@@ -6,11 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from agentprofiler.parser import (
+from agent_provenance.parser import (
     _extract_tool_calls,
     _normalize_traces,
     compute_upset_data,
+    extract_tool_call_responses,
     extract_tool_sets,
+    load_trace_records,
     parse_traces,
 )
 
@@ -53,6 +55,28 @@ class TestParseTraces:
             result = parse_traces(f.name)
         assert len(result) == 1
         assert result[0]["tool_calls"] == ["search"]
+
+    def test_parse_jsonl_file(self):
+        """Test parsing a JSONL file."""
+        payload = "\n".join(
+            [
+                json.dumps({"id": "1", "tool_calls": [{"name": "search"}]}),
+                json.dumps({"id": "2", "tool_calls": [{"name": "read"}]}),
+            ]
+        )
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+            f.write(payload)
+            f.flush()
+            result = parse_traces(f.name)
+        assert len(result) == 2
+        assert result[0]["tool_calls"] == ["search"]
+        assert result[1]["tool_calls"] == ["read"]
+
+    def test_load_trace_records_from_single_dict(self):
+        """Test loading a single trace dict without normalization."""
+        trace = {"id": "1", "tool_calls": [{"name": "search"}]}
+        result = load_trace_records(trace)
+        assert result == [trace]
 
     def test_parse_path_object(self):
         """Test parsing with Path object."""
@@ -113,6 +137,23 @@ class TestExtractToolCalls:
         result = _extract_tool_calls(trace)
         assert result == ["search", "read"]
 
+    def test_extract_tool_calls_outputs_messages_format(self):
+        """Test extracting tool calls from outputs.messages."""
+        trace = {
+            "outputs": {
+                "messages": [
+                    {
+                        "tool_calls": [
+                            {"id": "call-1", "name": "search", "args": {"q": "a"}},
+                            {"id": "call-2", "function": {"name": "read"}},
+                        ]
+                    }
+                ]
+            }
+        }
+        result = _extract_tool_calls(trace)
+        assert result == ["search", "read"]
+
 
 class TestNormalizeTraces:
     """Tests for trace normalization."""
@@ -135,6 +176,90 @@ class TestNormalizeTraces:
         result = _normalize_traces(trace)
         assert isinstance(result, list)
         assert len(result) == 1
+
+    def test_normalize_promotes_dashboard_fields(self):
+        """Test that score and outputs stay available for dashboard rendering."""
+        trace = {
+            "id": "1",
+            "score": 0.9,
+            "outputs": {"messages": [{"tool_calls": [{"name": "search"}]}]},
+        }
+        result = _normalize_traces([trace])
+        assert result[0]["score"] == 0.9
+        assert result[0]["outputs"]["messages"][0]["tool_calls"][0]["name"] == "search"
+
+
+class TestExtractToolCallResponses:
+    """Tests for extracting tool call/response pairs from OpenAI-style traces."""
+
+    def test_extract_tool_call_responses_pairs_by_id(self):
+        """Tool calls should be matched to tool outputs by tool_call_id."""
+        trace = {
+            "outputs": {
+                "messages": [
+                    {
+                        "type": "ai",
+                        "tool_calls": [
+                            {"id": "call-1", "name": "search", "args": {"q": "bos"}},
+                            {"id": "call-2", "function": {"name": "read", "arguments": "{\"path\": \"a.csv\"}"}},
+                        ],
+                    },
+                    {
+                        "type": "tool",
+                        "tool_call_id": "call-2",
+                        "content": "{\"rows\": 10}",
+                    },
+                    {
+                        "type": "tool",
+                        "tool_call_id": "call-1",
+                        "content": "{\"hits\": 3}",
+                    },
+                ]
+            }
+        }
+
+        result = extract_tool_call_responses(trace)
+
+        assert result == [
+            {
+                "id": "call-1",
+                "name": "search",
+                "args": {"q": "bos"},
+                "response": "{\"hits\": 3}",
+            },
+            {
+                "id": "call-2",
+                "name": "read",
+                "args": "{\"path\": \"a.csv\"}",
+                "response": "{\"rows\": 10}",
+            },
+        ]
+
+    def test_extract_tool_call_responses_handles_missing_tool_output(self):
+        """Missing tool responses should stay as None."""
+        trace = {
+            "outputs": {
+                "messages": [
+                    {
+                        "type": "ai",
+                        "tool_calls": [
+                            {"id": "call-1", "name": "search", "args": {"q": "bos"}}
+                        ],
+                    }
+                ]
+            }
+        }
+
+        result = extract_tool_call_responses(trace)
+
+        assert result == [
+            {
+                "id": "call-1",
+                "name": "search",
+                "args": {"q": "bos"},
+                "response": None,
+            }
+        ]
 
 
 class TestExtractToolSets:

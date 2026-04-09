@@ -1,1 +1,1 @@
-"""Tests for the AgentProfiler package."""
+"""Tests for the AgentProvenance package."""

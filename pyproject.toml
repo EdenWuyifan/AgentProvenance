@@ -3,15 +3,15 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agentprofiler"
+name = "agent_provenance"
 version = "0.1.0"
-description = "A tool to convert agent tracings to interactive UpSet Plots"
+description = "A tool to convert agent traces to interactive provenance dashboards"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
     {name = "Eden Wu"}
 ]
-keywords = ["agent", "profiler", "upset plot", "visualization", "jupyter", "d3.js"]
+keywords = ["agent", "provenance", "upset plot", "visualization", "jupyter", "d3.js"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -37,15 +37,15 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
 ]
-all = ["agentprofiler[jupyter,dev]"]
+all = ["agent_provenance[jupyter,dev]"]
 
 [project.urls]
-Homepage = "https://github.com/EdenWuyifan/AgentProfiler"
-Repository = "https://github.com/EdenWuyifan/AgentProfiler"
-Issues = "https://github.com/EdenWuyifan/AgentProfiler/issues"
+Homepage = "https://github.com/EdenWuyifan/AgentProvenance"
+Repository = "https://github.com/EdenWuyifan/AgentProvenance"
+Issues = "https://github.com/EdenWuyifan/AgentProvenance/issues"
 
 [tool.setuptools.packages.find]
-include = ["agentprofiler*"]
+include = ["agent_provenance*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

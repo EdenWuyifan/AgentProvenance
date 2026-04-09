@@ -165,6 +165,7 @@ MANIFEST
 .hypothesis/
 .ruff_cache/
 
+*.ipynb
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
 

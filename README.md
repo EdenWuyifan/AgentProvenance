@@ -1,11 +1,12 @@
-# AgentProfiler
+# AgentProvenance
 
-A Python tool to convert agent tracings (JSONs with tool calls) to interactive UpSet Plots using D3.js. Capable of visualizing plots in Jupyter Notebooks using IPython.
+A Python tool to convert agent traces into interactive UpSet plots and React-style provenance dashboards for Jupyter and standalone HTML.
 
 ## Features
 
-- **Parse Agent Traces**: Load and parse JSON files containing agent tool call data
-- **Interactive UpSet Plots**: Generate beautiful, interactive visualizations using D3.js
+- **Parse Agent Traces**: Load JSON, JSONL, or in-memory trace payloads
+- **Interactive UpSet Plots**: Generate D3-based overlap views for tool usage
+- **Trace Dashboard**: Explore the React-side provenance matrix in a standalone HTML shell
 - **Jupyter Integration**: Display plots directly in Jupyter Notebooks
 - **Export to HTML**: Save visualizations as standalone HTML files
 - **Flexible Input Formats**: Support for various trace data formats
@@ -13,19 +14,19 @@ A Python tool to convert agent tracings (JSONs with tool calls) to interactive U
 ## Installation
 
 ```bash
-pip install agentprofiler
+pip install agent_provenance
 ```
 
 For Jupyter Notebook support:
 
 ```bash
-pip install agentprofiler[jupyter]
+pip install agent_provenance[jupyter]
 ```
 
 For development:
 
 ```bash
-pip install agentprofiler[dev]
+pip install agent_provenance[dev]
 ```
 
 ## Quick Start
@@ -33,22 +34,19 @@ pip install agentprofiler[dev]
 ### Basic Usage
 
 ```python
-from agentprofiler import AgentProfiler
+from agent_provenance import AgentProvenance
 
 # Load traces from a JSON file
-profiler = AgentProfiler("traces.json")
+provenance = AgentProvenance("traces.json")
 
-# Display in Jupyter Notebook
-profiler.show()
-
-# Or save to HTML file
-profiler.save("output.html")
+# Display the default provenance dashboard in Jupyter
+provenance.show()
 ```
 
 ### Working with Trace Data
 
 ```python
-from agentprofiler import AgentProfiler
+from agent_provenance import AgentProvenance
 
 # Create traces programmatically
 traces = [
@@ -75,45 +73,45 @@ traces = [
     }
 ]
 
-# Initialize profiler with traces
-profiler = AgentProfiler(traces)
+# Initialize provenance with traces
+provenance = AgentProvenance(traces)
 
 # Get summary statistics
-print(profiler.summary())
+print(provenance.summary())
 # Output: {'total_traces': 3, 'unique_tools': 4, 'tools': [...], ...}
 
 # Access the tools found
-print(profiler.tools)
+print(provenance.tools)
 # Output: ['execute_code', 'read_file', 'search', 'write_file']
 ```
 
 ### Method Chaining
 
 ```python
-from agentprofiler import AgentProfiler
+from agent_provenance import AgentProvenance
 
-profiler = (
-    AgentProfiler()
+provenance = (
+    AgentProvenance()
     .load("initial_traces.json")
     .add_trace({"id": "new", "tool_calls": [{"name": "new_tool"}]})
 )
-profiler.show()
+provenance.show()
 ```
 
-### Customizing the Plot
+### Customizing the Dashboard
 
 ```python
-profiler.plot(
+provenance.show(
     width=1000,
     height=600,
-    bar_color="#4a90d9",
-    highlight_color="#f5a623"
-).show()
+    title="Custom Trace Explorer",
+    subtitle="Tool provenance across runs"
+)
 ```
 
 ## Supported Trace Formats
 
-AgentProfiler supports multiple common formats for tool call data:
+AgentProvenance supports multiple common formats for tool call data:
 
 ```python
 # Format 1: Using 'tool_calls' with 'name'
@@ -130,11 +128,14 @@ AgentProfiler supports multiple common formats for tool call data:
 
 # Format 5: Simple string arrays
 {"tool_calls": ["search", "read"]}
+
+# Format 6: LangSmith-style traces with outputs.messages
+{"outputs": {"messages": [{"tool_calls": [{"id": "call-1", "name": "search"}]}]}}
 ```
 
 ## API Reference
 
-### AgentProfiler
+### AgentProvenance
 
 Main class for loading traces and generating visualizations.
 
@@ -143,10 +144,7 @@ Main class for loading traces and generating visualizations.
 - `load(data)` - Load traces from file, JSON string, or list
 - `add_trace(trace)` - Add a single trace
 - `add_traces(traces)` - Add multiple traces
-- `plot(**kwargs)` - Create an UpSetPlot object
-- `show(**kwargs)` - Display in Jupyter Notebook
-- `save(filepath, **kwargs)` - Save to HTML file
-- `to_html(**kwargs)` - Get HTML string
+- `show(**kwargs)` - Display the provenance dashboard in Jupyter Notebook
 - `summary()` - Get summary statistics
 
 #### Properties
@@ -155,16 +153,6 @@ Main class for loading traces and generating visualizations.
 - `tools` - List of unique tools
 - `num_traces` - Total number of traces
 - `upset_data` - Computed UpSet plot data
-
-### UpSetPlot
-
-Class for rendering UpSet plot visualizations.
-
-#### Methods
-
-- `to_html(include_d3=True)` - Generate HTML string
-- `save(filepath)` - Save to HTML file
-- `show()` - Display in Jupyter Notebook
 
 ## License
 
