@@ -8,7 +8,6 @@ import pytest
 
 from agent_provenance.parser import (
     _extract_tool_calls,
-    _normalize_traces,
     compute_upset_data,
     extract_tool_call_responses,
     extract_tool_sets,
@@ -17,128 +16,175 @@ from agent_provenance.parser import (
 )
 
 
+def tool_call(name, *, id=None, args=None, response=None, status=None):
+    payload = {
+        "id": id,
+        "name": name,
+        "args": args,
+        "response": response,
+    }
+    if status is not None:
+        payload["status"] = status
+    return payload
+
+
 class TestParseTraces:
-    """Tests for parse_traces function."""
+    """Tests for parse_traces."""
 
     def test_parse_list_of_traces(self):
-        """Test parsing a list of trace dictionaries."""
         traces = [
             {"id": "1", "tool_calls": [{"name": "search"}, {"name": "read"}]},
             {"id": "2", "tool_calls": [{"name": "write"}]},
         ]
+
         result = parse_traces(traces)
-        assert len(result) == 2
-        assert result[0]["id"] == "1"
-        assert result[0]["tool_calls"] == ["search", "read"]
-        assert result[1]["tool_calls"] == ["write"]
+
+        assert result == [
+            {"id": "1", "tool_calls": [tool_call("search"), tool_call("read")]},
+            {"id": "2", "tool_calls": [tool_call("write")]},
+        ]
 
     def test_parse_single_trace_dict(self):
-        """Test parsing a single trace dictionary."""
         trace = {"id": "1", "tool_calls": [{"name": "search"}]}
-        result = parse_traces([trace])
-        assert len(result) == 1
-        assert result[0]["tool_calls"] == ["search"]
+
+        result = parse_traces(trace)
+
+        assert result == [{"id": "1", "tool_calls": [tool_call("search")]}]
 
     def test_parse_json_string(self):
-        """Test parsing a JSON string."""
         json_str = '[{"id": "1", "tool_calls": [{"name": "search"}]}]'
+
         result = parse_traces(json_str)
-        assert len(result) == 1
-        assert result[0]["tool_calls"] == ["search"]
+
+        assert result == [{"id": "1", "tool_calls": [tool_call("search")]}]
+
+    def test_parse_list_of_json_lines(self):
+        tracings = [
+            json.dumps({"id": "1", "tool_calls": [{"name": "search"}]}),
+            json.dumps({"id": "2", "tool_calls": ["read"]}),
+        ]
+
+        result = parse_traces(tracings)
+
+        assert result == [
+            {"id": "1", "tool_calls": [tool_call("search")]},
+            {"id": "2", "tool_calls": [tool_call("read")]},
+        ]
 
     def test_parse_json_file(self):
-        """Test parsing a JSON file."""
         traces = [{"id": "1", "tool_calls": [{"name": "search"}]}]
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(traces, f)
-            f.flush()
-            result = parse_traces(f.name)
-        assert len(result) == 1
-        assert result[0]["tool_calls"] == ["search"]
 
-    def test_parse_jsonl_file(self):
-        """Test parsing a JSONL file."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+            json.dump(traces, handle)
+            handle.flush()
+            result = parse_traces(handle.name)
+
+        assert result == [{"id": "1", "tool_calls": [tool_call("search")]}]
+
+    def test_parse_jsonl_file_returns_minimal_traces(self):
         payload = "\n".join(
             [
-                json.dumps({"id": "1", "tool_calls": [{"name": "search"}]}),
-                json.dumps({"id": "2", "tool_calls": [{"name": "read"}]}),
+                json.dumps(
+                    {
+                        "id": "1",
+                        "score": 0.9,
+                        "outputs": {
+                            "messages": [
+                                {
+                                    "type": "assistant",
+                                    "tool_calls": [
+                                        {
+                                            "id": "call-1",
+                                            "name": "search",
+                                            "args": {"q": "bos"},
+                                        }
+                                    ],
+                                },
+                                {
+                                    "type": "tool",
+                                    "tool_call_id": "call-1",
+                                    "content": "{\"hits\": 3}",
+                                },
+                            ]
+                        },
+                    }
+                ),
+                json.dumps({"id": "2", "tool_calls": ["read"]}),
             ]
         )
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
-            f.write(payload)
-            f.flush()
-            result = parse_traces(f.name)
-        assert len(result) == 2
-        assert result[0]["tool_calls"] == ["search"]
-        assert result[1]["tool_calls"] == ["read"]
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            result = parse_traces(handle.name)
+
+        assert result == [
+            {
+                "id": "1",
+                "score": 0.9,
+                "tool_calls": [
+                    tool_call(
+                        "search",
+                        id="call-1",
+                        args={"q": "bos"},
+                        response='{"hits": 3}',
+                    )
+                ],
+            },
+            {"id": "2", "tool_calls": [tool_call("read")]},
+        ]
 
     def test_load_trace_records_from_single_dict(self):
-        """Test loading a single trace dict without normalization."""
         trace = {"id": "1", "tool_calls": [{"name": "search"}]}
-        result = load_trace_records(trace)
-        assert result == [trace]
+        assert load_trace_records(trace) == [trace]
 
     def test_parse_path_object(self):
-        """Test parsing with Path object."""
         traces = [{"id": "1", "tool_calls": [{"name": "search"}]}]
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(traces, f)
-            f.flush()
-            result = parse_traces(Path(f.name))
-        assert len(result) == 1
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+            json.dump(traces, handle)
+            handle.flush()
+            result = parse_traces(Path(handle.name))
+
+        assert result == [{"id": "1", "tool_calls": [tool_call("search")]}]
 
     def test_parse_invalid_input(self):
-        """Test that invalid input raises ValueError."""
         with pytest.raises(ValueError):
             parse_traces(12345)
 
     def test_parse_invalid_json_string(self):
-        """Test that invalid JSON string raises ValueError."""
         with pytest.raises(ValueError):
             parse_traces("not valid json")
 
 
 class TestExtractToolCalls:
-    """Tests for tool call extraction."""
+    """Tests for tool name extraction."""
 
     def test_extract_tool_calls_name_format(self):
-        """Test extracting tool calls with 'name' key."""
         trace = {"tool_calls": [{"name": "search"}, {"name": "read"}]}
-        result = _extract_tool_calls(trace)
-        assert result == ["search", "read"]
+        assert _extract_tool_calls(trace) == ["search", "read"]
 
     def test_extract_tool_calls_string_format(self):
-        """Test extracting tool calls as strings."""
         trace = {"tool_calls": ["search", "read"]}
-        result = _extract_tool_calls(trace)
-        assert result == ["search", "read"]
+        assert _extract_tool_calls(trace) == ["search", "read"]
 
     def test_extract_tool_calls_tool_key(self):
-        """Test extracting tool calls with 'tool' key."""
         trace = {"tool_calls": [{"tool": "search"}]}
-        result = _extract_tool_calls(trace)
-        assert result == ["search"]
+        assert _extract_tool_calls(trace) == ["search"]
 
-    def test_extract_tool_calls_toolName_key(self):
-        """Test extracting tool calls with 'toolName' key."""
+    def test_extract_tool_calls_tool_name_key(self):
         trace = {"toolCalls": [{"toolName": "search"}]}
-        result = _extract_tool_calls(trace)
-        assert result == ["search"]
+        assert _extract_tool_calls(trace) == ["search"]
 
     def test_extract_tool_calls_function_key(self):
-        """Test extracting tool calls with 'function' key."""
         trace = {"calls": [{"function": "search"}]}
-        result = _extract_tool_calls(trace)
-        assert result == ["search"]
+        assert _extract_tool_calls(trace) == ["search"]
 
     def test_extract_tool_calls_steps_format(self):
-        """Test extracting tool calls from 'steps' key."""
         trace = {"steps": [{"name": "search"}, {"name": "read"}]}
-        result = _extract_tool_calls(trace)
-        assert result == ["search", "read"]
+        assert _extract_tool_calls(trace) == ["search", "read"]
 
     def test_extract_tool_calls_outputs_messages_format(self):
-        """Test extracting tool calls from outputs.messages."""
         trace = {
             "outputs": {
                 "messages": [
@@ -151,97 +197,55 @@ class TestExtractToolCalls:
                 ]
             }
         }
-        result = _extract_tool_calls(trace)
-        assert result == ["search", "read"]
 
-
-class TestNormalizeTraces:
-    """Tests for trace normalization."""
-
-    def test_normalize_adds_id(self):
-        """Test that normalization adds an ID if missing."""
-        traces = [{"tool_calls": [{"name": "search"}]}]
-        result = _normalize_traces(traces)
-        assert "id" in result[0]
-
-    def test_normalize_preserves_metadata(self):
-        """Test that normalization preserves additional metadata."""
-        traces = [{"id": "1", "tool_calls": [], "custom_field": "value"}]
-        result = _normalize_traces(traces)
-        assert result[0]["metadata"]["custom_field"] == "value"
-
-    def test_normalize_handles_single_dict(self):
-        """Test that a single dict gets wrapped in a list."""
-        trace = {"id": "1", "tool_calls": [{"name": "search"}]}
-        result = _normalize_traces(trace)
-        assert isinstance(result, list)
-        assert len(result) == 1
-
-    def test_normalize_promotes_dashboard_fields(self):
-        """Test that score and outputs stay available for dashboard rendering."""
-        trace = {
-            "id": "1",
-            "score": 0.9,
-            "outputs": {"messages": [{"tool_calls": [{"name": "search"}]}]},
-        }
-        result = _normalize_traces([trace])
-        assert result[0]["score"] == 0.9
-        assert result[0]["outputs"]["messages"][0]["tool_calls"][0]["name"] == "search"
+        assert _extract_tool_calls(trace) == ["search", "read"]
 
 
 class TestExtractToolCallResponses:
-    """Tests for extracting tool call/response pairs from OpenAI-style traces."""
+    """Tests for extracting ordered tool call/response pairs."""
 
     def test_extract_tool_call_responses_pairs_by_id(self):
-        """Tool calls should be matched to tool outputs by tool_call_id."""
         trace = {
             "outputs": {
                 "messages": [
                     {
-                        "type": "ai",
+                        "type": "assistant",
                         "tool_calls": [
                             {"id": "call-1", "name": "search", "args": {"q": "bos"}},
-                            {"id": "call-2", "function": {"name": "read", "arguments": "{\"path\": \"a.csv\"}"}},
+                            {
+                                "id": "call-2",
+                                "function": {
+                                    "name": "read",
+                                    "arguments": '{"path": "a.csv"}',
+                                },
+                            },
                         ],
                     },
                     {
                         "type": "tool",
                         "tool_call_id": "call-2",
-                        "content": "{\"rows\": 10}",
+                        "content": '{"rows": 10}',
                     },
                     {
                         "type": "tool",
                         "tool_call_id": "call-1",
-                        "content": "{\"hits\": 3}",
+                        "content": '{"hits": 3}',
                     },
                 ]
             }
         }
 
-        result = extract_tool_call_responses(trace)
-
-        assert result == [
-            {
-                "id": "call-1",
-                "name": "search",
-                "args": {"q": "bos"},
-                "response": "{\"hits\": 3}",
-            },
-            {
-                "id": "call-2",
-                "name": "read",
-                "args": "{\"path\": \"a.csv\"}",
-                "response": "{\"rows\": 10}",
-            },
+        assert extract_tool_call_responses(trace) == [
+            tool_call("search", id="call-1", args={"q": "bos"}, response='{"hits": 3}'),
+            tool_call("read", id="call-2", args='{"path": "a.csv"}', response='{"rows": 10}'),
         ]
 
     def test_extract_tool_call_responses_handles_missing_tool_output(self):
-        """Missing tool responses should stay as None."""
         trace = {
             "outputs": {
                 "messages": [
                     {
-                        "type": "ai",
+                        "type": "assistant",
                         "tool_calls": [
                             {"id": "call-1", "name": "search", "args": {"q": "bos"}}
                         ],
@@ -250,73 +254,60 @@ class TestExtractToolCallResponses:
             }
         }
 
-        result = extract_tool_call_responses(trace)
-
-        assert result == [
-            {
-                "id": "call-1",
-                "name": "search",
-                "args": {"q": "bos"},
-                "response": None,
-            }
+        assert extract_tool_call_responses(trace) == [
+            tool_call("search", id="call-1", args={"q": "bos"})
         ]
 
 
 class TestExtractToolSets:
-    """Tests for extract_tool_sets function."""
+    """Tests for extract_tool_sets."""
 
     def test_extract_tool_sets_basic(self):
-        """Test basic tool set extraction."""
         traces = [
-            {"id": "1", "tool_calls": ["search", "read"], "metadata": {}},
-            {"id": "2", "tool_calls": ["write"], "metadata": {}},
+            {"id": "1", "tool_calls": ["search", "read"]},
+            {"id": "2", "tool_calls": ["write"]},
         ]
-        result = extract_tool_sets(traces)
-        assert len(result) == 2
-        assert result[0] == {"search", "read"}
-        assert result[1] == {"write"}
+
+        assert extract_tool_sets(traces) == [{"search", "read"}, {"write"}]
 
     def test_extract_tool_sets_empty(self):
-        """Test extraction with empty traces."""
-        result = extract_tool_sets([])
-        assert result == []
+        assert extract_tool_sets([]) == []
 
 
 class TestComputeUpsetData:
-    """Tests for compute_upset_data function."""
+    """Tests for compute_upset_data."""
 
     def test_compute_upset_data_basic(self):
-        """Test basic UpSet data computation."""
         traces = [
-            {"id": "1", "tool_calls": ["search", "read"], "metadata": {}},
-            {"id": "2", "tool_calls": ["search", "read"], "metadata": {}},
-            {"id": "3", "tool_calls": ["write"], "metadata": {}},
+            {"id": "1", "tool_calls": ["search", "read"]},
+            {"id": "2", "tool_calls": ["search", "read"]},
+            {"id": "3", "tool_calls": ["write"]},
         ]
+
         result = compute_upset_data(traces)
 
-        assert "sets" in result
-        assert "intersections" in result
-        assert "total_traces" in result
         assert result["total_traces"] == 3
         assert set(result["sets"]) == {"search", "read", "write"}
+        assert "intersections" in result
 
     def test_compute_upset_data_intersection_counts(self):
-        """Test that intersection counts are correct."""
         traces = [
-            {"id": "1", "tool_calls": ["a", "b"], "metadata": {}},
-            {"id": "2", "tool_calls": ["a", "b"], "metadata": {}},
-            {"id": "3", "tool_calls": ["a"], "metadata": {}},
+            {"id": "1", "tool_calls": ["a", "b"]},
+            {"id": "2", "tool_calls": ["a", "b"]},
+            {"id": "3", "tool_calls": ["a"]},
         ]
-        result = compute_upset_data(traces)
 
-        # Check intersection sizes
-        intersections = {tuple(i["sets"]): i["size"] for i in result["intersections"]}
+        result = compute_upset_data(traces)
+        intersections = {tuple(item["sets"]): item["size"] for item in result["intersections"]}
+
         assert intersections[("a", "b")] == 2
         assert intersections[("a",)] == 1
 
     def test_compute_upset_data_empty(self):
-        """Test with empty traces."""
         result = compute_upset_data([])
-        assert result["sets"] == []
-        assert result["intersections"] == []
-        assert result["total_traces"] == 0
+
+        assert result == {
+            "sets": [],
+            "intersections": [],
+            "total_traces": 0,
+        }

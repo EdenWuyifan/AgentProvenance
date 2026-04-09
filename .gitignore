@@ -182,3 +182,9 @@ MANIFEST
 **/.ruff_cache/
 
 .coverage
+
+# ipynb
+.ipynb_checkpoints
+**/.ipynb_checkpoints
+tmp.ipynb
+**/tmp.ipynb
