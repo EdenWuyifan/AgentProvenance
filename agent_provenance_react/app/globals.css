@@ -17,3 +17,63 @@ body {
   color: var(--foreground);
   font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
 }
+
+.react-flow {
+  --xy-background-color: #f7f9fb;
+  --xy-theme-hover: #c5c5c5;
+  --xy-theme-edge-hover: #000000;
+  --xy-node-border-default: 1px solid #ededed;
+  --xy-node-boxshadow-default:
+    0px 3.54px 4.55px 0px #00000005,
+    0px 3.54px 4.55px 0px #0000000d,
+    0px 0.51px 1.01px 0px #0000001a;
+  --xy-node-border-radius-default: 8px;
+  --xy-handle-background-color-default: #ffffff;
+  --xy-handle-border-color-default: #aaaaaa;
+  --xy-edge-label-color-default: #505050;
+}
+
+.react-flow__node {
+  box-shadow: var(--xy-node-boxshadow-default);
+  border-radius: var(--xy-node-border-radius-default);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  padding: 10px;
+  font-size: 12px;
+  border: var(--xy-node-border-default);
+  background-color: #ffffff;
+}
+
+.react-flow__node.draggable:hover {
+  border-color: var(--xy-theme-hover);
+}
+
+.react-flow__handle {
+  background-color: var(--xy-handle-background-color-default);
+  border-color: var(--xy-handle-border-color-default);
+}
+
+.button-edge__label {
+  position: absolute;
+  pointer-events: all;
+  transform-origin: center;
+}
+
+.button-edge__button {
+  min-width: 24px;
+  height: 24px;
+  border: 3px solid #f7f9fb;
+  color: var(--xy-edge-label-color-default);
+  background-color: #f3f3f4;
+  cursor: pointer;
+  border-radius: 9999px;
+  font-size: 12px;
+  padding: 0 6px;
+}
+
+.button-edge__button:hover {
+  background-color: var(--xy-theme-hover);
+  color: #ffffff;
+}

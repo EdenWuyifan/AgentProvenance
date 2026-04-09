@@ -221,6 +221,7 @@ function renderCoverageGrid({
     showTooltip,
     hideTooltip,
     formatArgs,
+    onTracingSelect,
 }) {
     const gridStroke = "rgba(15,23,42,0.2)";
 
@@ -353,6 +354,9 @@ function renderCoverageGrid({
                         })
                         .on("mouseleave", () => {
                             hideTooltip();
+                        })
+                        .on("click", () => {
+                            onTracingSelect?.(tracing.id);
                         });
                 }
             });
@@ -486,6 +490,7 @@ function renderScoreRail({
     formatScore,
     onRowFocus,
     onRowBlur,
+    onRowSelect,
 }) {
     const scoreGroup = group
         .append("g")
@@ -568,6 +573,9 @@ function renderScoreRail({
         .on("mouseleave", () => {
             hideTooltip();
             onRowBlur?.();
+        })
+        .on("click", (_, d) => {
+            onRowSelect?.(d.id);
         });
 
     return { setRowHighlight };
@@ -710,6 +718,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         showTooltip,
         hideTooltip,
         formatArgs,
+        onTracingSelect: options.onTracingSelect,
     });
 
     g.append("g")
@@ -723,6 +732,10 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         .attr("text-anchor", "end")
         .attr("fill", "#111827")
         .style("font-size", "10px")
+        .style("cursor", options.onTracingSelect ? "pointer" : null)
+        .on("click", (_, d) => {
+            options.onTracingSelect?.(d.id);
+        })
         .text((d) => d.id);
 
     const scoreControls = renderScoreRail({
@@ -738,6 +751,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         formatScore,
         onRowFocus: (tracingId) => matrixControls.setRowHighlight(tracingId),
         onRowBlur: () => matrixControls.clearRowHighlight(),
+        onRowSelect: options.onTracingSelect,
     });
 
     matrixControls.registerExternalRowHighlight(scoreControls.setRowHighlight);

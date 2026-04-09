@@ -8,15 +8,14 @@ import {
   useState,
 } from "react";
 
-import { SAMPLE_TOOL_SETS } from "./lib/sample-tool-sets";
+import { ProvenanceGraphView } from "./components/provenance_graph";
+import type { Tracing } from "./components/types";
 import { renderUpsetPlot } from "./components/upset_plot";
-import { parseTracingPayload } from "./components/visualization_shared";
-
-type Tracing = {
-  id: string | number;
-  score?: number | null;
-  [key: string]: unknown;
-};
+import {
+  extractToolCallRecords,
+  parseTracingPayload,
+  prepareTracings,
+} from "./components/visualization_shared";
 
 function useTracingData(path: string) {
   const [data, setData] = useState<Tracing[]>([]);
@@ -38,7 +37,14 @@ function useTracingData(path: string) {
           return;
         }
 
-        const parsed = parseTracingPayload(text) as Tracing[];
+        const parsed = prepareTracings(parseTracingPayload(text)).map((tracing) => ({
+          id: tracing.id,
+          score:
+            typeof tracing.score === "number" || tracing.score === null
+              ? tracing.score
+              : undefined,
+          toolCalls: extractToolCallRecords(tracing),
+        }));
         startTransition(() => {
           setData(parsed);
           setError(null);
@@ -109,8 +115,13 @@ function StatusMessage({ message }: { message: string }) {
 
 export default function Home() {
   const upsetRef = useRef<HTMLDivElement | null>(null);
+  const [selectedTracingId, setSelectedTracingId] = useState<string | number | null>(
+    null
+  );
 
   const { data, loading, error } = useTracingData("/tracings.jsonl");
+  const selectedTracing =
+    data.find((tracing) => tracing.id === selectedTracingId) ?? null;
 
   useEffect(() => {
     const element = upsetRef.current;
@@ -119,8 +130,9 @@ export default function Home() {
     }
 
     const render = () => {
-      renderUpsetPlot(element, data, SAMPLE_TOOL_SETS, {
+      renderUpsetPlot(element, data, {}, {
         width: Math.max(element.clientWidth, 720),
+        onTracingSelect: setSelectedTracingId,
       });
     };
 
@@ -151,7 +163,7 @@ export default function Home() {
 
         <Card
           title="Tool provenance"
-          description="The matrix shows which tools appear in each trace."
+          description="Click a run to show its provenance graph."
         >
           {loading && <StatusMessage message="Loading traces…" />}
           {!loading && error && <StatusMessage message={error} />}
@@ -160,6 +172,27 @@ export default function Home() {
           )}
           {!loading && !error && data.length > 0 && (
             <div ref={upsetRef} className="w-full overflow-x-auto" />
+          )}
+        </Card>
+
+        <Card
+          title="Trace Graph"
+          description={
+            selectedTracing
+              ? `Run #${selectedTracing.id}`
+              : "Select a run from the plot."
+          }
+        >
+          {loading && <StatusMessage message="Loading traces…" />}
+          {!loading && error && <StatusMessage message={error} />}
+          {!loading && !error && data.length === 0 && (
+            <StatusMessage message="No traces available." />
+          )}
+          {!loading && !error && data.length > 0 && !selectedTracing && (
+            <StatusMessage message="Select a trace in the matrix to render its provenance graph." />
+          )}
+          {!loading && !error && selectedTracing && (
+            <ProvenanceGraphView tracing={selectedTracing} />
           )}
         </Card>
       </main>
