@@ -121,7 +121,7 @@ def _top_level_tool_calls(trace: Dict[str, Any]) -> List[Any]:
 
 
 def _minimal_trace(trace: Dict[str, Any], idx: int) -> Dict[str, Any]:
-    """Normalize any supported trace into {id, tool_calls, score?}."""
+    """Normalize any supported trace into {id, tool_calls, score?, ...metadata}."""
     tool_calls = extract_tool_call_responses(trace)
     if not tool_calls:
         tool_calls = [
@@ -130,9 +130,17 @@ def _minimal_trace(trace: Dict[str, Any], idx: int) -> Dict[str, Any]:
             if (tool_call := _minimal_tool_call(call))
         ]
 
+    excluded_keys = {"id", "score", "tool_calls", "toolCalls", "calls", "steps", "outputs"}
+    metadata = {
+        key: value
+        for key, value in trace.items()
+        if key not in excluded_keys and value is not None and value != "" and not isinstance(value, (dict, list))
+    }
+
     minimal = {
         "id": _trace_id(trace, idx),
         "tool_calls": tool_calls,
+        **metadata,
     }
 
     if trace.get("score") is not None:
