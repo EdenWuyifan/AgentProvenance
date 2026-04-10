@@ -8,7 +8,10 @@ import {
   useState,
 } from "react";
 
-import { ProvenanceGraphView } from "./components/provenance_graph";
+import {
+  ProvenanceGraphView,
+  type GraphMode,
+} from "./components/provenance_graph";
 import type { Tracing } from "./components/types";
 import { renderUpsetPlot } from "./components/upset_plot";
 import {
@@ -113,11 +116,46 @@ function StatusMessage({ message }: { message: string }) {
   );
 }
 
+function GraphModeToggle({
+  mode,
+  onChange,
+}: {
+  mode: GraphMode;
+  onChange: (mode: GraphMode) => void;
+}) {
+  return (
+    <div className="inline-flex rounded-lg border border-zinc-200 bg-zinc-50 p-1">
+      {[
+        ["collapsed", "Collapsed"],
+        ["tree", "Tree"],
+      ].map(([value, label]) => {
+        const active = mode === value;
+
+        return (
+          <button
+            key={value}
+            type="button"
+            className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+              active
+                ? "bg-white text-zinc-950 shadow-sm"
+                : "text-zinc-500 hover:text-zinc-950"
+            }`}
+            onClick={() => onChange(value as GraphMode)}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function Home() {
   const upsetRef = useRef<HTMLDivElement | null>(null);
   const [selectedTracingId, setSelectedTracingId] = useState<string | number | null>(
     null
   );
+  const [graphMode, setGraphMode] = useState<GraphMode>("tree");
 
   const { data, loading, error } = useTracingData("/tracings.jsonl");
   const selectedTracing =
@@ -162,7 +200,7 @@ export default function Home() {
         </header>
 
         <Card
-          title="Tool provenance"
+          title="Tracings provenance"
           description="Click a run to show its provenance graph."
         >
           {loading && <StatusMessage message="Loading traces…" />}
@@ -176,11 +214,14 @@ export default function Home() {
         </Card>
 
         <Card
-          title="Trace Graph"
+          title="Provenance graph"
           description={
             selectedTracing
               ? `Run #${selectedTracing.id}`
               : "Select a run from the plot."
+          }
+          actions={
+            <GraphModeToggle mode={graphMode} onChange={setGraphMode} />
           }
         >
           {loading && <StatusMessage message="Loading traces…" />}
@@ -192,7 +233,7 @@ export default function Home() {
             <StatusMessage message="Select a trace in the matrix to render its provenance graph." />
           )}
           {!loading && !error && selectedTracing && (
-            <ProvenanceGraphView tracing={selectedTracing} />
+            <ProvenanceGraphView tracing={selectedTracing} mode={graphMode} />
           )}
         </Card>
       </main>

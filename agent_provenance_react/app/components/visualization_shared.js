@@ -14,6 +14,39 @@ const GLYPH_TYPES = [
   "plus",
   "times",
 ];
+const GROUP_COLORS = d3.schemeTableau10;
+const UNKNOWN_GROUP_COLOR = "#52525b";
+
+export const DEFAULT_TOOL_SETS = {
+  "data tools": [
+    "csv_aggregate",
+    "csv_filter",
+    "csv_join",
+    "csv_read",
+    "csv_record",
+    "csv_select",
+  ],
+  "analysis tools": [
+    "run_deseq2_gsea_pipe",
+    "run_deseq2_ora_pipe",
+    "gsea_pipe",
+    "ora_pipe",
+  ],
+  "rag tools": [
+    "enrich_rumma",
+    "gene_info",
+    "literature_trends",
+    "prioritize_genes",
+    "query_genes",
+    "query_string_rumma",
+    "query_table_rumma",
+    "sets_info_rumm",
+  ],
+};
+
+function resolveToolSets(toolSets = DEFAULT_TOOL_SETS) {
+  return Object.keys(toolSets).length > 0 ? toolSets : DEFAULT_TOOL_SETS;
+}
 
 function parseJsonLines(text) {
   return text
@@ -194,27 +227,34 @@ export function extractToolCallRecords(tracing) {
 }
 
 export function createGlyphSystem(toolSets = {}) {
+  const resolvedToolSets = resolveToolSets(toolSets);
   const toolToGroup = new Map();
-  const groupNames = Object.keys(toolSets).sort();
+  const groupNames = Object.keys(resolvedToolSets).sort();
 
   groupNames.forEach((groupName) => {
-    const tools = toolSets[groupName] || [];
+    const tools = resolvedToolSets[groupName] || [];
     tools.forEach((toolName) => {
       toolToGroup.set(toolName, groupName);
     });
   });
 
   const groupToGlyph = new Map();
+  const groupToColor = new Map();
   groupNames.forEach((groupName, index) => {
     groupToGlyph.set(groupName, GLYPH_TYPES[index % GLYPH_TYPES.length]);
+    groupToColor.set(groupName, GROUP_COLORS[index % GROUP_COLORS.length]);
   });
+
+  const getGroup = (toolName) => toolToGroup.get(toolName) || "unknown";
 
   return {
     getGlyph: (toolName) => {
       const group = toolToGroup.get(toolName);
       return group ? groupToGlyph.get(group) || "circle" : "circle";
     },
-    getGroup: (toolName) => toolToGroup.get(toolName) || "unknown",
+    getGroup,
+    getColor: (toolName) => groupToColor.get(getGroup(toolName)) || UNKNOWN_GROUP_COLOR,
+    getGroupColor: (groupName) => groupToColor.get(groupName) || UNKNOWN_GROUP_COLOR,
     getAllGroups: () => Array.from(groupToGlyph.keys()),
     getGroupGlyph: (groupName) => groupToGlyph.get(groupName) || "circle",
   };
