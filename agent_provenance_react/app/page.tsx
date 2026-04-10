@@ -20,6 +20,58 @@ import {
   prepareTracings,
 } from "./components/visualization_shared";
 
+const GROUPING_EXCLUDED_KEYS = new Set(["id", "score", "toolCalls", "tool_calls"]);
+
+type TopChartMode = "usage" | "impact";
+
+function getGroupingOptions(tracings: Tracing[]) {
+  const keys = new Set<string>();
+
+  tracings.forEach((tracing) => {
+    Object.entries(tracing).forEach(([key, value]) => {
+      if (GROUPING_EXCLUDED_KEYS.has(key)) {
+        return;
+      }
+
+      if (value === null || value === undefined || value === "") {
+        return;
+      }
+
+      if (typeof value === "object") {
+        return;
+      }
+
+      keys.add(key);
+    });
+  });
+
+  return Array.from(keys).sort((a, b) => a.localeCompare(b));
+}
+
+function getGroupingValues(tracings: Tracing[], groupBy: string) {
+  if (!groupBy) {
+    return [];
+  }
+
+  const values = new Set<string>();
+
+  tracings.forEach((tracing) => {
+    const value = tracing[groupBy];
+
+    if (value === null || value === undefined || value === "") {
+      return;
+    }
+
+    if (typeof value === "object") {
+      return;
+    }
+
+    values.add(String(value));
+  });
+
+  return Array.from(values).sort((a, b) => a.localeCompare(b));
+}
+
 function useTracingData(path: string) {
   const [data, setData] = useState<Tracing[]>([]);
   const [loading, setLoading] = useState(true);
@@ -41,6 +93,11 @@ function useTracingData(path: string) {
         }
 
         const parsed = prepareTracings(parseTracingPayload(text)).map((tracing) => ({
+          ...Object.fromEntries(
+            Object.entries(tracing).filter(
+              ([key]) => !GROUPING_EXCLUDED_KEYS.has(key)
+            )
+          ),
           id: tracing.id,
           score:
             typeof tracing.score === "number" || tracing.score === null
@@ -124,7 +181,7 @@ function GraphModeToggle({
   onChange: (mode: GraphMode) => void;
 }) {
   return (
-    <div className="inline-flex rounded-lg border border-zinc-200 bg-zinc-50 p-1">
+    <div className="inline-flex h-7 items-center border border-zinc-300 bg-zinc-50/95 backdrop-blur-sm">
       {[
         ["collapsed", "Collapsed"],
         ["tree", "Tree"],
@@ -135,12 +192,111 @@ function GraphModeToggle({
           <button
             key={value}
             type="button"
-            className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+            className={`h-full px-2 text-[11px] font-medium transition ${
               active
                 ? "bg-white text-zinc-950 shadow-sm"
                 : "text-zinc-500 hover:text-zinc-950"
             }`}
+            style={
+              value === "tree"
+                ? { borderLeft: "1px solid rgb(212 212 216)" }
+                : undefined
+            }
             onClick={() => onChange(value as GraphMode)}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function UpsetGroupBySelect({
+  value,
+  options,
+  onChange,
+}: {
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="inline-flex h-full items-center text-[11px] text-zinc-600">
+      <span className="border-r border-zinc-300 px-2">Group rows</span>
+      <select
+        className="h-full border-0 bg-transparent px-2 text-[11px] text-zinc-950 outline-none"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        <option value="">None</option>
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function UpsetFoldActions({
+  disabled,
+  onFoldAll,
+  onExpandAll,
+}: {
+  disabled: boolean;
+  onFoldAll: () => void;
+  onExpandAll: () => void;
+}) {
+  return (
+    <div className="inline-flex h-full items-center text-[11px]">
+      <button
+        type="button"
+        className="h-full px-2 text-zinc-500 transition hover:text-zinc-950 disabled:cursor-default disabled:text-zinc-300"
+        onClick={onFoldAll}
+        disabled={disabled}
+      >
+        Fold all
+      </button>
+      <button
+        type="button"
+        className="h-full border-l border-zinc-300 px-2 text-zinc-500 transition hover:text-zinc-950 disabled:cursor-default disabled:text-zinc-300"
+        onClick={onExpandAll}
+        disabled={disabled}
+      >
+        Expand all
+      </button>
+    </div>
+  );
+}
+
+function UpsetTopChartToggle({
+  mode,
+  onChange,
+}: {
+  mode: TopChartMode;
+  onChange: (mode: TopChartMode) => void;
+}) {
+  return (
+    <div className="inline-flex h-full items-center border-r border-zinc-300 bg-zinc-50">
+      {[
+        ["usage", "Usage"],
+        ["impact", "Impact"],
+      ].map(([value, label]) => {
+        const active = mode === value;
+
+        return (
+          <button
+            key={value}
+            type="button"
+            className={`h-full px-2 text-[11px] font-medium transition ${
+              active
+                ? "bg-white text-zinc-950 shadow-sm"
+                : "text-zinc-500 hover:text-zinc-950"
+            }`}
+            style={value === "impact" ? { borderLeft: "1px solid rgb(212 212 216)" } : undefined}
+            onClick={() => onChange(value as TopChartMode)}
           >
             {label}
           </button>
@@ -155,11 +311,24 @@ export default function Home() {
   const [selectedTracingId, setSelectedTracingId] = useState<string | number | null>(
     null
   );
+  const [topChartMode, setTopChartMode] = useState<TopChartMode>("impact");
+  const [upsetGroupBy, setUpsetGroupBy] = useState("");
+  const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
   const [graphMode, setGraphMode] = useState<GraphMode>("tree");
 
   const { data, loading, error } = useTracingData("/tracings.jsonl");
+  const groupingOptions = getGroupingOptions(data);
+  const groupingValues = getGroupingValues(data, upsetGroupBy);
   const selectedTracing =
     data.find((tracing) => tracing.id === selectedTracingId) ?? null;
+
+  useEffect(() => {
+    const validGroups = new Set(getGroupingValues(data, upsetGroupBy));
+
+    setCollapsedGroups((current) =>
+      current.filter((group) => validGroups.has(group))
+    );
+  }, [data, upsetGroupBy]);
 
   useEffect(() => {
     const element = upsetRef.current;
@@ -170,6 +339,16 @@ export default function Home() {
     const render = () => {
       renderUpsetPlot(element, data, {}, {
         width: Math.max(element.clientWidth, 720),
+        topChartMode,
+        rowGroupBy: upsetGroupBy || undefined,
+        collapsedGroups,
+        onGroupToggle: (group: string) => {
+          setCollapsedGroups((current) =>
+            current.includes(group)
+              ? current.filter((item) => item !== group)
+              : [...current, group]
+          );
+        },
         onTracingSelect: setSelectedTracingId,
       });
     };
@@ -182,7 +361,7 @@ export default function Home() {
     return () => {
       observer.disconnect();
     };
-  }, [data, error, loading]);
+  }, [collapsedGroups, data, error, loading, topChartMode, upsetGroupBy]);
 
   return (
     <div className="min-h-screen bg-stone-100 px-4 py-10 text-zinc-950">
@@ -190,12 +369,6 @@ export default function Home() {
         <header className="px-1">
           <p className="text-xs font-semibold uppercase tracking-[0.24em] text-zinc-500">
             AgentProvenance
-          </p>
-          <h1 className="mt-2 text-3xl font-semibold tracking-tight text-zinc-950">
-            Trace explorer
-          </h1>
-          <p className="mt-3 max-w-3xl text-sm leading-6 text-zinc-600">
-            Inspect tool provenance across runs in a single view.
           </p>
         </header>
 
@@ -209,7 +382,41 @@ export default function Home() {
             <StatusMessage message="No traces available." />
           )}
           {!loading && !error && data.length > 0 && (
-            <div ref={upsetRef} className="w-full overflow-x-auto" />
+            <div className="w-full overflow-x-auto">
+              <div className="relative min-w-[720px] pt-16">
+                  <div className="pointer-events-none absolute inset-x-0 top-0 z-10 grid w-full grid-cols-[3fr_1fr]">
+                    <div className="pointer-events-auto flex h-7 items-center border border-zinc-300 bg-zinc-50/95 backdrop-blur-sm">
+                      <UpsetTopChartToggle
+                        mode={topChartMode}
+                        onChange={setTopChartMode}
+                      />
+                      <div className="h-full flex-1 border-l border-zinc-300" />
+                    </div>
+                  </div>
+                  <div className="pointer-events-none absolute inset-x-0 top-63 z-10 grid w-full grid-cols-[3fr_1fr]">
+                    <div />
+                    <div className="pointer-events-auto flex h-14 flex-col border border-zinc-300 bg-zinc-50/95 backdrop-blur-sm">
+                      <div className="flex h-7 items-center">
+                        <UpsetGroupBySelect
+                          value={upsetGroupBy}
+                          options={groupingOptions}
+                          onChange={setUpsetGroupBy}
+                        />
+                        <div className="h-full flex-1 border-l border-zinc-300" />
+                      </div>
+                      <div className="flex h-7 items-center border-t border-zinc-300">
+                        <UpsetFoldActions
+                          disabled={!upsetGroupBy}
+                          onFoldAll={() => setCollapsedGroups(groupingValues)}
+                          onExpandAll={() => setCollapsedGroups([])}
+                        />
+                        <div className="h-full flex-1 border-l border-zinc-300" />
+                      </div>
+                    </div>
+                  </div>
+                <div ref={upsetRef} className="w-full" />
+              </div>
+            </div>
           )}
         </Card>
 

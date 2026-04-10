@@ -9,6 +9,10 @@ import {
     renderGlyph,
 } from "./visualization_shared";
 
+const BAR_FILL = "#111827";
+const BAR_HIGHLIGHT_FILL = "#38bdf8";
+const GROUP_GAP_ROWS = 1;
+
 function buildToolCoverageData(tools, tracingToolCalls) {
     return tools.map((tool) => {
         let usageCount = 0;
@@ -22,15 +26,241 @@ function buildToolCoverageData(tools, tracingToolCalls) {
     });
 }
 
-function buildTraceScoreData(tracingToolCalls) {
-    const data = [];
-    tracingToolCalls.forEach((entry, tracingId) => {
-        data.push({
-            id: tracingId,
-            score: entry.score,
+function solveLinearSystem(matrix, vector) {
+    const size = vector.length;
+    const augmented = matrix.map((row, index) => [...row, vector[index]]);
+
+    for (let pivotIndex = 0; pivotIndex < size; pivotIndex += 1) {
+        let pivotRow = pivotIndex;
+
+        for (let rowIndex = pivotIndex + 1; rowIndex < size; rowIndex += 1) {
+            if (
+                Math.abs(augmented[rowIndex][pivotIndex]) >
+                Math.abs(augmented[pivotRow][pivotIndex])
+            ) {
+                pivotRow = rowIndex;
+            }
+        }
+
+        if (pivotRow !== pivotIndex) {
+            [augmented[pivotIndex], augmented[pivotRow]] = [
+                augmented[pivotRow],
+                augmented[pivotIndex],
+            ];
+        }
+
+        const pivot = augmented[pivotIndex][pivotIndex];
+        if (Math.abs(pivot) < 1e-9) {
+            return Array(size).fill(0);
+        }
+
+        for (let columnIndex = pivotIndex; columnIndex <= size; columnIndex += 1) {
+            augmented[pivotIndex][columnIndex] /= pivot;
+        }
+
+        for (let rowIndex = 0; rowIndex < size; rowIndex += 1) {
+            if (rowIndex === pivotIndex) {
+                continue;
+            }
+
+            const factor = augmented[rowIndex][pivotIndex];
+            for (let columnIndex = pivotIndex; columnIndex <= size; columnIndex += 1) {
+                augmented[rowIndex][columnIndex] -=
+                    factor * augmented[pivotIndex][columnIndex];
+            }
+        }
+    }
+
+    return augmented.map((row) => row[size]);
+}
+
+function buildToolImpactData(tools, tracings, tracingToolCalls) {
+    if (tools.length === 0 || tracings.length === 0) {
+        return [];
+    }
+
+    const rows = tracings.map((tracing) => {
+        const toolCallsByName = tracingToolCalls.get(tracing.id)?.toolCallsByName;
+        return tools.map((tool) => (toolCallsByName?.has(tool) ? 1 : 0));
+    });
+    const scores = tracings.map((tracing) => getTracingScore(tracing));
+    const featureMeans = tools.map(
+        (_, toolIndex) => d3.mean(rows, (row) => row[toolIndex]) ?? 0
+    );
+    const scoreMean = d3.mean(scores) ?? 0;
+    const gram = Array.from({ length: tools.length }, () =>
+        Array(tools.length).fill(0)
+    );
+    const rhs = Array(tools.length).fill(0);
+
+    rows.forEach((row, rowIndex) => {
+        const centeredScore = scores[rowIndex] - scoreMean;
+        const centeredRow = row.map((value, toolIndex) => value - featureMeans[toolIndex]);
+
+        centeredRow.forEach((value, leftIndex) => {
+            rhs[leftIndex] += value * centeredScore;
+
+            for (let rightIndex = leftIndex; rightIndex < tools.length; rightIndex += 1) {
+                gram[leftIndex][rightIndex] += value * centeredRow[rightIndex];
+            }
         });
     });
-    return data;
+
+    gram.forEach((row, leftIndex) => {
+        for (let rightIndex = leftIndex + 1; rightIndex < tools.length; rightIndex += 1) {
+            gram[rightIndex][leftIndex] = row[rightIndex];
+        }
+        row[leftIndex] += 1;
+    });
+
+    const coefficients = solveLinearSystem(gram, rhs);
+
+    return tools.map((tool, toolIndex) => {
+        const presentScores = [];
+        const absentScores = [];
+        let usageCount = 0;
+        let absoluteContributionSum = 0;
+
+        rows.forEach((row, rowIndex) => {
+            const present = row[toolIndex] === 1;
+            const contribution =
+                coefficients[toolIndex] * (row[toolIndex] - featureMeans[toolIndex]);
+
+            absoluteContributionSum += Math.abs(contribution);
+
+            if (present) {
+                usageCount += 1;
+                presentScores.push(scores[rowIndex]);
+                return;
+            }
+
+            absentScores.push(scores[rowIndex]);
+        });
+
+        const impactAbs = absoluteContributionSum / rows.length;
+        const direction = Math.sign(coefficients[toolIndex] || 0);
+
+        return {
+            toolName: tool,
+            usageCount,
+            impact: direction * impactAbs,
+            impactAbs,
+            meanPresentScore:
+                presentScores.length > 0 ? d3.mean(presentScores) : null,
+            meanAbsentScore:
+                absentScores.length > 0 ? d3.mean(absentScores) : null,
+        };
+    });
+}
+
+function buildTraceScoreData(tracings, tracingToolCalls) {
+    return tracings.map((tracing) => ({
+        id: tracing.id,
+        score: tracingToolCalls.get(tracing.id)?.score ?? getTracingScore(tracing),
+    }));
+}
+
+function compareLabels(a, b) {
+    return String(a).localeCompare(String(b), undefined, {
+        numeric: true,
+        sensitivity: "base",
+    });
+}
+
+function getTracingGroupValue(tracing, groupBy) {
+    if (!groupBy) {
+        return "";
+    }
+
+    const value = tracing?.[groupBy];
+    return value === null || value === undefined || value === "" ? "unknown" : String(value);
+}
+
+function orderTracings(tracings, groupBy, collapsedGroups = []) {
+    const byScore = (a, b) =>
+        getTracingScore(b) - getTracingScore(a) || compareLabels(a.id, b.id);
+    const collapsedGroupSet = new Set(collapsedGroups);
+
+    if (!groupBy) {
+        const ordered = [...tracings].sort(byScore);
+        return {
+            tracings: ordered,
+            groups: [],
+            domain: ordered.map((tracing) => tracing.id),
+        };
+    }
+
+    const groups = d3
+        .groups(tracings, (tracing) => getTracingGroupValue(tracing, groupBy))
+        .map(([label, items]) => ({
+            label,
+            items: items.slice().sort(byScore),
+            topScore: d3.max(items, (item) => getTracingScore(item)) ?? 0,
+        }))
+        .sort(
+            (a, b) => b.topScore - a.topScore || compareLabels(a.label, b.label)
+        );
+
+    const orderedTracings = [];
+    const orderedGroups = [];
+    const domain = [];
+
+    groups.forEach(({ label, items }) => {
+        if (items.length === 0) {
+            return;
+        }
+
+        const visibleItems = collapsedGroupSet.has(label) ? items.slice(0, 1) : items;
+        const gapIds = Array.from(
+            { length: GROUP_GAP_ROWS },
+            (_, index) => `__gap__${label}__${index}`
+        );
+
+        orderedGroups.push({
+            label,
+            collapsed: collapsedGroupSet.has(label),
+            gapIds,
+        });
+        orderedTracings.push(...visibleItems);
+        domain.push(...gapIds, ...visibleItems.map((item) => item.id));
+    });
+
+    return {
+        tracings: orderedTracings,
+        groups: orderedGroups,
+        domain,
+    };
+}
+
+function orderTools(tools, glyphSystem) {
+    const groupOrder = new Map(
+        [...glyphSystem.getAllGroups(), "unknown"].map((group, index) => [group, index])
+    );
+
+    return [...tools].sort((a, b) => {
+        const groupA = glyphSystem.getGroup(a);
+        const groupB = glyphSystem.getGroup(b);
+        const rankA = groupOrder.get(groupA) ?? groupOrder.size;
+        const rankB = groupOrder.get(groupB) ?? groupOrder.size;
+
+        if (rankA !== rankB) {
+            return rankA - rankB;
+        }
+
+        return compareLabels(a, b);
+    });
+}
+
+function getToolGroupBreaks(tools, glyphSystem) {
+    const breaks = [];
+
+    for (let index = 1; index < tools.length; index += 1) {
+        if (glyphSystem.getGroup(tools[index - 1]) !== glyphSystem.getGroup(tools[index])) {
+            breaks.push(tools[index]);
+        }
+    }
+
+    return breaks;
 }
 
 function buildTracingToolIndex(tracings) {
@@ -119,18 +349,42 @@ function renderToolCoverageBars({
     xScale,
     yScale,
     glyphSystem,
+    mode,
+    traceCount,
+    showTooltip,
+    hideTooltip,
+    formatScore,
 }) {
     const barsGroup = group.append("g").attr("class", "tool-coverage");
+    const zeroY = yScale(0);
 
     const bars = barsGroup
         .selectAll("rect")
         .data(data)
         .join("rect")
         .attr("x", (d) => xScale(d.toolName))
-        .attr("y", (d) => yScale(d.usageCount))
+        .attr("y", (d) =>
+            mode === "impact"
+                ? yScale(Math.max(d.impact, 0))
+                : yScale(d.usageCount)
+        )
         .attr("width", xScale.bandwidth())
-        .attr("height", (d) => yScale(0) - yScale(d.usageCount))
-        .attr("fill", "#111827");
+        .attr("height", (d) =>
+            mode === "impact"
+                ? Math.abs(yScale(d.impact) - zeroY)
+                : zeroY - yScale(d.usageCount)
+        )
+        .attr("fill", BAR_FILL);
+
+    if (mode === "impact") {
+        barsGroup
+            .append("line")
+            .attr("x1", 0)
+            .attr("x2", xScale.range()[1])
+            .attr("y1", zeroY)
+            .attr("y2", zeroY)
+            .attr("stroke", "#bababa");
+    }
 
     const yAxis = d3.axisLeft(yScale).ticks(5);
     const yAxisGroup = barsGroup
@@ -174,34 +428,155 @@ function renderToolCoverageBars({
 
     const setColumnHighlight = (toolName) => {
         if (!toolName) {
-            bars.attr("fill", "#111827");
+            bars.attr("fill", BAR_FILL);
             toolTexts.attr("fill", "#4b5563");
-            toolLabels.selectAll("path, circle, rect").attr("fill", "#111827");
+            toolLabels.selectAll("path, circle, rect").attr("fill", BAR_FILL);
             return;
         }
 
         bars.attr("fill", (d) =>
-            d.toolName === toolName ? "#0ea5e9" : "#111827"
+            d.toolName === toolName ? BAR_HIGHLIGHT_FILL : BAR_FILL
         );
         toolTexts.attr("fill", (d) =>
-            d.toolName === toolName ? "#0ea5e9" : "#4b5563"
+            d.toolName === toolName ? BAR_HIGHLIGHT_FILL : "#4b5563"
         );
         toolLabels.each(function (d) {
             const labelGroup = d3.select(this);
             const isHighlighted = d.toolName === toolName;
             labelGroup
                 .selectAll("path, circle, rect")
-                .attr("fill", isHighlighted ? "#0ea5e9" : "#111827");
+                .attr("fill", isHighlighted ? BAR_HIGHLIGHT_FILL : BAR_FILL);
         });
     };
 
     const clearColumnHighlight = () => {
-        bars.attr("fill", "#111827");
+        bars.attr("fill", BAR_FILL);
         toolTexts.attr("fill", "#4b5563");
-        toolLabels.selectAll("path, circle, rect").attr("fill", "#111827");
+        toolLabels.selectAll("path, circle, rect").attr("fill", BAR_FILL);
     };
 
+    const formatSigned = d3.format("+.3f");
+    const tooltipContent = (datum) => {
+        if (mode === "impact") {
+            return [
+                `<strong>Tool:</strong> ${datum.toolName}`,
+                `<strong>Group:</strong> ${glyphSystem.getGroup(datum.toolName)}`,
+                `<strong>Approx. Shapley impact:</strong> ${formatSigned(datum.impact)}`,
+                `<strong>|Impact|:</strong> ${formatScore(datum.impactAbs)}`,
+                `<strong>Runs with tool:</strong> ${datum.usageCount}/${traceCount}`,
+                `<strong>Mean score when present:</strong> ${formatScore(datum.meanPresentScore)}`,
+                `<strong>Mean score when absent:</strong> ${formatScore(datum.meanAbsentScore)}`,
+            ].join("<br/>");
+        }
+
+        return [
+            `<strong>Tool:</strong> ${datum.toolName}`,
+            `<strong>Group:</strong> ${glyphSystem.getGroup(datum.toolName)}`,
+            `<strong>Runs with tool:</strong> ${datum.usageCount}/${traceCount}`,
+        ].join("<br/>");
+    };
+
+    const bindTooltip = (selection) => {
+        selection
+            .on("mouseenter", (event, datum) => {
+                setColumnHighlight(datum.toolName);
+                showTooltip(event, tooltipContent(datum));
+            })
+            .on("mousemove", (event, datum) => {
+                showTooltip(event, tooltipContent(datum));
+            })
+            .on("mouseleave", () => {
+                hideTooltip();
+                clearColumnHighlight();
+            });
+    };
+
+    bindTooltip(bars);
+    bindTooltip(toolLabels);
+
     return { setColumnHighlight, clearColumnHighlight };
+}
+
+function renderToolGroupBreaks({
+    group,
+    breaks,
+    tools,
+    xScale,
+    height,
+}) {
+    if (breaks.length === 0) {
+        return;
+    }
+
+    group
+        .append("g")
+        .attr("class", "tool-group-breaks")
+        .selectAll("line")
+        .data(breaks)
+        .join("line")
+        .attr("x1", (tool) => {
+            const currentX = xScale(tool);
+            const previousX = xScale(tools[tools.indexOf(tool) - 1]);
+            return ((currentX ?? 0) + (previousX ?? 0) + xScale.bandwidth()) / 2;
+        })
+        .attr("x2", (tool) => {
+            const currentX = xScale(tool);
+            const previousX = xScale(tools[tools.indexOf(tool) - 1]);
+            return ((currentX ?? 0) + (previousX ?? 0) + xScale.bandwidth()) / 2;
+        })
+        .attr("y1", 0)
+        .attr("y2", height)
+        .attr("stroke", "#a1a1aa")
+        .attr("stroke-dasharray", "2 4");
+}
+
+function renderTraceGroupBreaks({
+    group,
+    groups,
+    traceScale,
+    width,
+    onGroupToggle,
+}) {
+    if (groups.length === 0) {
+        return;
+    }
+
+    const getGapCenter = (item) =>
+        d3.mean(
+            item.gapIds,
+            (gapId) => (traceScale(gapId) ?? 0) + traceScale.bandwidth() / 2
+        ) ?? 0;
+
+    group
+        .append("g")
+        .attr("class", "trace-group-breaks")
+        .selectAll("line")
+        .data(groups)
+        .join("line")
+        .attr("x1", 0)
+        .attr("x2", width)
+        .attr("y1", getGapCenter)
+        .attr("y2", getGapCenter)
+        .attr("stroke", "#a1a1aa")
+        .attr("stroke-dasharray", "2 4");
+
+    group
+        .append("g")
+        .attr("class", "trace-group-labels")
+        .selectAll("text")
+        .data(groups)
+        .join("text")
+        .attr("x", -12)
+        .attr("y", getGapCenter)
+        .attr("dy", "0.35em")
+        .attr("text-anchor", "end")
+        .attr("fill", "#71717a")
+        .style("font-size", "10px")
+        .style("cursor", onGroupToggle ? "pointer" : null)
+        .text((item) => `${item.collapsed ? "[+]" : "[-]"} ${item.label}`)
+        .on("click", (_, item) => {
+            onGroupToggle?.(item.label);
+        });
 }
 
 function renderCoverageGrid({
@@ -518,8 +893,8 @@ function renderScoreRail({
         .attr("text-anchor", "middle")
         .text("Run Score");
 
-    const scoreBarBaseFill = "#38bdf8";
-    const scoreBarHighlightFill = "#0284c7";
+    const scoreBarBaseFill = BAR_FILL;
+    const scoreBarHighlightFill = BAR_HIGHLIGHT_FILL;
     const scoreLabelBaseColor = "#475569";
     const scoreLabelHighlightColor = "#0f172a";
 
@@ -532,8 +907,7 @@ function renderScoreRail({
         .attr("y", (d) => traceScale(d.id))
         .attr("height", traceScale.bandwidth())
         .attr("width", (d) => scoreX(d.score ?? 0))
-        .attr("fill", scoreBarBaseFill)
-        .attr("rx", 3);
+        .attr("fill", scoreBarBaseFill);
 
     const scoreLabels = scoreGroup
         .selectAll("text.score-value")
@@ -586,10 +960,24 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
     if (!container) return;
 
     const tracings = prepareTracings(data);
-    const { tools, tracingToolCalls } = buildTracingToolIndex(tracings);
+    const topChartMode = options.topChartMode === "impact" ? "impact" : "usage";
     const glyphSystem = createGlyphSystem(toolSets);
-    const upperBarChartData = buildToolCoverageData(tools, tracingToolCalls);
-    const lowerBarChartData = buildTraceScoreData(tracingToolCalls);
+    const { tools, tracingToolCalls } = buildTracingToolIndex(tracings);
+    const orderedTracings = orderTracings(
+        tracings,
+        options.rowGroupBy,
+        options.collapsedGroups
+    );
+    const orderedTools = orderTools(tools, glyphSystem);
+    const toolGroupBreaks = getToolGroupBreaks(orderedTools, glyphSystem);
+    const upperBarChartData =
+        topChartMode === "impact"
+            ? buildToolImpactData(orderedTools, tracings, tracingToolCalls)
+            : buildToolCoverageData(orderedTools, tracingToolCalls);
+    const lowerBarChartData = buildTraceScoreData(
+        orderedTracings.tracings,
+        tracingToolCalls
+    );
 
     const width = options.width ?? Math.max(container.clientWidth || 0, 640);
     const margin = {
@@ -602,7 +990,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
 
     const minRowHeight = 20;
     const topBarHeightFixed = 200;
-    const numTracings = tracings.length;
+    const numTracings = orderedTracings.domain.length;
     const matrixHeightRequired = Math.max(
         numTracings * minRowHeight,
         100
@@ -670,16 +1058,31 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
 
     const x = d3
         .scaleBand()
-        .domain(tools)
+        .domain(orderedTools)
         .range([0, matrixWidth])
         .padding(0.3);
 
-    const maxToolUsage = d3.max(upperBarChartData, (d) => d.usageCount) || 1;
+    const maxToolValue =
+        topChartMode === "impact"
+            ? d3.max(upperBarChartData, (d) => Math.abs(d.impact)) || 1
+            : d3.max(upperBarChartData, (d) => d.usageCount) || 1;
     const yBar = d3
         .scaleLinear()
-        .domain([0, maxToolUsage])
+        .domain(
+            topChartMode === "impact"
+                ? [-maxToolValue, maxToolValue]
+                : [0, maxToolValue]
+        )
         .nice()
         .range([topBarHeight, 0]);
+
+    renderToolGroupBreaks({
+        group: g,
+        breaks: toolGroupBreaks,
+        tools: orderedTools,
+        xScale: x,
+        height: matrixTop + matrixHeight,
+    });
 
     const barHighlightControls = renderToolCoverageBars({
         group: g,
@@ -687,13 +1090,26 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         xScale: x,
         yScale: yBar,
         glyphSystem,
+        mode: topChartMode,
+        traceCount: tracings.length,
+        showTooltip,
+        hideTooltip,
+        formatScore,
     });
 
     const traceScale = d3
         .scaleBand()
-        .domain(tracings.map((t) => t.id))
+        .domain(orderedTracings.domain)
         .range([matrixTop, matrixTop + matrixHeight])
-        .paddingInner(0.4);
+        .paddingInner(0.25);
+
+    renderTraceGroupBreaks({
+        group: g,
+        groups: orderedTracings.groups,
+        traceScale,
+        width: matrixWidth + scoreWidth,
+        onGroupToggle: options.onGroupToggle,
+    });
 
     const maxScore = d3.max(lowerBarChartData, (d) => d.score) || 1;
     const scoreX = d3
@@ -704,8 +1120,8 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
     const matrixControls = renderCoverageGrid({
         svg,
         group: g,
-        tracings,
-        tools,
+        tracings: orderedTracings.tracings,
+        tools: orderedTools,
         matrixWidth,
         matrixTop,
         matrixHeight,
