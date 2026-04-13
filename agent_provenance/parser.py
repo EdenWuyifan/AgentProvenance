@@ -41,9 +41,9 @@ def parse_traces(
         path = Path(data)
         if _path_exists(path) and path.suffix == ".jsonl":
             with path.open(encoding="utf-8") as handle:
-                return [_minimal_trace(trace) for trace in _iter_jsonl_records(handle)]
+                return [_minimal_trace(trace, idx) for idx, trace in enumerate(_iter_jsonl_records(handle))]
 
-    return [_minimal_trace(trace) for trace in load_trace_records(data)]
+    return [_minimal_trace(trace, idx) for idx, trace in enumerate(load_trace_records(data))]
 
 
 def _path_exists(path: Path) -> bool:
@@ -106,9 +106,9 @@ def _iter_jsonl_records(lines: Iterable[str]) -> Iterable[Dict[str, Any]]:
         raise ValueError("No traces found in input")
 
 
-def _trace_id(trace: Dict[str, Any]) -> Any:
+def _trace_id(trace: Dict[str, Any], idx: int) -> Any:
     """Return the best available trace id."""
-    return trace.get("id", trace.get("trace_id", str(id(trace))))
+    return trace.get("id", trace.get("trace_id", f"agentrun#{idx}"))
 
 
 def _top_level_tool_calls(trace: Dict[str, Any]) -> List[Any]:
@@ -120,8 +120,8 @@ def _top_level_tool_calls(trace: Dict[str, Any]) -> List[Any]:
     return []
 
 
-def _minimal_trace(trace: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize any supported trace into {id, tool_calls, score?}."""
+def _minimal_trace(trace: Dict[str, Any], idx: int) -> Dict[str, Any]:
+    """Normalize any supported trace into {id, tool_calls, score?, ...metadata}."""
     tool_calls = extract_tool_call_responses(trace)
     if not tool_calls:
         tool_calls = [
@@ -130,9 +130,17 @@ def _minimal_trace(trace: Dict[str, Any]) -> Dict[str, Any]:
             if (tool_call := _minimal_tool_call(call))
         ]
 
+    excluded_keys = {"id", "score", "tool_calls", "toolCalls", "calls", "steps", "outputs"}
+    metadata = {
+        key: value
+        for key, value in trace.items()
+        if key not in excluded_keys and value is not None and value != "" and not isinstance(value, (dict, list))
+    }
+
     minimal = {
-        "id": _trace_id(trace),
+        "id": _trace_id(trace, idx),
         "tool_calls": tool_calls,
+        **metadata,
     }
 
     if trace.get("score") is not None:

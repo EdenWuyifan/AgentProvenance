@@ -188,3 +188,9 @@ MANIFEST
 **/.ipynb_checkpoints
 tmp.ipynb
 **/tmp.ipynb
+
+# bak
+*.bak
+
+# scripts
+scripts/
