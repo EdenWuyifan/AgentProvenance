@@ -31,6 +31,7 @@ type GraphEdgeData = {
   label?: string;
   curveOffset?: number;
   curveDirection?: 1 | -1;
+  color?: string;
 };
 
 type GraphNode = Node<GraphNodeData, 'tool'>;
@@ -40,9 +41,20 @@ type GraphEdgeProps = EdgeProps<GraphEdge>;
 
 const COLLAPSED_LAYOUT = { x: 0, y: 0, gapY: 50 };
 const TREE_LAYOUT = { x: 0, y: 0, gapX: 176, gapY: 112 };
+const COMPARE_LAYOUT = { x: 0, y: 0, gapX: 176, gapY: 112 };
 const EDGE_LAYOUT = {
   curveGap: 28,
   markerEnd: { type: MarkerType.Arrow, width: 24, height: 24 },
+};
+const TRACE_A_COLORS = {
+  edge: '#38bdf8',
+  fill: '#e0f2fe',
+  border: '#7dd3fc',
+};
+const TRACE_B_COLORS = {
+  edge: '#fb923c',
+  fill: '#ffedd5',
+  border: '#fdba74',
 };
 const GLYPH_SYSTEM = createGlyphSystem();
 
@@ -86,12 +98,16 @@ function EdgeBadge({
   );
 }
 
-function ToolNode({ data }: GraphNodeProps) {
+function ToolNode({
+  data,
+  sourcePosition = Position.Bottom,
+  targetPosition = Position.Top,
+}: GraphNodeProps) {
   const color = GLYPH_SYSTEM.getGroupColor(data.group);
 
   return (
     <>
-      <Handle type="target" position={Position.Top} />
+      <Handle type="target" position={targetPosition} />
       <div className="provenance-node" title={data.label}>
         <span
           className="provenance-node__glyph"
@@ -102,7 +118,7 @@ function ToolNode({ data }: GraphNodeProps) {
         </span>
         <span className="provenance-node__label">{data.label}</span>
       </div>
-      <Handle type="source" position={Position.Bottom} />
+      <Handle type="source" position={sourcePosition} />
     </>
   );
 }
@@ -147,6 +163,9 @@ function RepeatEdge(props: GraphEdgeProps) {
     data,
   } = props;
   const repeats = data?.repeats;
+  const edgeStyle = data?.color
+    ? { stroke: data.color, strokeWidth: 2 }
+    : undefined;
 
   let path = '';
   let labelX = (sourceX + targetX) / 2;
@@ -168,6 +187,7 @@ function RepeatEdge(props: GraphEdgeProps) {
         id={id}
         path={path}
         markerEnd={markerEnd}
+        style={edgeStyle}
       />
       {typeof repeats === 'number' && <EdgeBadge x={labelX} y={labelY} label={repeats} />}
     </>
@@ -175,9 +195,23 @@ function RepeatEdge(props: GraphEdgeProps) {
 }
 
 function SequentialEdge(props: GraphEdgeProps) {
-  const { id, source, target, sourceX, sourceY, targetX, targetY, markerEnd, data } =
-    props;
+  const {
+    id,
+    source,
+    target,
+    sourceX,
+    sourceY,
+    targetX,
+    targetY,
+    sourcePosition = Position.Bottom,
+    targetPosition = Position.Top,
+    markerEnd,
+    data,
+  } = props;
   const label = data?.label;
+  const edgeStyle = data?.color
+    ? { stroke: data.color, strokeWidth: 2 }
+    : undefined;
 
   if (source === target) {
     const loopOffset = data?.curveOffset ?? 1;
@@ -193,25 +227,37 @@ function SequentialEdge(props: GraphEdgeProps) {
           id={id}
           path={path}
           markerEnd={markerEnd}
+          style={edgeStyle}
         />
         {label && <EdgeBadge x={labelX} y={labelY} label={label} />}
       </>
     );
   }
 
-  let path = `M ${sourceX} ${sourceY} C ${sourceX} ${sourceY + 40} ${targetX} ${targetY - 40} ${targetX} ${targetY}`;
+  const horizontalFlow =
+    sourcePosition === Position.Right && targetPosition === Position.Left;
+  let path = '';
   let labelX = (sourceX + targetX) / 2;
   let labelY = (sourceY + targetY) / 2;
 
   {
     const curveOffset = data?.curveOffset ?? 0;
     const bend = (data?.curveDirection ?? 1) * curveOffset * EDGE_LAYOUT.curveGap;
-    const controlX1 = sourceX + bend;
-    const controlY1 = sourceY + 40 + curveOffset * 10;
-    const controlX2 = targetX + bend;
-    const controlY2 = targetY - 40 - curveOffset * 10;
+    if (horizontalFlow) {
+      const controlX1 = sourceX + 40 + curveOffset * 10;
+      const controlY1 = sourceY + bend;
+      const controlX2 = targetX - 40 - curveOffset * 10;
+      const controlY2 = targetY + bend;
 
-    path = `M ${sourceX} ${sourceY} C ${controlX1} ${controlY1} ${controlX2} ${controlY2} ${targetX} ${targetY}`;
+      path = `M ${sourceX} ${sourceY} C ${controlX1} ${controlY1} ${controlX2} ${controlY2} ${targetX} ${targetY}`;
+    } else {
+      const controlX1 = sourceX + bend;
+      const controlY1 = sourceY + 40 + curveOffset * 10;
+      const controlX2 = targetX + bend;
+      const controlY2 = targetY - 40 - curveOffset * 10;
+
+      path = `M ${sourceX} ${sourceY} C ${controlX1} ${controlY1} ${controlX2} ${controlY2} ${targetX} ${targetY}`;
+    }
     ({ x: labelX, y: labelY } = getPathMidpoint(
       path,
       (sourceX + targetX) / 2,
@@ -225,6 +271,7 @@ function SequentialEdge(props: GraphEdgeProps) {
         id={id}
         path={path}
         markerEnd={markerEnd}
+        style={edgeStyle}
       />
       {label && <EdgeBadge x={labelX} y={labelY} label={label} />}
     </>
@@ -233,6 +280,10 @@ function SequentialEdge(props: GraphEdgeProps) {
 
 function normalizeToolCalls(toolCalls: ToolCall[]) {
   return toolCalls.filter((toolCall) => toolCall?.name?.trim());
+}
+
+function getToolNames(tracing: Tracing) {
+  return normalizeToolCalls(tracing.toolCalls).map((toolCall) => toolCall.name);
 }
 
 function uniqueToolNames(toolCalls: ToolCall[]) {
@@ -439,6 +490,255 @@ function renderTreeGraph(tracing: Tracing) {
   return { nodes, edges };
 }
 
+function buildLcsPairs(traceA: Tracing, traceB: Tracing) {
+  const a = getToolNames(traceA);
+  const b = getToolNames(traceB);
+  const dp = Array.from({ length: a.length + 1 }, () =>
+    Array(b.length + 1).fill(0)
+  );
+
+  for (let i = a.length - 1; i >= 0; i -= 1) {
+    for (let j = b.length - 1; j >= 0; j -= 1) {
+      if (a[i] === b[j]) {
+        dp[i][j] = 1 + dp[i + 1][j + 1];
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+  }
+
+  const pairs: Array<[number, number, string]> = [];
+  let i = 0;
+  let j = 0;
+
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      pairs.push([i, j, a[i]]);
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] > dp[i][j + 1]) {
+      i += 1;
+    } else {
+      j += 1;
+    }
+  }
+
+  return { a, b, pairs };
+}
+
+function renderComparisonGraph(traceA: Tracing, traceB: Tracing) {
+  const { a, b, pairs } = buildLcsPairs(traceA, traceB);
+  const nodes: GraphNode[] = [];
+  const edges: GraphEdge[] = [];
+  const sharedNodeIds = pairs.map((_, index) => `${traceA.id}:${traceB.id}:shared:${index}`);
+  const sharedXs = pairs.map(
+    (_, index) => COMPARE_LAYOUT.x + index * COMPARE_LAYOUT.gapX
+  );
+
+  pairs.forEach(([, , name], index) => {
+    nodes.push({
+      id: sharedNodeIds[index],
+      type: 'tool',
+      position: {
+        x: sharedXs[index],
+        y: COMPARE_LAYOUT.y,
+      },
+      sourcePosition: Position.Right,
+      targetPosition: Position.Left,
+      data: buildNodeData(name),
+    });
+
+    if (index > 0) {
+      edges.push({
+        id: `${sharedNodeIds[index - 1]}:${sharedNodeIds[index]}`,
+        type: 'sequential',
+        source: sharedNodeIds[index - 1],
+        target: sharedNodeIds[index],
+        sourceHandle: null,
+        targetHandle: null,
+        markerEnd: EDGE_LAYOUT.markerEnd,
+      });
+    }
+  });
+
+  const addBranch = (
+    sequence: string[],
+    matchIndexes: number[],
+    traceId: Tracing['id'],
+    laneY: number,
+    colors: typeof TRACE_A_COLORS
+  ) => {
+    let previousMatch = -1;
+
+    for (let sharedIndex = 0; sharedIndex <= matchIndexes.length; sharedIndex += 1) {
+      const nextMatch =
+        sharedIndex < matchIndexes.length ? matchIndexes[sharedIndex] : sequence.length;
+      const items = sequence.slice(previousMatch + 1, nextMatch);
+
+      if (items.length > 0) {
+        const leftAnchorIndex = sharedIndex - 1;
+        const rightAnchorIndex = sharedIndex < sharedXs.length ? sharedIndex : null;
+        const leftAnchorId = leftAnchorIndex >= 0 ? sharedNodeIds[leftAnchorIndex] : null;
+        const rightAnchorId =
+          rightAnchorIndex === null ? null : sharedNodeIds[rightAnchorIndex];
+        const leftX = leftAnchorIndex >= 0 ? sharedXs[leftAnchorIndex] : null;
+        const rightX = rightAnchorIndex === null ? null : sharedXs[rightAnchorIndex];
+
+        const branchNodeIds = items.map((name, itemIndex) => {
+          let x = COMPARE_LAYOUT.x + itemIndex * COMPARE_LAYOUT.gapX;
+
+          if (leftX !== null && rightX !== null) {
+            x = leftX + ((rightX - leftX) * (itemIndex + 1)) / (items.length + 1);
+          } else if (leftX !== null) {
+            x = leftX + COMPARE_LAYOUT.gapX * (itemIndex + 1);
+          } else if (rightX !== null) {
+            x = rightX - COMPARE_LAYOUT.gapX * (items.length - itemIndex);
+          }
+
+          const id = `${traceId}:compare:${sharedIndex}:${itemIndex}`;
+
+          nodes.push({
+            id,
+            type: 'tool',
+            position: { x, y: laneY },
+            sourcePosition: Position.Right,
+            targetPosition: Position.Left,
+            data: buildNodeData(name),
+            style: {
+              backgroundColor: colors.fill,
+              borderColor: colors.border,
+            },
+          });
+
+          return id;
+        });
+
+        if (leftAnchorId) {
+          edges.push({
+            id: `${leftAnchorId}:${branchNodeIds[0]}`,
+            type: 'sequential',
+            source: leftAnchorId,
+            target: branchNodeIds[0],
+            sourceHandle: null,
+            targetHandle: null,
+            data: { color: colors.edge },
+            markerEnd: EDGE_LAYOUT.markerEnd,
+          });
+        }
+
+        for (let itemIndex = 1; itemIndex < branchNodeIds.length; itemIndex += 1) {
+          edges.push({
+            id: `${branchNodeIds[itemIndex - 1]}:${branchNodeIds[itemIndex]}`,
+            type: 'sequential',
+            source: branchNodeIds[itemIndex - 1],
+            target: branchNodeIds[itemIndex],
+            sourceHandle: null,
+            targetHandle: null,
+            data: { color: colors.edge },
+            markerEnd: EDGE_LAYOUT.markerEnd,
+          });
+        }
+
+        if (rightAnchorId) {
+          edges.push({
+            id: `${branchNodeIds[branchNodeIds.length - 1]}:${rightAnchorId}`,
+            type: 'sequential',
+            source: branchNodeIds[branchNodeIds.length - 1],
+            target: rightAnchorId,
+            sourceHandle: null,
+            targetHandle: null,
+            data: { color: colors.edge },
+            markerEnd: EDGE_LAYOUT.markerEnd,
+          });
+        }
+      }
+
+      previousMatch = nextMatch;
+    }
+  };
+
+  addBranch(
+    a,
+    pairs.map(([index]) => index),
+    traceA.id,
+    COMPARE_LAYOUT.y - COMPARE_LAYOUT.gapY,
+    TRACE_A_COLORS
+  );
+  addBranch(
+    b,
+    pairs.map(([, index]) => index),
+    traceB.id,
+    COMPARE_LAYOUT.y + COMPARE_LAYOUT.gapY,
+    TRACE_B_COLORS
+  );
+
+  if (nodes.length === 0) {
+    a.forEach((name, index) => {
+      nodes.push({
+        id: `${traceA.id}:compare:none:${index}`,
+        type: 'tool',
+        position: {
+          x: COMPARE_LAYOUT.x + index * COMPARE_LAYOUT.gapX,
+          y: COMPARE_LAYOUT.y - COMPARE_LAYOUT.gapY,
+        },
+        sourcePosition: Position.Right,
+        targetPosition: Position.Left,
+        data: buildNodeData(name),
+        style: {
+          backgroundColor: TRACE_A_COLORS.fill,
+          borderColor: TRACE_A_COLORS.border,
+        },
+      });
+
+      if (index > 0) {
+        edges.push({
+          id: `${traceA.id}:compare:none:${index - 1}:${index}`,
+          type: 'sequential',
+          source: `${traceA.id}:compare:none:${index - 1}`,
+          target: `${traceA.id}:compare:none:${index}`,
+          sourceHandle: null,
+          targetHandle: null,
+          data: { color: TRACE_A_COLORS.edge },
+          markerEnd: EDGE_LAYOUT.markerEnd,
+        });
+      }
+    });
+
+    b.forEach((name, index) => {
+      nodes.push({
+        id: `${traceB.id}:compare:none:${index}`,
+        type: 'tool',
+        position: {
+          x: COMPARE_LAYOUT.x + index * COMPARE_LAYOUT.gapX,
+          y: COMPARE_LAYOUT.y + COMPARE_LAYOUT.gapY,
+        },
+        sourcePosition: Position.Right,
+        targetPosition: Position.Left,
+        data: buildNodeData(name),
+        style: {
+          backgroundColor: TRACE_B_COLORS.fill,
+          borderColor: TRACE_B_COLORS.border,
+        },
+      });
+
+      if (index > 0) {
+        edges.push({
+          id: `${traceB.id}:compare:none:${index - 1}:${index}`,
+          type: 'sequential',
+          source: `${traceB.id}:compare:none:${index - 1}`,
+          target: `${traceB.id}:compare:none:${index}`,
+          sourceHandle: null,
+          targetHandle: null,
+          data: { color: TRACE_B_COLORS.edge },
+          markerEnd: EDGE_LAYOUT.markerEnd,
+        });
+      }
+    });
+  }
+
+  return { nodes, edges };
+}
+
 function renderProvenanceGraph(tracing: Tracing, mode: GraphMode) {
   if (mode === 'tree') {
     return renderTreeGraph(tracing);
@@ -447,31 +747,33 @@ function renderProvenanceGraph(tracing: Tracing, mode: GraphMode) {
   return renderCollapsedGraph(tracing);
 }
 
-function ProvenanceGraphView({
-  tracing,
-  mode,
+function FlowGraph({
+  graph,
+  graphKey,
+  emptyMessage,
+  heightClass = 'h-96',
 }: {
-  tracing: Tracing;
-  mode: GraphMode;
+  graph: { nodes: GraphNode[]; edges: GraphEdge[] };
+  graphKey: string;
+  emptyMessage: string;
+  heightClass?: string;
 }) {
-  const graph = renderProvenanceGraph(tracing, mode);
   const [nodes, setNodes, onNodesChange] = useNodesState(graph.nodes);
   const [edges, setEdges] = useState(graph.edges);
 
   useEffect(() => {
-    const nextGraph = renderProvenanceGraph(tracing, mode);
-    setNodes(nextGraph.nodes);
-    setEdges(nextGraph.edges);
-  }, [mode, tracing, setNodes]);
+    setNodes(graph.nodes);
+    setEdges(graph.edges);
+  }, [graph, setNodes]);
 
   if (nodes.length === 0) {
-    return <div className="text-sm text-zinc-600">No tool calls.</div>;
+    return <div className="text-sm text-zinc-600">{emptyMessage}</div>;
   }
 
   return (
-    <div className="h-96">
+    <div className={heightClass}>
       <ReactFlow
-        key={`${tracing.id}:${mode}`}
+        key={graphKey}
         nodes={nodes}
         edges={edges}
         nodeTypes={nodeTypes}
@@ -490,5 +792,41 @@ function ProvenanceGraphView({
   );
 }
 
-export { ProvenanceGraphView, renderProvenanceGraph };
+function ProvenanceGraphView({
+  tracing,
+  mode,
+}: {
+  tracing: Tracing;
+  mode: GraphMode;
+}) {
+  const graph = renderProvenanceGraph(tracing, mode);
+  return (
+    <FlowGraph
+      graph={graph}
+      graphKey={`${tracing.id}:${mode}`}
+      emptyMessage="No tool calls."
+    />
+  );
+}
+
+function TracingComparisonView({
+  traceA,
+  traceB,
+}: {
+  traceA: Tracing;
+  traceB: Tracing;
+}) {
+  const graph = renderComparisonGraph(traceA, traceB);
+
+  return (
+    <FlowGraph
+      graph={graph}
+      graphKey={`${traceA.id}:${traceB.id}:compare`}
+      emptyMessage="No comparable tool calls."
+      heightClass="h-[28rem]"
+    />
+  );
+}
+
+export { ProvenanceGraphView, TracingComparisonView, renderProvenanceGraph };
 export type { GraphMode };

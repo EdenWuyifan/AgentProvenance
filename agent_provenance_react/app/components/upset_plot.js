@@ -596,9 +596,24 @@ function renderCoverageGrid({
     showTooltip,
     hideTooltip,
     formatArgs,
+    selectedTracingColors,
     onTracingSelect,
 }) {
     const gridStroke = "rgba(15,23,42,0.2)";
+
+    group
+        .append("g")
+        .attr("class", "matrix-selected-rows")
+        .selectAll("rect")
+        .data(tracings.filter((tracing) => selectedTracingColors?.[tracing.id]))
+        .join("rect")
+        .attr("x", 0)
+        .attr("y", (tracing) => traceScale(tracing.id))
+        .attr("width", matrixWidth + scoreWidth)
+        .attr("height", traceScale.bandwidth())
+        .attr("rx", 4)
+        .attr("fill", (tracing) => selectedTracingColors[tracing.id])
+        .style("pointer-events", "none");
 
     const highlightRow = group
         .append("rect")
@@ -1134,6 +1149,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         showTooltip,
         hideTooltip,
         formatArgs,
+        selectedTracingColors: options.selectedTracingColors,
         onTracingSelect: options.onTracingSelect,
     });
 
@@ -1147,6 +1163,9 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         .attr("dy", "0.35em")
         .attr("text-anchor", "end")
         .attr("fill", "#111827")
+        .attr("font-weight", (d) =>
+            options.selectedTracingColors?.[d.id] ? 600 : 400
+        )
         .style("font-size", "10px")
         .style("cursor", options.onTracingSelect ? "pointer" : null)
         .on("click", (_, d) => {

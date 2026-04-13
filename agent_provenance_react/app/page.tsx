@@ -10,6 +10,7 @@ import {
 
 import {
   ProvenanceGraphView,
+  TracingComparisonView,
   type GraphMode,
 } from "./components/provenance_graph";
 import type { Tracing } from "./components/types";
@@ -21,6 +22,10 @@ import {
 } from "./components/visualization_shared";
 
 const GROUPING_EXCLUDED_KEYS = new Set(["id", "score", "toolCalls", "tool_calls"]);
+const TRACE_SELECTION_COLORS = [
+  "rgba(56, 189, 248, 0.18)",
+  "rgba(251, 146, 60, 0.18)",
+] as const;
 
 type TopChartMode = "usage" | "impact";
 
@@ -308,9 +313,7 @@ function UpsetTopChartToggle({
 
 export default function Home() {
   const upsetRef = useRef<HTMLDivElement | null>(null);
-  const [selectedTracingId, setSelectedTracingId] = useState<string | number | null>(
-    null
-  );
+  const [selectedTracingIds, setSelectedTracingIds] = useState<Array<Tracing["id"]>>([]);
   const [topChartMode, setTopChartMode] = useState<TopChartMode>("impact");
   const [upsetGroupBy, setUpsetGroupBy] = useState("");
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
@@ -319,8 +322,36 @@ export default function Home() {
   const { data, loading, error } = useTracingData("/tracings.jsonl");
   const groupingOptions = getGroupingOptions(data);
   const groupingValues = getGroupingValues(data, upsetGroupBy);
-  const selectedTracing =
-    data.find((tracing) => tracing.id === selectedTracingId) ?? null;
+  const selectedTracings = selectedTracingIds
+    .map((selectedTracingId) =>
+      data.find((tracing) => tracing.id === selectedTracingId) ?? null
+    )
+    .filter((tracing): tracing is Tracing => tracing !== null);
+  const selectedTracing = selectedTracings[0] ?? null;
+  const selectedTracingColors = Object.fromEntries(
+    selectedTracingIds.map((selectedTracingId, index) => [
+      selectedTracingId,
+      TRACE_SELECTION_COLORS[index],
+    ])
+  );
+
+  function handleTracingSelect(tracingId: Tracing["id"]) {
+    setSelectedTracingIds((current) => {
+      if (current.includes(tracingId)) {
+        return current.filter((selectedTracingId) => selectedTracingId !== tracingId);
+      }
+
+      if (current.length === 0) {
+        return [tracingId];
+      }
+
+      if (current.length === 1) {
+        return [...current, tracingId];
+      }
+
+      return [current[0], tracingId];
+    });
+  }
 
   useEffect(() => {
     const validGroups = new Set(getGroupingValues(data, upsetGroupBy));
@@ -329,6 +360,14 @@ export default function Home() {
       current.filter((group) => validGroups.has(group))
     );
   }, [data, upsetGroupBy]);
+
+  useEffect(() => {
+    setSelectedTracingIds((current) =>
+      current.filter((selectedTracingId) =>
+        data.some((tracing) => tracing.id === selectedTracingId)
+      )
+    );
+  }, [data]);
 
   useEffect(() => {
     const element = upsetRef.current;
@@ -342,6 +381,7 @@ export default function Home() {
         topChartMode,
         rowGroupBy: upsetGroupBy || undefined,
         collapsedGroups,
+        selectedTracingColors,
         onGroupToggle: (group: string) => {
           setCollapsedGroups((current) =>
             current.includes(group)
@@ -349,7 +389,7 @@ export default function Home() {
               : [...current, group]
           );
         },
-        onTracingSelect: setSelectedTracingId,
+        onTracingSelect: handleTracingSelect,
       });
     };
 
@@ -361,7 +401,7 @@ export default function Home() {
     return () => {
       observer.disconnect();
     };
-  }, [collapsedGroups, data, error, loading, topChartMode, upsetGroupBy]);
+  }, [collapsedGroups, data, error, loading, selectedTracingIds, topChartMode, upsetGroupBy]);
 
   return (
     <div className="min-h-screen bg-stone-100 px-4 py-10 text-zinc-950">
@@ -374,7 +414,7 @@ export default function Home() {
 
         <Card
           title="Tracings provenance"
-          description="Click a run to show its provenance graph."
+          description="Click up to 2 runs to inspect a provenance graph or compare them on a shared LCS branch."
         >
           {loading && <StatusMessage message="Loading traces…" />}
           {!loading && error && <StatusMessage message={error} />}
@@ -423,12 +463,16 @@ export default function Home() {
         <Card
           title="Provenance graph"
           description={
-            selectedTracing
-              ? `Run #${selectedTracing.id}`
-              : "Select a run from the plot."
+            selectedTracings.length === 2
+              ? `Compare run #${selectedTracings[0].id} in blue with run #${selectedTracings[1].id} in orange.`
+              : selectedTracing
+                ? `Run #${selectedTracing.id}`
+                : "Select up to 2 runs from the plot."
           }
           actions={
-            <GraphModeToggle mode={graphMode} onChange={setGraphMode} />
+            selectedTracings.length === 1 ? (
+              <GraphModeToggle mode={graphMode} onChange={setGraphMode} />
+            ) : undefined
           }
         >
           {loading && <StatusMessage message="Loading traces…" />}
@@ -436,11 +480,17 @@ export default function Home() {
           {!loading && !error && data.length === 0 && (
             <StatusMessage message="No traces available." />
           )}
-          {!loading && !error && data.length > 0 && !selectedTracing && (
-            <StatusMessage message="Select a trace in the matrix to render its provenance graph." />
+          {!loading && !error && data.length > 0 && selectedTracings.length === 0 && (
+            <StatusMessage message="Select up to 2 traces in the matrix to render a provenance graph or comparison." />
           )}
-          {!loading && !error && selectedTracing && (
+          {!loading && !error && selectedTracings.length === 1 && selectedTracing && (
             <ProvenanceGraphView tracing={selectedTracing} mode={graphMode} />
+          )}
+          {!loading && !error && selectedTracings.length === 2 && (
+            <TracingComparisonView
+              traceA={selectedTracings[0]}
+              traceB={selectedTracings[1]}
+            />
           )}
         </Card>
       </main>
