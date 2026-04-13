@@ -7,6 +7,7 @@ import {
   EdgeLabelRenderer,
   Handle,
   MarkerType,
+  NodeToolbar,
   Position,
   ReactFlow,
   useNodesState,
@@ -20,10 +21,21 @@ import { createGlyphSystem } from './visualization_shared';
 
 type GraphMode = 'collapsed' | 'tree';
 
+type ComparisonNodeDetail = {
+  traceId: Tracing['id'];
+  traceLabel: string;
+  step: number;
+  color: string;
+  toolCall: ToolCall;
+};
+
 type GraphNodeData = {
   label: string;
   glyph: string;
   group: string;
+  details?: ComparisonNodeDetail[];
+  tooltipOpen?: boolean;
+  onCloseDetails?: () => void;
 };
 
 type GraphEdgeData = {
@@ -56,6 +68,12 @@ const TRACE_B_COLORS = {
   fill: '#ffedd5',
   border: '#fdba74',
 };
+const TRACE_C_COLORS = {
+  edge: '#22c55e',
+  fill: '#dcfce7',
+  border: '#86efac',
+};
+const COMPARISON_TRACE_COLORS = [TRACE_A_COLORS, TRACE_B_COLORS, TRACE_C_COLORS] as const;
 const GLYPH_SYSTEM = createGlyphSystem();
 
 const nodeTypes = { tool: ToolNode };
@@ -107,6 +125,14 @@ function ToolNode({
 
   return (
     <>
+      {data.details?.length ? (
+        <NodeToolbar isVisible={data.tooltipOpen} position={Position.Top} offset={8}>
+          <ComparisonNodeDetails
+            details={data.details}
+            onClose={data.onCloseDetails ?? (() => {})}
+          />
+        </NodeToolbar>
+      ) : null}
       <Handle type="target" position={targetPosition} />
       <div className="provenance-node" title={data.label}>
         <span
@@ -290,12 +316,48 @@ function uniqueToolNames(toolCalls: ToolCall[]) {
   return Array.from(new Set(toolCalls.map((toolCall) => toolCall.name)));
 }
 
-function buildNodeData(name: string): GraphNodeData {
+function buildNodeData(
+  name: string,
+  details?: ComparisonNodeDetail[]
+): GraphNodeData {
   return {
     label: name,
     glyph: GLYPH_SYSTEM.getGlyph(name),
     group: GLYPH_SYSTEM.getGroup(name),
+    details,
   };
+}
+
+function buildComparisonNodeDetail(
+  trace: Tracing,
+  toolCall: ToolCall,
+  step: number,
+  traceLabel: string,
+  color: string
+): ComparisonNodeDetail {
+  return {
+    traceId: trace.id,
+    traceLabel,
+    step,
+    color,
+    toolCall,
+  };
+}
+
+function formatDetailValue(value: unknown) {
+  if (value === null || value === undefined || value === '') {
+    return '—';
+  }
+
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }
 
 function renderCollapsedGraph(tracing: Tracing) {
@@ -507,13 +569,13 @@ function buildLcsPairs(traceA: Tracing, traceB: Tracing) {
     }
   }
 
-  const pairs: Array<[number, number, string]> = [];
+  const matches: Array<{ indexes: [number, number]; name: string }> = [];
   let i = 0;
   let j = 0;
 
   while (i < a.length && j < b.length) {
     if (a[i] === b[j]) {
-      pairs.push([i, j, a[i]]);
+      matches.push({ indexes: [i, j], name: a[i] });
       i += 1;
       j += 1;
     } else if (dp[i + 1][j] > dp[i][j + 1]) {
@@ -523,19 +585,96 @@ function buildLcsPairs(traceA: Tracing, traceB: Tracing) {
     }
   }
 
-  return { a, b, pairs };
+  return { sequences: [a, b], matches };
 }
 
-function renderComparisonGraph(traceA: Tracing, traceB: Tracing) {
-  const { a, b, pairs } = buildLcsPairs(traceA, traceB);
+function buildLcsTriples(traceA: Tracing, traceB: Tracing, traceC: Tracing) {
+  const a = getToolNames(traceA);
+  const b = getToolNames(traceB);
+  const c = getToolNames(traceC);
+  const dp = Array.from({ length: a.length + 1 }, () =>
+    Array.from({ length: b.length + 1 }, () => Array(c.length + 1).fill(0))
+  );
+
+  for (let i = a.length - 1; i >= 0; i -= 1) {
+    for (let j = b.length - 1; j >= 0; j -= 1) {
+      for (let k = c.length - 1; k >= 0; k -= 1) {
+        if (a[i] === b[j] && a[i] === c[k]) {
+          dp[i][j][k] = 1 + dp[i + 1][j + 1][k + 1];
+        } else {
+          dp[i][j][k] = Math.max(
+            dp[i + 1][j][k],
+            dp[i][j + 1][k],
+            dp[i][j][k + 1]
+          );
+        }
+      }
+    }
+  }
+
+  const matches: Array<{ indexes: [number, number, number]; name: string }> = [];
+  let i = 0;
+  let j = 0;
+  let k = 0;
+
+  while (i < a.length && j < b.length && k < c.length) {
+    if (a[i] === b[j] && a[i] === c[k]) {
+      matches.push({ indexes: [i, j, k], name: a[i] });
+      i += 1;
+      j += 1;
+      k += 1;
+      continue;
+    }
+
+    const nextA = dp[i + 1][j][k];
+    const nextB = dp[i][j + 1][k];
+    const nextC = dp[i][j][k + 1];
+
+    if (nextA >= nextB && nextA >= nextC) {
+      i += 1;
+    } else if (nextB >= nextC) {
+      j += 1;
+    } else {
+      k += 1;
+    }
+  }
+
+  return { sequences: [a, b, c], matches };
+}
+
+function getComparisonLaneYs(count: number) {
+  if (count === 3) {
+    return [
+      COMPARE_LAYOUT.y - COMPARE_LAYOUT.gapY * 2,
+      COMPARE_LAYOUT.y + COMPARE_LAYOUT.gapY * 2,
+      COMPARE_LAYOUT.y + COMPARE_LAYOUT.gapY * 4,
+    ];
+  }
+
+  return [
+    COMPARE_LAYOUT.y - COMPARE_LAYOUT.gapY,
+    COMPARE_LAYOUT.y + COMPARE_LAYOUT.gapY,
+  ];
+}
+
+function renderComparisonGraph(traces: Tracing[]) {
+  const comparison =
+    traces.length === 3
+      ? buildLcsTriples(traces[0], traces[1], traces[2])
+      : buildLcsPairs(traces[0], traces[1]);
+  const traceToolCalls = traces.map((trace) => normalizeToolCalls(trace.toolCalls));
+  const traceLabels = ['A', 'B', 'C'];
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
-  const sharedNodeIds = pairs.map((_, index) => `${traceA.id}:${traceB.id}:shared:${index}`);
-  const sharedXs = pairs.map(
+  const comparisonId = traces.map((trace) => trace.id).join(':');
+  const sharedNodeIds = comparison.matches.map(
+    (_, index) => `${comparisonId}:shared:${index}`
+  );
+  const sharedXs = comparison.matches.map(
     (_, index) => COMPARE_LAYOUT.x + index * COMPARE_LAYOUT.gapX
   );
 
-  pairs.forEach(([, , name], index) => {
+  comparison.matches.forEach((match, index) => {
     nodes.push({
       id: sharedNodeIds[index],
       type: 'tool',
@@ -545,7 +684,18 @@ function renderComparisonGraph(traceA: Tracing, traceB: Tracing) {
       },
       sourcePosition: Position.Right,
       targetPosition: Position.Left,
-      data: buildNodeData(name),
+      data: buildNodeData(
+        match.name,
+        traces.map((trace, traceIndex) =>
+          buildComparisonNodeDetail(
+            trace,
+            traceToolCalls[traceIndex][match.indexes[traceIndex]],
+            match.indexes[traceIndex] + 1,
+            traceLabels[traceIndex],
+            COMPARISON_TRACE_COLORS[traceIndex].edge
+          )
+        )
+      ),
     });
 
     if (index > 0) {
@@ -563,9 +713,11 @@ function renderComparisonGraph(traceA: Tracing, traceB: Tracing) {
 
   const addBranch = (
     sequence: string[],
+    toolCalls: ToolCall[],
     matchIndexes: number[],
-    traceId: Tracing['id'],
+    trace: Tracing,
     laneY: number,
+    traceLabel: string,
     colors: typeof TRACE_A_COLORS
   ) => {
     let previousMatch = -1;
@@ -573,7 +725,8 @@ function renderComparisonGraph(traceA: Tracing, traceB: Tracing) {
     for (let sharedIndex = 0; sharedIndex <= matchIndexes.length; sharedIndex += 1) {
       const nextMatch =
         sharedIndex < matchIndexes.length ? matchIndexes[sharedIndex] : sequence.length;
-      const items = sequence.slice(previousMatch + 1, nextMatch);
+      const startIndex = previousMatch + 1;
+      const items = sequence.slice(startIndex, nextMatch);
 
       if (items.length > 0) {
         const leftAnchorIndex = sharedIndex - 1;
@@ -595,7 +748,8 @@ function renderComparisonGraph(traceA: Tracing, traceB: Tracing) {
             x = rightX - COMPARE_LAYOUT.gapX * (items.length - itemIndex);
           }
 
-          const id = `${traceId}:compare:${sharedIndex}:${itemIndex}`;
+          const sequenceIndex = startIndex + itemIndex;
+          const id = `${trace.id}:compare:${sharedIndex}:${itemIndex}`;
 
           nodes.push({
             id,
@@ -603,7 +757,15 @@ function renderComparisonGraph(traceA: Tracing, traceB: Tracing) {
             position: { x, y: laneY },
             sourcePosition: Position.Right,
             targetPosition: Position.Left,
-            data: buildNodeData(name),
+            data: buildNodeData(name, [
+              buildComparisonNodeDetail(
+                trace,
+                toolCalls[sequenceIndex],
+                sequenceIndex + 1,
+                traceLabel,
+                colors.edge
+              ),
+            ]),
             style: {
               backgroundColor: colors.fill,
               borderColor: colors.border,
@@ -657,82 +819,62 @@ function renderComparisonGraph(traceA: Tracing, traceB: Tracing) {
     }
   };
 
-  addBranch(
-    a,
-    pairs.map(([index]) => index),
-    traceA.id,
-    COMPARE_LAYOUT.y - COMPARE_LAYOUT.gapY,
-    TRACE_A_COLORS
-  );
-  addBranch(
-    b,
-    pairs.map(([, index]) => index),
-    traceB.id,
-    COMPARE_LAYOUT.y + COMPARE_LAYOUT.gapY,
-    TRACE_B_COLORS
-  );
+  const laneYs = getComparisonLaneYs(traces.length);
+
+  traces.forEach((trace, index) => {
+    addBranch(
+      comparison.sequences[index],
+      traceToolCalls[index],
+      comparison.matches.map((match) => match.indexes[index]),
+      trace,
+      laneYs[index],
+      traceLabels[index],
+      COMPARISON_TRACE_COLORS[index]
+    );
+  });
 
   if (nodes.length === 0) {
-    a.forEach((name, index) => {
-      nodes.push({
-        id: `${traceA.id}:compare:none:${index}`,
-        type: 'tool',
-        position: {
-          x: COMPARE_LAYOUT.x + index * COMPARE_LAYOUT.gapX,
-          y: COMPARE_LAYOUT.y - COMPARE_LAYOUT.gapY,
-        },
-        sourcePosition: Position.Right,
-        targetPosition: Position.Left,
-        data: buildNodeData(name),
-        style: {
-          backgroundColor: TRACE_A_COLORS.fill,
-          borderColor: TRACE_A_COLORS.border,
-        },
-      });
+    traces.forEach((trace, traceIndex) => {
+      const colors = COMPARISON_TRACE_COLORS[traceIndex];
 
-      if (index > 0) {
-        edges.push({
-          id: `${traceA.id}:compare:none:${index - 1}:${index}`,
-          type: 'sequential',
-          source: `${traceA.id}:compare:none:${index - 1}`,
-          target: `${traceA.id}:compare:none:${index}`,
-          sourceHandle: null,
-          targetHandle: null,
-          data: { color: TRACE_A_COLORS.edge },
-          markerEnd: EDGE_LAYOUT.markerEnd,
+      comparison.sequences[traceIndex].forEach((name, index) => {
+        nodes.push({
+          id: `${trace.id}:compare:none:${index}`,
+          type: 'tool',
+          position: {
+            x: COMPARE_LAYOUT.x + index * COMPARE_LAYOUT.gapX,
+            y: laneYs[traceIndex],
+          },
+          sourcePosition: Position.Right,
+          targetPosition: Position.Left,
+          data: buildNodeData(name, [
+            buildComparisonNodeDetail(
+              trace,
+              traceToolCalls[traceIndex][index],
+              index + 1,
+              traceLabels[traceIndex],
+              colors.edge
+            ),
+          ]),
+          style: {
+            backgroundColor: colors.fill,
+            borderColor: colors.border,
+          },
         });
-      }
-    });
 
-    b.forEach((name, index) => {
-      nodes.push({
-        id: `${traceB.id}:compare:none:${index}`,
-        type: 'tool',
-        position: {
-          x: COMPARE_LAYOUT.x + index * COMPARE_LAYOUT.gapX,
-          y: COMPARE_LAYOUT.y + COMPARE_LAYOUT.gapY,
-        },
-        sourcePosition: Position.Right,
-        targetPosition: Position.Left,
-        data: buildNodeData(name),
-        style: {
-          backgroundColor: TRACE_B_COLORS.fill,
-          borderColor: TRACE_B_COLORS.border,
-        },
+        if (index > 0) {
+          edges.push({
+            id: `${trace.id}:compare:none:${index - 1}:${index}`,
+            type: 'sequential',
+            source: `${trace.id}:compare:none:${index - 1}`,
+            target: `${trace.id}:compare:none:${index}`,
+            sourceHandle: null,
+            targetHandle: null,
+            data: { color: colors.edge },
+            markerEnd: EDGE_LAYOUT.markerEnd,
+          });
+        }
       });
-
-      if (index > 0) {
-        edges.push({
-          id: `${traceB.id}:compare:none:${index - 1}:${index}`,
-          type: 'sequential',
-          source: `${traceB.id}:compare:none:${index - 1}`,
-          target: `${traceB.id}:compare:none:${index}`,
-          sourceHandle: null,
-          targetHandle: null,
-          data: { color: TRACE_B_COLORS.edge },
-          markerEnd: EDGE_LAYOUT.markerEnd,
-        });
-      }
     });
   }
 
@@ -745,6 +887,83 @@ function renderProvenanceGraph(tracing: Tracing, mode: GraphMode) {
   }
 
   return renderCollapsedGraph(tracing);
+}
+
+function ComparisonNodeDetails({
+  details,
+  onClose,
+}: {
+  details: ComparisonNodeDetail[];
+  onClose: () => void;
+}) {
+  const horizontal = details.length > 1;
+
+  return (
+    <div
+      className="nodrag nopan relative min-h-[4rem] min-w-[11rem] resize overflow-auto rounded-md border border-zinc-200 bg-white px-1.5 py-1 shadow-sm"
+      style={horizontal ? { width: `${details.length * 9}rem` } : undefined}
+      onClick={(event) => event.stopPropagation()}
+      onMouseDown={(event) => event.stopPropagation()}
+    >
+      <button
+        type="button"
+        aria-label="Close details"
+        className="nodrag nopan absolute right-1.5 top-1.5 inline-flex h-3.5 w-3.5 items-center justify-center text-zinc-400 transition hover:text-zinc-950"
+        onClick={(event) => {
+          event.stopPropagation();
+          onClose();
+        }}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <svg viewBox="0 0 12 12" width="10" height="10" fill="none" aria-hidden="true">
+          <path d="M2 2l8 8M10 2L2 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+        </svg>
+      </button>
+      <div
+        className={horizontal ? 'grid gap-1 pr-4' : 'space-y-1 pr-4'}
+        style={horizontal ? { gridTemplateColumns: `repeat(${details.length}, minmax(0, 1fr))` } : undefined}
+      >
+        {details.map((detail) => {
+          const status =
+            typeof (detail.toolCall as { status?: unknown }).status === 'string'
+              ? (detail.toolCall as { status?: string }).status
+              : null;
+
+          return (
+            <div
+              key={`${detail.traceLabel}:${detail.traceId}:${detail.step}`}
+              className={
+                horizontal
+                  ? 'min-w-0 border-l border-zinc-200 pl-1 first:border-l-0 first:pl-0'
+                  : 'border-t border-zinc-200 pt-1 first:border-t-0 first:pt-0'
+              }
+            >
+              <div className="flex flex-wrap items-center gap-x-1 gap-y-0.5 text-[9px] leading-tight">
+                <span className="font-semibold" style={{ color: detail.color }}>
+                  Trace {detail.traceLabel}
+                </span>
+                <span className="text-zinc-500">run #{String(detail.traceId)}</span>
+                <span className="text-zinc-500">step {detail.step}</span>
+                {status ? <span className="text-zinc-500">status: {status}</span> : null}
+              </div>
+              <div className="mt-1">
+                <pre className="w-full min-w-0 overflow-hidden font-mono text-[9px] leading-tight text-zinc-700 whitespace-pre-wrap break-all">
+                  {formatDetailValue(detail.toolCall.args)}
+                </pre>
+              </div>
+              {detail.toolCall.response !== undefined && detail.toolCall.response !== null ? (
+                <div className="mt-1">
+                  <pre className="w-full min-w-0 overflow-hidden font-mono text-[9px] leading-tight text-zinc-700 whitespace-pre-wrap break-all">
+                    {formatDetailValue(detail.toolCall.response)}
+                  </pre>
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function FlowGraph({
@@ -760,11 +979,26 @@ function FlowGraph({
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState(graph.nodes);
   const [edges, setEdges] = useState(graph.edges);
+  const [openNodeIds, setOpenNodeIds] = useState<string[]>([]);
 
   useEffect(() => {
     setNodes(graph.nodes);
     setEdges(graph.edges);
+    setOpenNodeIds([]);
   }, [graph, setNodes]);
+
+  const displayNodes = nodes.map((node) => ({
+    ...node,
+    data: {
+      ...node.data,
+      tooltipOpen: openNodeIds.includes(node.id),
+      onCloseDetails: () => {
+        setOpenNodeIds((current) =>
+          current.filter((openNodeId) => openNodeId !== node.id)
+        );
+      },
+    },
+  }));
 
   if (nodes.length === 0) {
     return <div className="text-sm text-zinc-600">{emptyMessage}</div>;
@@ -774,11 +1008,20 @@ function FlowGraph({
     <div className={heightClass}>
       <ReactFlow
         key={graphKey}
-        nodes={nodes}
+        nodes={displayNodes}
         edges={edges}
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
+        onNodeClick={(_, node) => {
+          if (!node.data.details?.length) {
+            return;
+          }
+
+          setOpenNodeIds((current) =>
+            current.includes(node.id) ? current : [...current, node.id]
+          );
+        }}
         fitView
         fitViewOptions={{ padding: 0.2 }}
         nodesDraggable
@@ -810,20 +1053,18 @@ function ProvenanceGraphView({
 }
 
 function TracingComparisonView({
-  traceA,
-  traceB,
+  traces,
 }: {
-  traceA: Tracing;
-  traceB: Tracing;
+  traces: Tracing[];
 }) {
-  const graph = renderComparisonGraph(traceA, traceB);
+  const graph = renderComparisonGraph(traces);
 
   return (
     <FlowGraph
       graph={graph}
-      graphKey={`${traceA.id}:${traceB.id}:compare`}
+      graphKey={`${traces.map((trace) => trace.id).join(':')}:compare`}
       emptyMessage="No comparable tool calls."
-      heightClass="h-[28rem]"
+      heightClass={traces.length === 3 ? 'h-[40rem]' : 'h-[28rem]'}
     />
   );
 }

@@ -25,6 +25,7 @@ const GROUPING_EXCLUDED_KEYS = new Set(["id", "score", "toolCalls", "tool_calls"
 const TRACE_SELECTION_COLORS = [
   "rgba(56, 189, 248, 0.18)",
   "rgba(251, 146, 60, 0.18)",
+  "rgba(74, 222, 128, 0.18)",
 ] as const;
 
 type TopChartMode = "usage" | "impact";
@@ -341,15 +342,11 @@ export default function Home() {
         return current.filter((selectedTracingId) => selectedTracingId !== tracingId);
       }
 
-      if (current.length === 0) {
-        return [tracingId];
-      }
-
-      if (current.length === 1) {
+      if (current.length < 3) {
         return [...current, tracingId];
       }
 
-      return [current[0], tracingId];
+      return [...current.slice(0, 2), tracingId];
     });
   }
 
@@ -414,7 +411,7 @@ export default function Home() {
 
         <Card
           title="Tracings provenance"
-          description="Click up to 2 runs to inspect a provenance graph or compare them on a shared LCS branch."
+          description="Click up to 3 runs to inspect a provenance graph or compare them on a shared LCS branch."
         >
           {loading && <StatusMessage message="Loading traces…" />}
           {!loading && error && <StatusMessage message={error} />}
@@ -463,11 +460,15 @@ export default function Home() {
         <Card
           title="Provenance graph"
           description={
-            selectedTracings.length === 2
-              ? `Compare run #${selectedTracings[0].id} in blue with run #${selectedTracings[1].id} in orange.`
+            selectedTracings.length >= 2
+              ? `Compare ${selectedTracings
+                  .map((tracing, index) =>
+                    `run #${tracing.id} in ${index === 0 ? "blue" : index === 1 ? "orange" : "green"}`
+                  )
+                  .join(", ")}.`
               : selectedTracing
                 ? `Run #${selectedTracing.id}`
-                : "Select up to 2 runs from the plot."
+                : "Select up to 3 runs from the plot."
           }
           actions={
             selectedTracings.length === 1 ? (
@@ -481,16 +482,13 @@ export default function Home() {
             <StatusMessage message="No traces available." />
           )}
           {!loading && !error && data.length > 0 && selectedTracings.length === 0 && (
-            <StatusMessage message="Select up to 2 traces in the matrix to render a provenance graph or comparison." />
+            <StatusMessage message="Select up to 3 traces in the matrix to render a provenance graph or comparison." />
           )}
           {!loading && !error && selectedTracings.length === 1 && selectedTracing && (
             <ProvenanceGraphView tracing={selectedTracing} mode={graphMode} />
           )}
-          {!loading && !error && selectedTracings.length === 2 && (
-            <TracingComparisonView
-              traceA={selectedTracings[0]}
-              traceB={selectedTracings[1]}
-            />
+          {!loading && !error && selectedTracings.length >= 2 && (
+            <TracingComparisonView traces={selectedTracings} />
           )}
         </Card>
       </main>
