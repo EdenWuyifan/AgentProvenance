@@ -8,6 +8,7 @@ export interface Tracing {
 export interface ToolCall {
   id?: string;
   name: string;
-  args?: Record<string, unknown>;
+  args?: unknown;
   response?: unknown;
+  status?: string | null;
 }
