@@ -147,6 +147,8 @@ function normalizeToolCall(call, fallbackId) {
       name,
       type: "tool_call",
       args: null,
+      response: null,
+      status: null,
     };
   }
 
@@ -155,75 +157,33 @@ function normalizeToolCall(call, fallbackId) {
     name,
     type: call.type ?? "tool_call",
     args: normalizeToolArgs(call),
+    response: call.response ?? null,
+    status: typeof call.status === "string" ? call.status : null,
   };
 }
 
 export function extractToolCallRecords(tracing) {
-  const records = [];
   const tracePrefix = tracing?.id ?? tracing?.trace_id ?? "trace";
-  const outputs = tracing?.outputs?.messages;
-
-  if (Array.isArray(outputs)) {
-    const recordsById = new Map();
-    let recordIndex = 0;
-
-    outputs.forEach((output, outputIndex) => {
-      const toolCalls = output?.tool_calls;
-      if (Array.isArray(toolCalls)) {
-        toolCalls.forEach((call, callIndex) => {
-          const record = normalizeToolCall(
-            call,
-            `${tracePrefix}-${outputIndex}-${callIndex}`
-          );
-
-          if (!record) {
-            return;
-          }
-
-          const enrichedRecord = {
-            ...record,
-            index: recordIndex,
-            outputIndex,
-          };
-
-          records.push(enrichedRecord);
-          recordsById.set(enrichedRecord.id, enrichedRecord);
-          recordIndex += 1;
-        });
-        return;
-      }
-
-      if (output?.tool_call_id && recordsById.has(output.tool_call_id)) {
-        const existingRecord = recordsById.get(output.tool_call_id);
-        existingRecord.status = output.status;
-        existingRecord.content = output.content;
-      }
-    });
-  }
-
-  if (records.length > 0) {
-    return records;
-  }
-
-  TOOL_CALL_KEYS.forEach((key) => {
+  for (const key of TOOL_CALL_KEYS) {
     const toolCalls = tracing?.[key];
     if (!Array.isArray(toolCalls)) {
-      return;
+      continue;
     }
 
-    toolCalls.forEach((call, callIndex) => {
+    return toolCalls.flatMap((call, callIndex) => {
       const record = normalizeToolCall(call, `${tracePrefix}-${key}-${callIndex}`);
-      if (record) {
-        records.push({
-          ...record,
-          index: callIndex,
-          outputIndex: callIndex,
-        });
+      if (!record) {
+        return [];
       }
-    });
-  });
 
-  return records;
+      return [{
+        ...record,
+        index: callIndex,
+      }];
+    });
+  }
+
+  return [];
 }
 
 export function createGlyphSystem(toolSets = {}) {

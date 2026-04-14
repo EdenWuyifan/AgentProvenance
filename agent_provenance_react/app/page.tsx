@@ -13,6 +13,7 @@ import {
   TracingComparisonView,
   type GraphMode,
 } from "./components/provenance_graph";
+import { ProvenanceCopilot } from "./components/provenance_copilot";
 import type { Tracing } from "./components/types";
 import { renderUpsetPlot } from "./components/upset_plot";
 import {
@@ -21,7 +22,12 @@ import {
   prepareTracings,
 } from "./components/visualization_shared";
 
-const GROUPING_EXCLUDED_KEYS = new Set(["id", "score", "toolCalls", "tool_calls"]);
+const GROUPING_EXCLUDED_KEYS = new Set([
+  "id",
+  "score",
+  "toolCalls",
+  "tool_calls",
+]);
 const TRACE_SELECTION_COLORS = [
   "rgba(56, 189, 248, 0.18)",
   "rgba(251, 146, 60, 0.18)",
@@ -78,6 +84,22 @@ function getGroupingValues(tracings: Tracing[], groupBy: string) {
   return Array.from(values).sort((a, b) => a.localeCompare(b));
 }
 
+function normalizeTracing(
+  tracing: Record<string, unknown> & { id: Tracing["id"]; score?: unknown }
+): Tracing {
+  return {
+    ...Object.fromEntries(
+      Object.entries(tracing).filter(([key]) => !GROUPING_EXCLUDED_KEYS.has(key))
+    ),
+    id: tracing.id,
+    score:
+      typeof tracing.score === "number" || tracing.score === null
+        ? tracing.score
+        : undefined,
+    toolCalls: extractToolCallRecords(tracing),
+  };
+}
+
 function useTracingData(path: string) {
   const [data, setData] = useState<Tracing[]>([]);
   const [loading, setLoading] = useState(true);
@@ -98,19 +120,7 @@ function useTracingData(path: string) {
           return;
         }
 
-        const parsed = prepareTracings(parseTracingPayload(text)).map((tracing) => ({
-          ...Object.fromEntries(
-            Object.entries(tracing).filter(
-              ([key]) => !GROUPING_EXCLUDED_KEYS.has(key)
-            )
-          ),
-          id: tracing.id,
-          score:
-            typeof tracing.score === "number" || tracing.score === null
-              ? tracing.score
-              : undefined,
-          toolCalls: extractToolCallRecords(tracing),
-        }));
+        const parsed = prepareTracings(parseTracingPayload(text)).map(normalizeTracing);
         startTransition(() => {
           setData(parsed);
           setError(null);
@@ -492,6 +502,11 @@ export default function Home() {
           )}
         </Card>
       </main>
+
+      <ProvenanceCopilot
+        selectedTraces={selectedTracings}
+        graphMode={graphMode}
+      />
     </div>
   );
 }
