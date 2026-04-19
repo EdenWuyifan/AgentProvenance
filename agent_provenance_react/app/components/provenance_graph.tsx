@@ -16,18 +16,16 @@ import {
   type Node,
   type NodeProps,
 } from '@xyflow/react';
+import {
+  ToolCallTooltip,
+  type ToolCallTooltipDetail,
+} from './tool_call_tooltip';
 import type { ToolCall, Tracing } from './types';
 import { createGlyphSystem } from './visualization_shared';
 
 type GraphMode = 'collapsed' | 'tree';
 
-type ComparisonNodeDetail = {
-  traceId: Tracing['id'];
-  traceLabel: string;
-  step: number;
-  color: string;
-  toolCall: ToolCall;
-};
+type ComparisonNodeDetail = ToolCallTooltipDetail;
 
 type GraphNodeData = {
   label: string;
@@ -127,7 +125,7 @@ function ToolNode({
     <>
       {data.details?.length ? (
         <NodeToolbar isVisible={data.tooltipOpen} position={Position.Top} offset={8}>
-          <ComparisonNodeDetails
+          <ToolCallTooltip
             details={data.details}
             onClose={data.onCloseDetails ?? (() => {})}
           />
@@ -332,7 +330,7 @@ function buildComparisonNodeDetail(
   trace: Tracing,
   toolCall: ToolCall,
   step: number,
-  traceLabel: string,
+  traceLabel: string | undefined,
   color: string
 ): ComparisonNodeDetail {
   return {
@@ -344,20 +342,18 @@ function buildComparisonNodeDetail(
   };
 }
 
-function formatDetailValue(value: unknown) {
-  if (value === null || value === undefined || value === '') {
-    return '—';
-  }
-
-  if (typeof value === 'string') {
-    return value;
-  }
-
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
+function buildTraceNodeDetail(
+  trace: Tracing,
+  toolCall: ToolCall,
+  step: number
+): ComparisonNodeDetail {
+  return buildComparisonNodeDetail(
+    trace,
+    toolCall,
+    step,
+    undefined,
+    GLYPH_SYSTEM.getGroupColor(toolCall.name)
+  );
 }
 
 function renderCollapsedGraph(tracing: Tracing) {
@@ -371,9 +367,10 @@ function renderCollapsedGraph(tracing: Tracing) {
 
   let previousNode: GraphNode | null = null;
   let runName = toolCalls[0].name;
+  let runStartIndex = 0;
   let runLength = 1;
 
-  const pushRun = (name: string) => {
+  const pushRun = (name: string, startIndex: number, count: number) => {
     const node: GraphNode = {
       id: `${tracing.id}:${nodes.length}`,
       type: 'tool',
@@ -383,7 +380,14 @@ function renderCollapsedGraph(tracing: Tracing) {
       },
       sourcePosition: Position.Bottom,
       targetPosition: Position.Top,
-      data: buildNodeData(name),
+      data: buildNodeData(
+        name,
+        toolCalls
+          .slice(startIndex, startIndex + count)
+          .map((toolCall, index) =>
+            buildTraceNodeDetail(tracing, toolCall, startIndex + index + 1)
+          )
+      ),
     };
 
     nodes.push(node);
@@ -400,7 +404,7 @@ function renderCollapsedGraph(tracing: Tracing) {
       });
     }
 
-    if (runLength > 1) {
+    if (count > 1) {
       edges.push({
         id: `${node.id}:repeat`,
         type: 'repeat',
@@ -408,7 +412,7 @@ function renderCollapsedGraph(tracing: Tracing) {
         target: node.id,
         sourceHandle: null,
         targetHandle: null,
-        data: { repeats: runLength - 1 },
+        data: { repeats: count - 1 },
         markerEnd: EDGE_LAYOUT.markerEnd,
       });
     }
@@ -422,12 +426,13 @@ function renderCollapsedGraph(tracing: Tracing) {
       continue;
     }
 
-    pushRun(runName);
+    pushRun(runName, runStartIndex, runLength);
     runName = toolCalls[index].name;
+    runStartIndex = index;
     runLength = 1;
   }
 
-  pushRun(runName);
+  pushRun(runName, runStartIndex, runLength);
 
   return { nodes, edges };
 }
@@ -442,12 +447,22 @@ function renderTreeGraph(tracing: Tracing) {
   }
 
   const names = uniqueToolNames(toolCalls);
+  const toolCallsByName = new Map<
+    string,
+    Array<{ toolCall: ToolCall; step: number }>
+  >();
   const rootName = names[0];
   const nodeIds = new Map<string, string>();
   const childrenByName = new Map(names.map((name) => [name, [] as string[]]));
   const parentByName = new Map<string, string>();
   const positions = new Map<string, { x: number; y: number; depth: number }>();
   const seen = new Set([rootName]);
+
+  toolCalls.forEach((toolCall, index) => {
+    const entry = toolCallsByName.get(toolCall.name) ?? [];
+    entry.push({ toolCall, step: index + 1 });
+    toolCallsByName.set(toolCall.name, entry);
+  });
 
   for (let index = 1; index < toolCalls.length; index += 1) {
     const parentName = toolCalls[index - 1].name;
@@ -510,7 +525,12 @@ function renderTreeGraph(tracing: Tracing) {
       },
       sourcePosition: Position.Bottom,
       targetPosition: Position.Top,
-      data: buildNodeData(name),
+      data: buildNodeData(
+        name,
+        (toolCallsByName.get(name) ?? []).map(({ toolCall, step }) =>
+          buildTraceNodeDetail(tracing, toolCall, step)
+        )
+      ),
     });
   });
 
@@ -887,83 +907,6 @@ function renderProvenanceGraph(tracing: Tracing, mode: GraphMode) {
   }
 
   return renderCollapsedGraph(tracing);
-}
-
-function ComparisonNodeDetails({
-  details,
-  onClose,
-}: {
-  details: ComparisonNodeDetail[];
-  onClose: () => void;
-}) {
-  const horizontal = details.length > 1;
-
-  return (
-    <div
-      className="nodrag nopan relative min-h-[4rem] min-w-[11rem] resize overflow-auto rounded-md border border-zinc-200 bg-white px-1.5 py-1 shadow-sm"
-      style={horizontal ? { width: `${details.length * 9}rem` } : undefined}
-      onClick={(event) => event.stopPropagation()}
-      onMouseDown={(event) => event.stopPropagation()}
-    >
-      <button
-        type="button"
-        aria-label="Close details"
-        className="nodrag nopan absolute right-1.5 top-1.5 inline-flex h-3.5 w-3.5 items-center justify-center text-zinc-400 transition hover:text-zinc-950"
-        onClick={(event) => {
-          event.stopPropagation();
-          onClose();
-        }}
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <svg viewBox="0 0 12 12" width="10" height="10" fill="none" aria-hidden="true">
-          <path d="M2 2l8 8M10 2L2 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-        </svg>
-      </button>
-      <div
-        className={horizontal ? 'grid gap-1 pr-4' : 'space-y-1 pr-4'}
-        style={horizontal ? { gridTemplateColumns: `repeat(${details.length}, minmax(0, 1fr))` } : undefined}
-      >
-        {details.map((detail) => {
-          const status =
-            typeof (detail.toolCall as { status?: unknown }).status === 'string'
-              ? (detail.toolCall as { status?: string }).status
-              : null;
-
-          return (
-            <div
-              key={`${detail.traceLabel}:${detail.traceId}:${detail.step}`}
-              className={
-                horizontal
-                  ? 'min-w-0 border-l border-zinc-200 pl-1 first:border-l-0 first:pl-0'
-                  : 'border-t border-zinc-200 pt-1 first:border-t-0 first:pt-0'
-              }
-            >
-              <div className="flex flex-wrap items-center gap-x-1 gap-y-0.5 text-[9px] leading-tight">
-                <span className="font-semibold" style={{ color: detail.color }}>
-                  Trace {detail.traceLabel}
-                </span>
-                <span className="text-zinc-500">run #{String(detail.traceId)}</span>
-                <span className="text-zinc-500">step {detail.step}</span>
-                {status ? <span className="text-zinc-500">status: {status}</span> : null}
-              </div>
-              <div className="mt-1">
-                <pre className="w-full min-w-0 overflow-hidden font-mono text-[9px] leading-tight text-zinc-700 whitespace-pre-wrap break-all">
-                  {formatDetailValue(detail.toolCall.args)}
-                </pre>
-              </div>
-              {detail.toolCall.response !== undefined && detail.toolCall.response !== null ? (
-                <div className="mt-1">
-                  <pre className="w-full min-w-0 overflow-hidden font-mono text-[9px] leading-tight text-zinc-700 whitespace-pre-wrap break-all">
-                    {formatDetailValue(detail.toolCall.response)}
-                  </pre>
-                </div>
-              ) : null}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
 }
 
 function FlowGraph({
