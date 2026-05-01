@@ -164,6 +164,8 @@ MANIFEST
 *.cover
 .hypothesis/
 .ruff_cache/
+*.venv/
+.venv/
 
 *.ipynb
 .ipynb_checkpoints/

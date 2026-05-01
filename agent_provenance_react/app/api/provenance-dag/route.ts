@@ -12,7 +12,7 @@ function backendUrl(path: string) {
 
 export async function POST(request: Request) {
   try {
-    const response = await fetch(backendUrl("api/provenance-agent"), {
+    const response = await fetch(backendUrl("api/prov-graph"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: await request.text(),
@@ -22,8 +22,7 @@ export async function POST(request: Request) {
     return new Response(response.body, {
       status: response.status,
       headers: {
-        "Content-Type": response.headers.get("Content-Type") ?? "text/plain; charset=utf-8",
-        "Cache-Control": response.headers.get("Cache-Control") ?? "no-cache, no-transform",
+        "Content-Type": response.headers.get("Content-Type") ?? "application/json",
       },
     });
   } catch {

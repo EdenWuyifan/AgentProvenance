@@ -71,7 +71,7 @@ function JsonField({
       <details className="text-[9px] leading-tight text-zinc-700">
         <summary className="nodrag nopan cursor-pointer break-all text-zinc-700">
           <span className="text-zinc-500">{name}:</span>{' '}
-          "{summarizeString(value)}"
+          &quot;{summarizeString(value)}&quot;
         </summary>
         <pre className="mt-1 whitespace-pre-wrap break-all font-mono text-[9px] leading-tight text-zinc-700">
           {value}

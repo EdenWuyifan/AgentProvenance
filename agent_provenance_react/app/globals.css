@@ -50,6 +50,21 @@ body {
   border-color: var(--xy-theme-hover);
 }
 
+.react-flow__node.prov-node--activity {
+  min-width: 150px;
+  border-color: #cbd5e1;
+  background: #ffffff;
+}
+
+.react-flow__node.prov-node--entity {
+  width: 112px;
+  height: 112px;
+  padding: 0;
+  border-color: #93c5fd;
+  border-radius: 9999px;
+  background: linear-gradient(180deg, #eff6ff 0%, #ffffff 100%);
+}
+
 .provenance-node {
   display: inline-flex;
   align-items: center;
@@ -72,6 +87,27 @@ body {
   line-height: 1.1;
 }
 
+.provenance-node--entity {
+  width: 88px;
+  height: 88px;
+  justify-content: center;
+  text-align: center;
+}
+
+.provenance-node--entity .provenance-node__label {
+  display: -webkit-box;
+  max-width: 82px;
+  max-height: 78px;
+  white-space: normal;
+  hyphens: none;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 6;
+  font-size: 10px;
+  line-height: 1.15;
+}
+
 .react-flow__handle {
   background-color: var(--xy-handle-background-color-default);
   border-color: var(--xy-handle-border-color-default);
@@ -87,12 +123,12 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 24px;
-  height: 24px;
-  border: 3px solid #f7f9fb;
+  min-width: 20px;
+  height: 20px;
+  border: 2px solid #f7f9fb;
   color: var(--xy-edge-label-color-default);
-  background-color: #f3f3f4;
+  background-color: #ffffff;
   border-radius: 9999px;
-  font-size: 12px;
-  padding: 0 6px;
+  font-size: 10px;
+  padding: 0 5px;
 }
