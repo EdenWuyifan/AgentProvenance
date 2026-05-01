@@ -22,16 +22,15 @@ export type ActivityNode = {
   kind: "Activity";
   toolCallId: string;
   tool: string;
-  label: string;
   timeIndex: number;
+  args?: unknown;
 };
 
 export type EntityNode = {
   id: string;
   kind: "Entity";
   entityType: string;
-  label: string;
-  keys: string[];
+  response?: unknown;
 };
 
 export type ProvNode = ActivityNode | EntityNode;
@@ -40,13 +39,18 @@ export type ProvEdge = {
   source: string;
   target: string;
   relation: "usedBy" | "generatedBy" | "informedBy";
+  evidence?: Array<{
+    kind: "artifact" | "shared_token" | "llm";
+    shared?: string[];
+    score?: number;
+  }>;
 };
 
 export type ProvNodePatch = {
-  label?: string;
   tool?: string;
   entityType?: string;
-  keys?: string[];
+  args?: unknown;
+  response?: unknown;
 };
 
 export type ProvGraphEdit =

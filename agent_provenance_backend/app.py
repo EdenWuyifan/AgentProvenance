@@ -131,7 +131,7 @@ def get_cache_path(trace_id: Any, calls: list[dict[str, Any]]) -> tuple[Path, st
     cache_key = sha256(
         json.dumps(
             {
-                "schema": "prov-workflow-py-v3",
+                "schema": "prov-workflow-py-v5",
                 "calls": calls,
                 "tokenCandidates": MAX_TOKEN_EDGE_CANDIDATES,
                 "tokenChamferThreshold": token_chamfer_threshold(),
@@ -176,14 +176,20 @@ def output_entity(call: dict[str, Any]) -> dict[str, Any] | None:
     if not metadata or not key:
         return None
 
-    label = metadata["name"] or (basename(metadata["path"]) if metadata["path"] else key)
     return {
         "id": f"ent:output:{safe_id(key)}",
         "kind": "Entity",
         "entityType": "tool_output",
-        "label": truncate(label),
-        "keys": unique([metadata["id"], metadata["path"], metadata["name"], basename(key)]),
+        "response": sanitize_value(call["response"]),
     }
+
+
+def output_keys(call: dict[str, Any]) -> list[str]:
+    metadata = output_metadata(call["response"])
+    if not metadata:
+        return []
+    key = metadata["id"] or metadata["path"] or metadata["name"]
+    return unique([metadata["id"], metadata["path"], metadata["name"], basename(key)] if key else [])
 
 
 def summarize(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -197,12 +203,11 @@ def summarize(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "kind": "Activity",
                     "toolCallId": call["id"],
                     "tool": call["tool"],
-                    "label": call["tool"],
                     "timeIndex": call["timeIndex"],
+                    "args": sanitize_value(call["args"]),
                 },
-                "args": sanitize_value(call["args"]),
                 "output": output_entity(call),
-                "response": sanitize_value(call["response"]),
+                "outputKeys": output_keys(call),
             }
         )
     return summaries
@@ -213,11 +218,18 @@ def edge_key(edge: dict[str, str]) -> str:
 
 
 def args_use_output(next_summary: dict[str, Any], previous: dict[str, Any]) -> bool:
-    output = previous.get("output")
-    if not output:
+    output_keys = previous.get("outputKeys") or []
+    if not output_keys:
         return False
     args_text = json.dumps(next_summary["call"]["args"], default=str)
-    return any(key and key in args_text for key in output["keys"])
+    return any(key and key in args_text for key in output_keys)
+
+
+def artifact_evidence(next_summary: dict[str, Any], previous: dict[str, Any]) -> list[dict[str, Any]]:
+    output_keys = previous.get("outputKeys") or []
+    args_text = json.dumps(next_summary["call"]["args"], default=str)
+    shared = [basename(key) for key in output_keys if key and key in args_text]
+    return [{"kind": "artifact", "shared": shared[:8]}] if shared else []
 
 
 def edge_from(previous: dict[str, Any], next_summary: dict[str, Any]) -> dict[str, str]:
@@ -234,7 +246,9 @@ def exact_artifact_edges(summaries: list[dict[str, Any]]) -> list[dict[str, str]
     for index, next_summary in enumerate(summaries):
         for previous in summaries[:index]:
             if args_use_output(next_summary, previous):
-                edges.append(edge_from(previous, next_summary))
+                edge = edge_from(previous, next_summary)
+                edge["evidence"] = artifact_evidence(next_summary, previous)
+                edges.append(edge)
     return edges
 
 
@@ -331,6 +345,13 @@ def suggested_edges(summaries: list[dict[str, Any]]) -> list[dict[str, str]]:
 
             for item in ranked[:MAX_TOKEN_EDGE_CANDIDATES]:
                 edge = edge_from(item["previous"], next_summary)
+                edge["evidence"] = [
+                    {
+                        "kind": "shared_token",
+                        "score": round(item["score"], 3),
+                        "shared": sorted(item["shared"])[:16],
+                    }
+                ]
                 edges[edge_key(edge)] = edge
 
         for token in output_token_sets[index]:
@@ -366,40 +387,18 @@ def build_graph(summaries: list[dict[str, Any]], selected: list[dict[str, str]])
     return {"nodes": list(nodes.values()), "edges": list(edges.values())}
 
 
-def prompt(
-    summaries: list[dict[str, Any]],
-    draft_graph: dict[str, Any],
-    edges: list[dict[str, str]],
-) -> str:
-    calls = [
-        {
-            "id": summary["call"]["id"],
-            "activityId": summary["activity"]["id"],
-            "tool": summary["call"]["tool"],
-            "args": summary["args"],
-            "output": {
-                "id": summary["output"]["id"],
-                "label": summary["output"]["label"],
-                "keys": [basename(key) for key in summary["output"]["keys"]],
-            }
-            if summary["output"]
-            else None,
-            "response": summary["response"],
-        }
-        for summary in summaries
-    ]
-
+def prompt(draft_graph: dict[str, Any]) -> str:
     return f"""Select direct provenance connections from ordered tool calls.
 
 Model each call as input -> tool activity -> output.
-Use suggestedEdges for direct tool-call dependency edges. suggestedEdges already conform to the ProvEdge schema.
+Use Activity node args, Entity node responses, and edge evidence to refine direct tool-call dependencies.
 Do not connect Entity to Entity.
-Exact ids, filenames, paths, and artifact names are strong evidence.
-Token-overlap suggested edges are recommendations; reject them if the provenance logic is not direct.
-Use the full args and response JSON to reason about logical reuse of genes, pathways, ranked lists, candidate sets, files, and result artifacts.
+Exact ids, filenames, paths, artifact names, and shared-token evidence are strong evidence.
+Token-overlap edges are recommendations; reject them if the provenance logic is not direct.
+Use Activity args and Entity response JSON to reason about logical reuse of genes, pathways, ranked lists, candidate sets, files, and result artifacts.
 If a call has no direct predecessor, leave it as a root.
 Prune redundant nodes when they do not add a distinct artifact, transformation, decision, or analysis step.
-Do not use fixed tool-name assumptions. Decide from args, response, output, and graph context.
+Do not use fixed tool-name assumptions. Decide from Activity args, Entity responses, edge evidence, and graph context.
 Return edits as graph patch operations.
 You may add semantic Entity nodes for meaningful intermediate data objects, but do not add Activity nodes.
 If pruning an Activity because its output only repeats an input artifact, remove both the Activity and its generated output Entity.
@@ -408,27 +407,23 @@ ProvEdge:
 {{
   "source": "node id",
   "target": "node id",
-  "relation": "usedBy | generatedBy | informedBy"
+  "relation": "usedBy | generatedBy | informedBy",
+  "evidence": [{{"kind":"artifact | shared_token | llm","shared":["optional"],"score":0.5}}]
 }}
 
 Return JSON:
 {{"edits":[
-  {{"op":"addNode","node":{{"id":"ent:semantic:name","kind":"Entity","entityType":"gene_list","label":"candidate genes","keys":["CTNNB1","LEF1"]}}}},
-  {{"op":"editNode","nodeId":"node id","patch":{{"label":"short label","entityType":"optional","keys":["optional"]}}}},
+  {{"op":"addNode","node":{{"id":"ent:semantic:candidate_genes","kind":"Entity","entityType":"gene_list","response":["CTNNB1","LEF1"]}}}},
+  {{"op":"editNode","nodeId":"act:id","patch":{{"args":{{}}}}}},
+  {{"op":"editNode","nodeId":"ent:id","patch":{{"entityType":"gene_list","response":[]}}}},
   {{"op":"removeNode","nodeId":"node id"}},
-  {{"op":"addEdge","edge":{{"source":"node id","target":"node id","relation":"usedBy"}}}},
+  {{"op":"addEdge","edge":{{"source":"node id","target":"node id","relation":"usedBy","evidence":[{{"kind":"llm","shared":["optional"]}}]}}}},
   {{"op":"removeEdge","edge":{{"source":"node id","target":"node id","relation":"usedBy"}}}},
   {{"op":"editEdge","edge":{{"source":"node id","target":"node id","relation":"informedBy"}},"nextEdge":{{"source":"node id","target":"node id","relation":"usedBy"}}}}
 ]}}
 
-calls:
-{json.dumps(calls, indent=2)}
-
 draftGraph:
-{json.dumps(draft_graph, indent=2)}
-
-suggestedEdges:
-{json.dumps(edges, indent=2)}"""
+{json.dumps(draft_graph, indent=2)}"""
 
 
 def response_text(payload: dict[str, Any]) -> str:
@@ -447,7 +442,10 @@ def parse_edge(value: Any) -> dict[str, str] | None:
     target = value.get("target") if isinstance(value.get("target"), str) else ""
     relation = value.get("relation")
     if source and target and relation in {"usedBy", "generatedBy", "informedBy"}:
-        return {"source": source, "target": target, "relation": relation}
+        edge = {"source": source, "target": target, "relation": relation}
+        if isinstance(value.get("evidence"), list):
+            edge["evidence"] = value["evidence"][:8]
+        return edge
     return None
 
 
@@ -455,34 +453,31 @@ def parse_entity_node(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     node_id = safe_id(value.get("id", "")) if isinstance(value.get("id"), str) else ""
-    label = clean_string(value.get("label"))
     entity_type = clean_string(value.get("entityType"))
-    if not node_id.startswith("ent:") or value.get("kind") != "Entity" or not label or not entity_type:
+    if not node_id.startswith("ent:") or value.get("kind") != "Entity" or not entity_type:
         return None
-    keys = (
-        unique([clean_string(key) for key in value["keys"]])
-        if isinstance(value.get("keys"), list)
-        else []
-    )
-    return {
+    node = {
         "id": node_id,
         "kind": "Entity",
         "entityType": entity_type,
-        "label": truncate(label),
-        "keys": keys,
     }
+    if "response" in value:
+        node["response"] = sanitize_value(value["response"])
+    return node
 
 
 def parse_node_patch(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     patch: dict[str, Any] = {}
-    for key in ("label", "tool", "entityType"):
+    for key in ("tool", "entityType"):
         text = clean_string(value.get(key))
         if text:
-            patch[key] = truncate(text) if key == "label" else text
-    if isinstance(value.get("keys"), list):
-        patch["keys"] = unique([clean_string(key) for key in value["keys"]])
+            patch[key] = text
+    if "args" in value:
+        patch["args"] = sanitize_value(value["args"])
+    if "response" in value:
+        patch["response"] = sanitize_value(value["response"])
     return patch or None
 
 
@@ -542,9 +537,7 @@ def chat_config() -> tuple[str, str, str, dict[str, str]]:
 
 
 async def refine_graph(
-    summaries: list[dict[str, Any]],
     draft_graph: dict[str, Any],
-    edges: list[dict[str, str]],
 ) -> dict[str, Any]:
     try:
         _, model, url, headers = chat_config()
@@ -557,7 +550,7 @@ async def refine_graph(
             headers=headers,
             json={
                 "model": model,
-                "messages": [{"role": "user", "content": prompt(summaries, draft_graph, edges)}],
+                "messages": [{"role": "user", "content": prompt(draft_graph)}],
             },
         )
 
@@ -570,11 +563,11 @@ async def refine_graph(
 def patch_node(node: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     next_node = {**node}
     if node.get("kind") == "Activity":
-        for key in ("label", "tool"):
+        for key in ("tool", "args"):
             if key in patch:
                 next_node[key] = patch[key]
     else:
-        for key in ("label", "entityType", "keys"):
+        for key in ("entityType", "response"):
             if key in patch:
                 next_node[key] = patch[key]
     return next_node
@@ -819,10 +812,9 @@ async def prov_graph(request: Request):
         }
 
     summaries = summarize(calls)
-    exact_edges = exact_artifact_edges(summaries)
     edges = suggested_edges(summaries)
-    draft_graph = build_graph(summaries, exact_edges)
-    patch = await refine_graph(summaries, draft_graph, edges)
+    draft_graph = build_graph(summaries, edges)
+    patch = await refine_graph(draft_graph)
     dag = apply_graph_patch(draft_graph, patch, edges)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
