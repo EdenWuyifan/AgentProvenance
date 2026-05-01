@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { GraphMode } from "./provenance_graph";
-import type { Tracing } from "./types";
+import { ProvenanceCopilotAgent } from "./provenance_copilot_agent";
+import type { GraphMode, Tracing } from "./types";
 
 type ProvenanceCopilotProps = {
   selectedTraces: Tracing[];
@@ -59,6 +59,7 @@ export function ProvenanceCopilot({
   selectedTraces,
   graphMode,
 }: ProvenanceCopilotProps) {
+  const agent = useMemo(() => new ProvenanceCopilotAgent(), []);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const dragStateRef = useRef<DragState | null>(null);
   const resizeStateRef = useRef<ResizeState | null>(null);
@@ -237,43 +238,14 @@ export function ProvenanceCopilot({
     setAnswer("");
 
     try {
-      const response = await fetch("/api/provenance-agent", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
+      await agent.run(
+        {
           question: question.trim(),
           selectedTraces,
-          graphMode: selectedTraces.length >= 2 ? "comparison" : graphMode,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error((await response.text()) || "Unable to get an answer.");
-      }
-
-      if (!response.body) {
-        throw new Error("Streaming is not available for this response.");
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let nextAnswer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) {
-          break;
-        }
-
-        nextAnswer += decoder.decode(value, { stream: true });
-        setAnswer(nextAnswer);
-      }
-
-      nextAnswer += decoder.decode();
-      setAnswer(nextAnswer);
+          graphMode,
+        },
+        setAnswer
+      );
     } catch (requestError) {
       setError(
         requestError instanceof Error

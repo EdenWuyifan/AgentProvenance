@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import {
   Background,
   BaseEdge,
@@ -16,23 +16,22 @@ import {
   type Node,
   type NodeProps,
 } from '@xyflow/react';
-import type { ToolCall, Tracing } from './types';
+import {
+  ToolCallTooltip,
+  type ToolCallTooltipDetail,
+} from './tool_call_tooltip';
+import type { AgentDag, GraphMode, ToolCall, Tracing } from './types';
 import { createGlyphSystem } from './visualization_shared';
 
-type GraphMode = 'collapsed' | 'tree';
-
-type ComparisonNodeDetail = {
-  traceId: Tracing['id'];
-  traceLabel: string;
-  step: number;
-  color: string;
-  toolCall: ToolCall;
-};
+type ComparisonNodeDetail = ToolCallTooltipDetail;
 
 type GraphNodeData = {
   label: string;
   glyph: string;
   group: string;
+  kind?: 'Activity' | 'Entity';
+  nodeType?: string;
+  provProperties?: Array<{ name: string; value: string | string[] }>;
   details?: ComparisonNodeDetail[];
   tooltipOpen?: boolean;
   onCloseDetails?: () => void;
@@ -54,6 +53,7 @@ type GraphEdgeProps = EdgeProps<GraphEdge>;
 const COLLAPSED_LAYOUT = { x: 0, y: 0, gapY: 50 };
 const TREE_LAYOUT = { x: 0, y: 0, gapX: 176, gapY: 112 };
 const COMPARE_LAYOUT = { x: 0, y: 0, gapX: 176, gapY: 112 };
+const AGENT_DAG_LAYOUT = { x: 0, y: 0, gapX: 248, gapY: 128 };
 const EDGE_LAYOUT = {
   curveGap: 28,
   markerEnd: { type: MarkerType.Arrow, width: 24, height: 24 },
@@ -122,30 +122,89 @@ function ToolNode({
   targetPosition = Position.Top,
 }: GraphNodeProps) {
   const color = GLYPH_SYSTEM.getGroupColor(data.group);
+  const title = data.nodeType ? `${data.label} (${data.nodeType})` : data.label;
+  const hasTooltip = Boolean(data.details?.length || data.provProperties?.length);
+  const variant =
+    data.kind === 'Entity'
+      ? 'entity'
+      : data.kind === 'Activity'
+        ? 'activity'
+        : 'tool';
 
   return (
     <>
-      {data.details?.length ? (
+      {hasTooltip ? (
         <NodeToolbar isVisible={data.tooltipOpen} position={Position.Top} offset={8}>
-          <ComparisonNodeDetails
-            details={data.details}
-            onClose={data.onCloseDetails ?? (() => {})}
-          />
+          {data.details?.length ? (
+            <ToolCallTooltip
+              details={data.details}
+              onClose={data.onCloseDetails ?? (() => {})}
+            />
+          ) : (
+            <ProvNodeTooltip
+              properties={data.provProperties ?? []}
+              onClose={data.onCloseDetails ?? (() => {})}
+            />
+          )}
         </NodeToolbar>
       ) : null}
       <Handle type="target" position={targetPosition} />
-      <div className="provenance-node" title={data.label}>
-        <span
-          className="provenance-node__glyph"
-          style={{ color }}
-          aria-hidden="true"
-        >
-          <ToolGlyph glyph={data.glyph} />
-        </span>
+      <div className={`provenance-node provenance-node--${variant}`} title={title}>
+        {data.kind !== 'Entity' ? (
+          <span
+            className="provenance-node__glyph"
+            style={{ color }}
+            aria-hidden="true"
+          >
+            <ToolGlyph glyph={data.glyph} />
+          </span>
+        ) : null}
         <span className="provenance-node__label">{data.label}</span>
       </div>
       <Handle type="source" position={sourcePosition} />
     </>
+  );
+}
+
+function ProvNodeTooltip({
+  properties,
+  onClose,
+}: {
+  properties: Array<{ name: string; value: string | string[] }>;
+  onClose: () => void;
+}) {
+  const json = Object.fromEntries(
+    properties.map((property) => [property.name, property.value])
+  );
+
+  return (
+    <div
+      className="nodrag nopan relative flex h-44 w-64 resize flex-col overflow-hidden rounded-md border border-zinc-200 bg-white shadow-sm"
+      onClick={(event) => event.stopPropagation()}
+      onMouseDown={(event) => event.stopPropagation()}
+    >
+      <div className="flex h-5 shrink-0 items-center justify-end border-b border-zinc-200 bg-zinc-50 px-1">
+        <button
+          type="button"
+          aria-label="Close details"
+          className="nodrag nopan inline-flex h-3.5 w-3.5 items-center justify-center text-zinc-400 transition hover:text-zinc-950"
+          onClick={(event) => {
+            event.stopPropagation();
+            onClose();
+          }}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <svg viewBox="0 0 12 12" width="10" height="10" fill="none" aria-hidden="true">
+            <path d="M2 2l8 8M10 2L2 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto px-2 py-1.5 pr-4">
+        <pre className="whitespace-pre-wrap break-all font-mono text-[9px] leading-tight text-zinc-700">
+          {JSON.stringify(json, null, 2)}
+        </pre>
+      </div>
+    </div>
   );
 }
 
@@ -183,8 +242,6 @@ function RepeatEdge(props: GraphEdgeProps) {
     sourceY,
     targetX,
     targetY,
-    sourcePosition = Position.Bottom,
-    targetPosition = Position.Top,
     markerEnd,
     data,
   } = props;
@@ -318,12 +375,18 @@ function uniqueToolNames(toolCalls: ToolCall[]) {
 
 function buildNodeData(
   name: string,
-  details?: ComparisonNodeDetail[]
+  details?: ComparisonNodeDetail[],
+  options: Partial<
+    Pick<GraphNodeData, 'glyph' | 'group' | 'kind' | 'nodeType' | 'provProperties'>
+  > = {}
 ): GraphNodeData {
   return {
     label: name,
-    glyph: GLYPH_SYSTEM.getGlyph(name),
-    group: GLYPH_SYSTEM.getGroup(name),
+    glyph: options.glyph ?? GLYPH_SYSTEM.getGlyph(name),
+    group: options.group ?? GLYPH_SYSTEM.getGroup(name),
+    kind: options.kind,
+    nodeType: options.nodeType,
+    provProperties: options.provProperties,
     details,
   };
 }
@@ -332,7 +395,7 @@ function buildComparisonNodeDetail(
   trace: Tracing,
   toolCall: ToolCall,
   step: number,
-  traceLabel: string,
+  traceLabel: string | undefined,
   color: string
 ): ComparisonNodeDetail {
   return {
@@ -344,20 +407,18 @@ function buildComparisonNodeDetail(
   };
 }
 
-function formatDetailValue(value: unknown) {
-  if (value === null || value === undefined || value === '') {
-    return '—';
-  }
-
-  if (typeof value === 'string') {
-    return value;
-  }
-
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
+function buildTraceNodeDetail(
+  trace: Tracing,
+  toolCall: ToolCall,
+  step: number
+): ComparisonNodeDetail {
+  return buildComparisonNodeDetail(
+    trace,
+    toolCall,
+    step,
+    undefined,
+    GLYPH_SYSTEM.getGroupColor(toolCall.name)
+  );
 }
 
 function renderCollapsedGraph(tracing: Tracing) {
@@ -371,9 +432,10 @@ function renderCollapsedGraph(tracing: Tracing) {
 
   let previousNode: GraphNode | null = null;
   let runName = toolCalls[0].name;
+  let runStartIndex = 0;
   let runLength = 1;
 
-  const pushRun = (name: string) => {
+  const pushRun = (name: string, startIndex: number, count: number) => {
     const node: GraphNode = {
       id: `${tracing.id}:${nodes.length}`,
       type: 'tool',
@@ -383,7 +445,14 @@ function renderCollapsedGraph(tracing: Tracing) {
       },
       sourcePosition: Position.Bottom,
       targetPosition: Position.Top,
-      data: buildNodeData(name),
+      data: buildNodeData(
+        name,
+        toolCalls
+          .slice(startIndex, startIndex + count)
+          .map((toolCall, index) =>
+            buildTraceNodeDetail(tracing, toolCall, startIndex + index + 1)
+          )
+      ),
     };
 
     nodes.push(node);
@@ -400,7 +469,7 @@ function renderCollapsedGraph(tracing: Tracing) {
       });
     }
 
-    if (runLength > 1) {
+    if (count > 1) {
       edges.push({
         id: `${node.id}:repeat`,
         type: 'repeat',
@@ -408,7 +477,7 @@ function renderCollapsedGraph(tracing: Tracing) {
         target: node.id,
         sourceHandle: null,
         targetHandle: null,
-        data: { repeats: runLength - 1 },
+        data: { repeats: count - 1 },
         markerEnd: EDGE_LAYOUT.markerEnd,
       });
     }
@@ -422,12 +491,13 @@ function renderCollapsedGraph(tracing: Tracing) {
       continue;
     }
 
-    pushRun(runName);
+    pushRun(runName, runStartIndex, runLength);
     runName = toolCalls[index].name;
+    runStartIndex = index;
     runLength = 1;
   }
 
-  pushRun(runName);
+  pushRun(runName, runStartIndex, runLength);
 
   return { nodes, edges };
 }
@@ -442,12 +512,22 @@ function renderTreeGraph(tracing: Tracing) {
   }
 
   const names = uniqueToolNames(toolCalls);
+  const toolCallsByName = new Map<
+    string,
+    Array<{ toolCall: ToolCall; step: number }>
+  >();
   const rootName = names[0];
   const nodeIds = new Map<string, string>();
   const childrenByName = new Map(names.map((name) => [name, [] as string[]]));
   const parentByName = new Map<string, string>();
   const positions = new Map<string, { x: number; y: number; depth: number }>();
   const seen = new Set([rootName]);
+
+  toolCalls.forEach((toolCall, index) => {
+    const entry = toolCallsByName.get(toolCall.name) ?? [];
+    entry.push({ toolCall, step: index + 1 });
+    toolCallsByName.set(toolCall.name, entry);
+  });
 
   for (let index = 1; index < toolCalls.length; index += 1) {
     const parentName = toolCalls[index - 1].name;
@@ -478,7 +558,7 @@ function renderTreeGraph(tracing: Tracing) {
       return column;
     }
 
-    let firstColumn = placeNode(children[0], depth + 1);
+    const firstColumn = placeNode(children[0], depth + 1);
     let lastColumn = firstColumn;
 
     for (let index = 1; index < children.length; index += 1) {
@@ -510,7 +590,12 @@ function renderTreeGraph(tracing: Tracing) {
       },
       sourcePosition: Position.Bottom,
       targetPosition: Position.Top,
-      data: buildNodeData(name),
+      data: buildNodeData(
+        name,
+        (toolCallsByName.get(name) ?? []).map(({ toolCall, step }) =>
+          buildTraceNodeDetail(tracing, toolCall, step)
+        )
+      ),
     });
   });
 
@@ -889,81 +974,151 @@ function renderProvenanceGraph(tracing: Tracing, mode: GraphMode) {
   return renderCollapsedGraph(tracing);
 }
 
-function ComparisonNodeDetails({
-  details,
-  onClose,
-}: {
-  details: ComparisonNodeDetail[];
-  onClose: () => void;
-}) {
-  const horizontal = details.length > 1;
+function formatProvEdge(edge: AgentDag['edges'][number], direction: 'from' | 'to') {
+  const relation = edge.relation ?? 'edge';
+  const peer = direction === 'from' ? edge.source : edge.target;
 
-  return (
-    <div
-      className="nodrag nopan relative min-h-[4rem] min-w-[11rem] resize overflow-auto rounded-md border border-zinc-200 bg-white px-1.5 py-1 shadow-sm"
-      style={horizontal ? { width: `${details.length * 9}rem` } : undefined}
-      onClick={(event) => event.stopPropagation()}
-      onMouseDown={(event) => event.stopPropagation()}
-    >
-      <button
-        type="button"
-        aria-label="Close details"
-        className="nodrag nopan absolute right-1.5 top-1.5 inline-flex h-3.5 w-3.5 items-center justify-center text-zinc-400 transition hover:text-zinc-950"
-        onClick={(event) => {
-          event.stopPropagation();
-          onClose();
-        }}
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <svg viewBox="0 0 12 12" width="10" height="10" fill="none" aria-hidden="true">
-          <path d="M2 2l8 8M10 2L2 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-        </svg>
-      </button>
-      <div
-        className={horizontal ? 'grid gap-1 pr-4' : 'space-y-1 pr-4'}
-        style={horizontal ? { gridTemplateColumns: `repeat(${details.length}, minmax(0, 1fr))` } : undefined}
-      >
-        {details.map((detail) => {
-          const status =
-            typeof (detail.toolCall as { status?: unknown }).status === 'string'
-              ? (detail.toolCall as { status?: string }).status
-              : null;
+  return `${relation} ${direction} ${peer}`;
+}
 
-          return (
-            <div
-              key={`${detail.traceLabel}:${detail.traceId}:${detail.step}`}
-              className={
-                horizontal
-                  ? 'min-w-0 border-l border-zinc-200 pl-1 first:border-l-0 first:pl-0'
-                  : 'border-t border-zinc-200 pt-1 first:border-t-0 first:pt-0'
-              }
-            >
-              <div className="flex flex-wrap items-center gap-x-1 gap-y-0.5 text-[9px] leading-tight">
-                <span className="font-semibold" style={{ color: detail.color }}>
-                  Trace {detail.traceLabel}
-                </span>
-                <span className="text-zinc-500">run #{String(detail.traceId)}</span>
-                <span className="text-zinc-500">step {detail.step}</span>
-                {status ? <span className="text-zinc-500">status: {status}</span> : null}
-              </div>
-              <div className="mt-1">
-                <pre className="w-full min-w-0 overflow-hidden font-mono text-[9px] leading-tight text-zinc-700 whitespace-pre-wrap break-all">
-                  {formatDetailValue(detail.toolCall.args)}
-                </pre>
-              </div>
-              {detail.toolCall.response !== undefined && detail.toolCall.response !== null ? (
-                <div className="mt-1">
-                  <pre className="w-full min-w-0 overflow-hidden font-mono text-[9px] leading-tight text-zinc-700 whitespace-pre-wrap break-all">
-                    {formatDetailValue(detail.toolCall.response)}
-                  </pre>
-                </div>
-              ) : null}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
+function buildProvProperties(
+  node: AgentDag['nodes'][number],
+  incoming: string[],
+  outgoing: string[]
+) {
+  const properties: Array<{ name: string; value: string | string[] }> = [
+    { name: 'id', value: node.id },
+    { name: 'kind', value: node.kind },
+    { name: 'label', value: node.label },
+  ];
+
+  if (node.kind === 'Activity') {
+    properties.push(
+      { name: 'toolCallId', value: node.toolCallId },
+      { name: 'tool', value: node.tool },
+      { name: 'timeIndex', value: String(node.timeIndex) }
+    );
+  } else {
+    properties.push(
+      { name: 'entityType', value: node.entityType },
+      { name: 'keys', value: node.keys.length ? node.keys : ['none'] }
+    );
+  }
+
+  if (incoming.length > 0) {
+    properties.push({ name: 'incoming', value: incoming });
+  }
+
+  if (outgoing.length > 0) {
+    properties.push({ name: 'outgoing', value: outgoing });
+  }
+
+  return properties;
+}
+
+function renderAgentDagGraph(dag: AgentDag) {
+  const nodeLevels = new Map(dag.nodes.map((node) => [node.id, 0]));
+  const rowsByLevel = new Map<number, number>();
+  const incomingByNode = new Map<string, string[]>();
+  const outgoingByNode = new Map<string, string[]>();
+
+  for (let pass = 0; pass < dag.nodes.length; pass += 1) {
+    let changed = false;
+
+    dag.edges.forEach((edge) => {
+      const nextLevel = (nodeLevels.get(edge.source) ?? 0) + 1;
+
+      if (nextLevel > (nodeLevels.get(edge.target) ?? 0)) {
+        nodeLevels.set(edge.target, nextLevel);
+        changed = true;
+      }
+    });
+
+    if (!changed) {
+      break;
+    }
+  }
+
+  dag.edges.forEach((edge) => {
+    incomingByNode.set(edge.target, [
+      ...(incomingByNode.get(edge.target) ?? []),
+      formatProvEdge(edge, 'from'),
+    ]);
+    outgoingByNode.set(edge.source, [
+      ...(outgoingByNode.get(edge.source) ?? []),
+      formatProvEdge(edge, 'to'),
+    ]);
+  });
+
+  const nodes: GraphNode[] = dag.nodes.map((node) => {
+    const level = nodeLevels.get(node.id) ?? 0;
+    const row = rowsByLevel.get(level) ?? 0;
+    rowsByLevel.set(level, row + 1);
+
+    return {
+      id: node.id,
+      type: 'tool',
+      className:
+        node.kind === 'Entity' ? 'prov-node--entity' : 'prov-node--activity',
+      position: {
+        x: AGENT_DAG_LAYOUT.x + level * AGENT_DAG_LAYOUT.gapX,
+        y: AGENT_DAG_LAYOUT.y + row * AGENT_DAG_LAYOUT.gapY,
+      },
+      sourcePosition: Position.Right,
+      targetPosition: Position.Left,
+      data:
+        node.kind === 'Entity'
+          ? buildNodeData(node.label, undefined, {
+              glyph: 'circle',
+              group: node.entityType,
+              kind: 'Entity',
+              nodeType: node.entityType,
+              provProperties: buildProvProperties(
+                node,
+                incomingByNode.get(node.id) ?? [],
+                outgoingByNode.get(node.id) ?? []
+              ),
+            })
+          : buildNodeData(node.label, undefined, {
+              kind: 'Activity',
+              nodeType: node.tool,
+              provProperties: buildProvProperties(
+                node,
+                incomingByNode.get(node.id) ?? [],
+                outgoingByNode.get(node.id) ?? []
+              ),
+            }),
+    };
+  });
+  const edgeCounts = new Map<string, number>();
+  const edges: GraphEdge[] = dag.edges.map((edge, index) => {
+    const edgeKey = `${edge.source}:${edge.target}`;
+    const count = edgeCounts.get(edgeKey) ?? 0;
+    edgeCounts.set(edgeKey, count + 1);
+
+    return {
+      id: `${edgeKey}:${index}`,
+      type: 'sequential',
+      source: edge.source,
+      target: edge.target,
+      sourceHandle: null,
+      targetHandle: null,
+      data: {
+        label: edge.relation,
+        color:
+          edge.relation === 'usedBy'
+            ? '#0284c7'
+            : edge.relation === 'generatedBy'
+              ? '#16a34a'
+              : '#64748b',
+        curveOffset: count > 0 ? count + 1 : undefined,
+        curveDirection: count % 2 === 0 ? 1 : -1,
+      },
+      markerEnd: EDGE_LAYOUT.markerEnd,
+    };
+  });
+
+  return { nodes, edges };
 }
 
 function FlowGraph({
@@ -977,15 +1132,31 @@ function FlowGraph({
   emptyMessage: string;
   heightClass?: string;
 }) {
-  const [nodes, setNodes, onNodesChange] = useNodesState(graph.nodes);
-  const [edges, setEdges] = useState(graph.edges);
-  const [openNodeIds, setOpenNodeIds] = useState<string[]>([]);
+  if (graph.nodes.length === 0) {
+    return <div className="text-sm text-zinc-600">{emptyMessage}</div>;
+  }
 
-  useEffect(() => {
-    setNodes(graph.nodes);
-    setEdges(graph.edges);
-    setOpenNodeIds([]);
-  }, [graph, setNodes]);
+  return (
+    <FlowGraphBody
+      key={graphKey}
+      graph={graph}
+      graphKey={graphKey}
+      heightClass={heightClass}
+    />
+  );
+}
+
+function FlowGraphBody({
+  graph,
+  graphKey,
+  heightClass,
+}: {
+  graph: { nodes: GraphNode[]; edges: GraphEdge[] };
+  graphKey: string;
+  heightClass: string;
+}) {
+  const [nodes, , onNodesChange] = useNodesState(graph.nodes);
+  const [openNodeIds, setOpenNodeIds] = useState<string[]>([]);
 
   const displayNodes = nodes.map((node) => ({
     ...node,
@@ -1000,21 +1171,17 @@ function FlowGraph({
     },
   }));
 
-  if (nodes.length === 0) {
-    return <div className="text-sm text-zinc-600">{emptyMessage}</div>;
-  }
-
   return (
     <div className={heightClass}>
       <ReactFlow
         key={graphKey}
         nodes={displayNodes}
-        edges={edges}
+        edges={graph.edges}
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
         onNodeClick={(_, node) => {
-          if (!node.data.details?.length) {
+          if (!node.data.details?.length && !node.data.provProperties?.length) {
             return;
           }
 
@@ -1069,5 +1236,20 @@ function TracingComparisonView({
   );
 }
 
-export { ProvenanceGraphView, TracingComparisonView, renderProvenanceGraph };
-export type { GraphMode };
+function AgentDagGraphView({ dag }: { dag: AgentDag }) {
+  return (
+    <FlowGraph
+      graph={renderAgentDagGraph(dag)}
+      graphKey={`agent-dag:${dag.nodes.map((node) => node.id).join(':')}`}
+      emptyMessage="No tool calls."
+      heightClass="h-[28rem]"
+    />
+  );
+}
+
+export {
+  AgentDagGraphView,
+  ProvenanceGraphView,
+  TracingComparisonView,
+  renderProvenanceGraph,
+};

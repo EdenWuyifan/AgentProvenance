@@ -43,6 +43,60 @@ provenance = AgentProvenance("traces.json")
 provenance.show()
 ```
 
+## React App And Backend
+
+The React UI is in `agent_provenance_react`. The Python API backend is in
+`agent_provenance_backend`.
+
+The browser app stays focused on input and visualization. The backend owns PROV
+graph building, token-overlap candidate edges, graph caching, and LLM calls for
+both PROV refinement and the chat panel.
+
+### Backend Setup
+
+```bash
+cd agent_provenance_backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+The backend reads `agent_provenance_react/.env` if present. Configure the LLM
+there or in your shell:
+
+```bash
+PORTKEY_API_KEY=...
+PORTKEY_BASE_URL=https://your-portkey-server/v1/
+PORTKEY_MODEL=gpt-5-mini
+```
+
+### Frontend Setup
+
+```bash
+cd agent_provenance_react
+npm install
+```
+
+### Run Together
+
+```bash
+./run_agent_provenance_system.sh
+```
+
+This starts:
+
+- backend: `http://127.0.0.1:8008`
+- frontend: `http://127.0.0.1:3000`
+
+Optional ports:
+
+```bash
+PROVENANCE_BACKEND_PORT=8008 PROVENANCE_FRONTEND_PORT=3000 ./run_agent_provenance_system.sh
+```
+
+This script intentionally mirrors the future Docker Compose split: one backend
+service and one frontend service, connected by `PROVENANCE_BACKEND_URL`.
+
 ### Working with Trace Data
 
 ```python

@@ -2,19 +2,21 @@
 
 import {
   startTransition,
+  useCallback,
   useEffect,
+  useMemo,
   useRef,
   type ReactNode,
   useState,
 } from "react";
 
 import {
+  AgentDagGraphView,
   ProvenanceGraphView,
   TracingComparisonView,
-  type GraphMode,
 } from "./components/provenance_graph";
 import { ProvenanceCopilot } from "./components/provenance_copilot";
-import type { Tracing } from "./components/types";
+import type { AgentDag, GraphMode, Tracing } from "./components/types";
 import { renderUpsetPlot } from "./components/upset_plot";
 import {
   extractToolCallRecords,
@@ -35,6 +37,11 @@ const TRACE_SELECTION_COLORS = [
 ] as const;
 
 type TopChartMode = "usage" | "impact";
+type BottomGraphView = "trace" | "agent";
+type AgentDagState =
+  | { status: "loading" }
+  | { status: "ready"; dag: AgentDag }
+  | { status: "error" };
 
 function getGroupingOptions(tracings: Tracing[]) {
   const keys = new Set<string>();
@@ -228,6 +235,46 @@ function GraphModeToggle({
   );
 }
 
+function BottomGraphViewToggle({
+  view,
+  agentDisabled,
+  agentLoading,
+  onChange,
+}: {
+  view: BottomGraphView;
+  agentDisabled: boolean;
+  agentLoading: boolean;
+  onChange: (view: BottomGraphView) => void;
+}) {
+  return (
+    <div className="inline-flex h-7 items-center border border-zinc-300 bg-zinc-50/95 backdrop-blur-sm">
+      <button
+        type="button"
+        className={`h-full px-2 text-[11px] font-medium transition ${
+          view === "trace"
+            ? "bg-white text-zinc-950 shadow-sm"
+            : "text-zinc-500 hover:text-zinc-950"
+        }`}
+        onClick={() => onChange("trace")}
+      >
+        Trace
+      </button>
+      <button
+        type="button"
+        className={`h-full border-l border-zinc-300 px-2 text-[11px] font-medium transition ${
+          view === "agent"
+            ? "bg-white text-zinc-950 shadow-sm"
+            : "text-zinc-500 hover:text-zinc-950"
+        } disabled:cursor-default disabled:bg-zinc-100 disabled:text-zinc-300`}
+        onClick={() => onChange("agent")}
+        disabled={agentDisabled}
+      >
+        {agentLoading ? "Building PROV" : "PROV graph"}
+      </button>
+    </div>
+  );
+}
+
 function UpsetGroupBySelect({
   value,
   options,
@@ -329,6 +376,11 @@ export default function Home() {
   const [upsetGroupBy, setUpsetGroupBy] = useState("");
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
   const [graphMode, setGraphMode] = useState<GraphMode>("tree");
+  const [bottomGraphView, setBottomGraphView] = useState<BottomGraphView>("trace");
+  const [agentDagStates, setAgentDagStates] = useState<
+    Record<string, AgentDagState>
+  >({});
+  const agentDagStatesRef = useRef<Record<string, AgentDagState>>({});
 
   const { data, loading, error } = useTracingData("/tracings.jsonl");
   const groupingOptions = getGroupingOptions(data);
@@ -339,14 +391,75 @@ export default function Home() {
     )
     .filter((tracing): tracing is Tracing => tracing !== null);
   const selectedTracing = selectedTracings[0] ?? null;
-  const selectedTracingColors = Object.fromEntries(
-    selectedTracingIds.map((selectedTracingId, index) => [
-      selectedTracingId,
-      TRACE_SELECTION_COLORS[index],
-    ])
+  const selectedAgentDagState = selectedTracing
+    ? agentDagStates[String(selectedTracing.id)]
+    : undefined;
+  const agentDagReady = selectedAgentDagState?.status === "ready";
+  const agentDagLoading = selectedAgentDagState?.status === "loading";
+  const selectedTracingColors = useMemo(
+    () =>
+      Object.fromEntries(
+        selectedTracingIds.map((selectedTracingId, index) => [
+          selectedTracingId,
+          TRACE_SELECTION_COLORS[index],
+        ])
+      ),
+    [selectedTracingIds]
   );
 
-  function handleTracingSelect(tracingId: Tracing["id"]) {
+  const setAgentDagState = useCallback((traceId: Tracing["id"], state: AgentDagState) => {
+    agentDagStatesRef.current = {
+      ...agentDagStatesRef.current,
+      [String(traceId)]: state,
+    };
+    setAgentDagStates(agentDagStatesRef.current);
+  }, []);
+
+  const loadAgentDag = useCallback(async (tracing: Tracing) => {
+    const state = agentDagStatesRef.current[String(tracing.id)];
+
+    if (state?.status === "loading" || state?.status === "ready") {
+      return;
+    }
+
+    setAgentDagState(tracing.id, { status: "loading" });
+
+    try {
+      const response = await fetch("/api/provenance-dag", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          traceId: tracing.id,
+          toolCalls: tracing.toolCalls,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error((await response.text()) || "Unable to build PROV graph.");
+      }
+
+      const payload = (await response.json()) as {
+        dag: AgentDag;
+      };
+
+      setAgentDagState(tracing.id, {
+        status: "ready",
+        dag: payload.dag,
+      });
+    } catch {
+      setAgentDagState(tracing.id, { status: "error" });
+    }
+  }, [setAgentDagState]);
+
+  const handleTracingSelect = useCallback((tracingId: Tracing["id"]) => {
+    const tracing = data.find((item) => item.id === tracingId);
+
+    if (tracing && !selectedTracingIds.includes(tracingId)) {
+      void loadAgentDag(tracing);
+    }
+
     setSelectedTracingIds((current) => {
       if (current.includes(tracingId)) {
         return current.filter((selectedTracingId) => selectedTracingId !== tracingId);
@@ -358,7 +471,7 @@ export default function Home() {
 
       return [...current.slice(0, 2), tracingId];
     });
-  }
+  }, [data, loadAgentDag, selectedTracingIds]);
 
   useEffect(() => {
     const validGroups = new Set(getGroupingValues(data, upsetGroupBy));
@@ -408,7 +521,16 @@ export default function Home() {
     return () => {
       observer.disconnect();
     };
-  }, [collapsedGroups, data, error, loading, selectedTracingIds, topChartMode, upsetGroupBy]);
+  }, [
+    collapsedGroups,
+    data,
+    error,
+    handleTracingSelect,
+    loading,
+    selectedTracingColors,
+    topChartMode,
+    upsetGroupBy,
+  ]);
 
   return (
     <div className="min-h-screen bg-stone-100 px-4 py-10 text-zinc-950">
@@ -482,7 +604,17 @@ export default function Home() {
           }
           actions={
             selectedTracings.length === 1 ? (
-              <GraphModeToggle mode={graphMode} onChange={setGraphMode} />
+              <div className="flex flex-wrap items-center gap-2">
+                <BottomGraphViewToggle
+                  view={agentDagReady ? bottomGraphView : "trace"}
+                  agentDisabled={!agentDagReady}
+                  agentLoading={agentDagLoading}
+                  onChange={setBottomGraphView}
+                />
+                {bottomGraphView === "trace" || !agentDagReady ? (
+                  <GraphModeToggle mode={graphMode} onChange={setGraphMode} />
+                ) : null}
+              </div>
             ) : undefined
           }
         >
@@ -495,7 +627,11 @@ export default function Home() {
             <StatusMessage message="Select up to 3 traces in the matrix to render a provenance graph or comparison." />
           )}
           {!loading && !error && selectedTracings.length === 1 && selectedTracing && (
-            <ProvenanceGraphView tracing={selectedTracing} mode={graphMode} />
+            bottomGraphView === "agent" && agentDagReady ? (
+              <AgentDagGraphView dag={selectedAgentDagState.dag} />
+            ) : (
+              <ProvenanceGraphView tracing={selectedTracing} mode={graphMode} />
+            )
           )}
           {!loading && !error && selectedTracings.length >= 2 && (
             <TracingComparisonView traces={selectedTracings} />
