@@ -33,19 +33,23 @@ The Python backend in [`../agent_provenance_backend/app.py`](../agent_provenance
 builds the graph in two stages. The Next route only proxies requests to that backend.
 
 1. Code creates the stable skeleton:
-   - one Activity node for each tool call
+   - one Activity node for each tool call, with `id`, `kind`, `toolCallId`, `tool`, `timeIndex`, and sanitized `args`
    - at most one primary output Entity for a tool call with a valid artifact id, path, url, name, or filename
+   - Entity nodes contain `id`, `kind`, `entityType`, and sanitized output `response`
    - Activity -> Entity edges for tool outputs
 
 2. Code proposes direct dependency candidates between earlier calls and later calls:
    - shared ids, filenames, paths, urls, or artifact names from previous output to next input
    - weighted input-token coverage using an inverted index from previous output tokens to tool calls
+   - candidate edges carry `evidence`, such as shared artifact names or shared tokens plus scores
    - adjacency alone is not used as evidence
 
-3. The LLM receives sanitized full args/response JSON, the draft graph, and suggested `ProvEdge` objects, then returns validated graph edit operations. Supported operations are `addNode`, `removeNode`, `editNode`, `addEdge`, `removeEdge`, and `editEdge`.
+3. The LLM receives only the sanitized `draftGraph`. It does not receive raw tool calls or a separate suggested-edge list. It reviews Activity args, Entity responses, and edge evidence, then returns validated graph edit operations. Supported operations are `addNode`, `removeNode`, `editNode`, `addEdge`, `removeEdge`, and `editEdge`.
 
 Rules:
 
+- Activity nodes do not include responses; responses live on output Entity nodes.
+- Entity nodes do not duplicate response metadata as top-level `name`, `path`, `label`, or `keys`.
 - No Entity -> Entity edges.
 - If a call has no selected direct predecessor, its Activity node starts as a new root.
 - If a previous tool call has no valid output Entity but still clearly informs a later call, the graph may use Activity -> Activity.

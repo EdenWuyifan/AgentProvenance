@@ -977,8 +977,65 @@ function renderProvenanceGraph(tracing: Tracing, mode: GraphMode) {
 function formatProvEdge(edge: AgentDag['edges'][number], direction: 'from' | 'to') {
   const relation = edge.relation ?? 'edge';
   const peer = direction === 'from' ? edge.source : edge.target;
+  const evidence = edge.evidence
+    ?.flatMap((item) => item.shared ?? [])
+    .slice(0, 6)
+    .join(', ');
 
-  return `${relation} ${direction} ${peer}`;
+  return evidence
+    ? `${relation} ${direction} ${peer} [${evidence}]`
+    : `${relation} ${direction} ${peer}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function provNodeLabel(node: AgentDag['nodes'][number]) {
+  if (node.kind === 'Activity') {
+    return node.tool;
+  }
+
+  return entityResponseLabel(node.response) ?? node.entityType;
+}
+
+function entityResponseLabel(response: unknown) {
+  if (!isRecord(response)) {
+    return undefined;
+  }
+
+  const candidates = [response, ...Object.values(response).filter(isRecord)];
+
+  for (const candidate of candidates) {
+    const name = candidate.name;
+    if (name) {
+      return String(name);
+    }
+
+    const path = candidate.path;
+    if (path) {
+      return String(path).split('/').pop() ?? String(path);
+    }
+
+    const id = candidate.id;
+    if (id) {
+      return String(id);
+    }
+  }
+
+  return undefined;
+}
+
+function propertyValue(value: unknown): string | string[] {
+  if (Array.isArray(value) && value.every((item) => typeof item === 'string')) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  return JSON.stringify(value) ?? 'undefined';
 }
 
 function buildProvProperties(
@@ -989,20 +1046,20 @@ function buildProvProperties(
   const properties: Array<{ name: string; value: string | string[] }> = [
     { name: 'id', value: node.id },
     { name: 'kind', value: node.kind },
-    { name: 'label', value: node.label },
   ];
 
   if (node.kind === 'Activity') {
     properties.push(
       { name: 'toolCallId', value: node.toolCallId },
       { name: 'tool', value: node.tool },
-      { name: 'timeIndex', value: String(node.timeIndex) }
+      { name: 'timeIndex', value: String(node.timeIndex) },
+      { name: 'args', value: propertyValue(node.args) }
     );
   } else {
-    properties.push(
-      { name: 'entityType', value: node.entityType },
-      { name: 'keys', value: node.keys.length ? node.keys : ['none'] }
-    );
+    properties.push({ name: 'entityType', value: node.entityType });
+    if (node.response !== undefined) {
+      properties.push({ name: 'response', value: propertyValue(node.response) });
+    }
   }
 
   if (incoming.length > 0) {
@@ -1068,7 +1125,7 @@ function renderAgentDagGraph(dag: AgentDag) {
       targetPosition: Position.Left,
       data:
         node.kind === 'Entity'
-          ? buildNodeData(node.label, undefined, {
+          ? buildNodeData(provNodeLabel(node), undefined, {
               glyph: 'circle',
               group: node.entityType,
               kind: 'Entity',
@@ -1079,7 +1136,7 @@ function renderAgentDagGraph(dag: AgentDag) {
                 outgoingByNode.get(node.id) ?? []
               ),
             })
-          : buildNodeData(node.label, undefined, {
+          : buildNodeData(provNodeLabel(node), undefined, {
               kind: 'Activity',
               nodeType: node.tool,
               provProperties: buildProvProperties(

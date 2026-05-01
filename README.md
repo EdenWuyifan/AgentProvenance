@@ -52,6 +52,18 @@ The browser app stays focused on input and visualization. The backend owns PROV
 graph building, token-overlap candidate edges, graph caching, and LLM calls for
 both PROV refinement and the chat panel.
 
+The PROV graph is intentionally compact:
+
+- Activity nodes hold call identity, tool name, time index, and sanitized args.
+- Entity nodes hold the sanitized output response.
+- Responses are not duplicated on Activity nodes.
+- Entity metadata such as names and paths stays inside the response, not as
+  top-level `label`, `keys`, `name`, or `path` fields.
+- Dependency candidates are edges with explicit evidence, such as shared
+  artifacts or shared tokens. Adjacent calls are not connected by default.
+- The refinement LLM receives only the sanitized draft graph and returns graph
+  edits; raw calls and separate suggested-edge lists are not passed to it.
+
 ### Backend Setup
 
 ```bash
