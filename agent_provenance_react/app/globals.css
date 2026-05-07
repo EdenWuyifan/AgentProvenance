@@ -65,6 +65,12 @@ body {
   background: linear-gradient(180deg, #eff6ff 0%, #ffffff 100%);
 }
 
+.react-flow__node.prov-node--root {
+  min-width: 96px;
+  border-color: #a3a3a3;
+  background: #fafafa;
+}
+
 .provenance-node {
   display: inline-flex;
   align-items: center;
@@ -106,6 +112,10 @@ body {
   -webkit-line-clamp: 6;
   font-size: 10px;
   line-height: 1.15;
+}
+
+.provenance-node--root {
+  font-weight: 600;
 }
 
 .react-flow__handle {

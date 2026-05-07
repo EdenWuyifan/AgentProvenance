@@ -67,7 +67,7 @@ export function ProvenanceCopilot({
   const [answer, setAnswer] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [minimized, setMinimized] = useState(false);
+  const [minimized, setMinimized] = useState(true);
   const [dragging, setDragging] = useState(false);
   const [resizing, setResizing] = useState(false);
   const [position, setPosition] = useState<PanelPosition | null>(null);
@@ -261,7 +261,7 @@ export function ProvenanceCopilot({
     <div
       ref={panelRef}
       className={`fixed z-50 flex flex-col overflow-hidden rounded-[22px] border border-slate-200/80 bg-white/72 shadow-[0_10px_30px_rgba(15,23,42,0.12)] backdrop-blur-xl ${
-        position ? "" : "left-1/2 bottom-4 -translate-x-1/2"
+        position ? "" : "right-4 top-4"
       }`}
       style={{
         left: position?.x,

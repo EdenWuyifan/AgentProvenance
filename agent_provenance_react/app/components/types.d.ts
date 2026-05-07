@@ -87,3 +87,57 @@ export type ProvGraph = {
 };
 
 export type AgentDag = ProvGraph;
+
+export type JoinedProvenanceNode = {
+  id: string;
+  kind: "Root" | "JoinedActivity";
+  label: string;
+  supportTraces: string[];
+  supportCount: number;
+  multiplicityByTrace: Record<string, number>;
+  members: unknown[];
+  representativeSignature: unknown;
+  rootSetsByTrace: Record<string, string[][]>;
+  confidence: number;
+  supportRatio?: number;
+  scoreSummary?: JoinedScoreSummary;
+};
+
+export type JoinedProvenanceEdge = {
+  id: string;
+  source: string;
+  target: string;
+  supportTraces: string[];
+  supportCount: number;
+  relationTypes: string[];
+  rawEdges: unknown[];
+  count: number;
+  scoreSummary?: JoinedScoreSummary;
+};
+
+export type JoinedScoreSummary = {
+  highScoreTraces: string[];
+  lowScoreTraces: string[];
+  averageScore: number | null;
+  isAnomaly: boolean;
+};
+
+export type JoinedProvenanceGraph = {
+  nodes: JoinedProvenanceNode[];
+  edges: JoinedProvenanceEdge[];
+  motifs: Array<{
+    path: string[];
+    supportTraces: string[];
+    supportCount: number;
+    highScoreSupport?: number;
+    lowScoreSupport?: number;
+    scoreLift?: number;
+  }>;
+  threshold: number;
+  rootDefinitionsByTrace: Record<string, unknown[]>;
+  scoreSummary?: {
+    min: number;
+    max: number;
+    median: number;
+  } | null;
+};

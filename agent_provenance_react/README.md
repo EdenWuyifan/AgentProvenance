@@ -1,8 +1,21 @@
 # AgentProvenance React UI
 
-This app is the browser UI for exploring trace provenance.
+Browser interface for exploring agent trace provenance. The frontend owns data
+loading, selection state, visualization, and proxy routes. It does not infer
+provenance dependencies; graph generation lives in the backend.
 
-## Run locally
+Backend behavior is documented in
+[`../agent_provenance_backend/README.md`](../agent_provenance_backend/README.md).
+
+## Frontend Domain
+
+- Load JSON or JSONL trace files from `public/`.
+- Render the provenance matrix and selected trace context.
+- Proxy graph and chat requests to the Python backend.
+- Display single-trace PROV DAGs and joined provenance graphs.
+- Keep UI state for selected runs, graph mode, thresholds, and chat.
+
+## Run Locally
 
 ```bash
 npm install
@@ -11,92 +24,58 @@ npm run dev
 
 Open `http://localhost:3000`.
 
-## Data source
-
-The page loads trace data from [`public/tracings.jsonl`](./public/tracings.jsonl).
-
-- JSON arrays are supported.
-- JSONL files are supported.
-- Rich traces with `outputs.messages[].tool_calls` are supported.
-- Simpler traces with `tool_calls` are supported.
-- Both shapes render the provenance matrix.
-
-## PROV Graph Workflow
-
-The PROV graph treats each tool call as:
-
-```text
-input -> tool activity -> output
-```
-
-The Python backend in [`../agent_provenance_backend/app.py`](../agent_provenance_backend/app.py)
-builds the graph in two stages. The Next route only proxies requests to that backend.
-
-1. Code creates the stable skeleton:
-   - one Activity node for each tool call, with `id`, `kind`, `toolCallId`, `tool`, `timeIndex`, and sanitized `args`
-   - at most one primary output Entity for a tool call with a valid artifact id, path, url, name, or filename
-   - Entity nodes contain `id`, `kind`, `entityType`, and sanitized output `response`
-   - Activity -> Entity edges for tool outputs
-
-2. Code proposes direct dependency candidates between earlier calls and later calls:
-   - shared ids, filenames, paths, urls, or artifact names from previous output to next input
-   - weighted input-token coverage using an inverted index from previous output tokens to tool calls
-   - candidate edges carry `evidence`, such as shared artifact names or shared tokens plus scores
-   - adjacency alone is not used as evidence
-
-3. The LLM receives only the sanitized `draftGraph`. It does not receive raw tool calls or a separate suggested-edge list. It reviews Activity args, Entity responses, and edge evidence, then returns validated graph edit operations. Supported operations are `addNode`, `removeNode`, `editNode`, `addEdge`, `removeEdge`, and `editEdge`.
-
-Rules:
-
-- Activity nodes do not include responses; responses live on output Entity nodes.
-- Entity nodes do not duplicate response metadata as top-level `name`, `path`, `label`, or `keys`.
-- No Entity -> Entity edges.
-- If a call has no selected direct predecessor, its Activity node starts as a new root.
-- If a previous tool call has no valid output Entity but still clearly informs a later call, the graph may use Activity -> Activity.
-- Redundant inspection or preview steps are pruned only when the LLM explicitly returns graph edits; the code does not rely on fixed tool names.
-- Token-overlap edges are scored candidates only; the LLM must still reject indirect or sibling calls.
-
-Embedding candidates are disabled for now because local embedding generation is slow. Token candidates are generated from raw scalar JSON values before truncation, so short inputs such as gene lists can connect to earlier outputs containing the same genes.
+Set the backend URL when it is not running on the default port:
 
 ```bash
-# Optional:
 PROVENANCE_BACKEND_URL=http://127.0.0.1:8008
-PROVENANCE_TOKEN_CHAMFER_THRESHOLD=0.5
 ```
 
-Run the backend before using PROV graph generation or the chat panel:
+## Data Source
+
+The default page reads trace data from:
+
+- [`public/tracings.jsonl`](./public/tracings.jsonl)
+
+[`public/pi_mono_tracings.jsonl`](./public/pi_mono_tracings.jsonl) is available
+as an alternate local dataset.
+
+Supported trace shapes:
+
+- JSON arrays
+- JSONL files
+- `tool_calls`
+- `toolCalls`
+- `calls`
+- `steps`
+- LangSmith-style `outputs.messages[].tool_calls`
+
+## Backend Boundary
+
+The Next routes under `app/api/` only forward requests to the Python service:
+
+- `app/api/provenance-dag/route.ts` -> `POST /api/prov-graph`
+- `app/api/joined-provenance-graph/route.ts` -> `POST /api/joined-provenance-graph`
+- `app/api/provenance-agent/route.ts` -> `POST /api/provenance-agent`
+
+Run the backend before using PROV graph generation, joined graphs, or the chat
+panel:
 
 ```bash
 cd ../agent_provenance_backend
-python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
 uvicorn app:app --host 127.0.0.1 --port 8008
 ```
 
-## Provenance Copilot
+The matrix can still render static trace files without the backend.
 
-The dashboard also includes a small chat panel for the current selection. The
-Next route proxies the request to the Python backend, and the backend makes the
-LLM call.
+## Main Files
 
-Set these environment variables before running the app:
-
-```bash
-PORTKEY_API_KEY=...
-PORTKEY_BASE_URL=https://your-portkey-server/v1/
-PORTKEY_MODEL=gpt-5-mini
-```
-
-Select up to 3 runs in the matrix, then ask questions about the active
-provenance graph. The request includes the selected traces, their scores,
-metadata, and ordered tool calls with parameters.
-
-## Main files
-
-- [`app/page.tsx`](./app/page.tsx): page shell and state
-- [`app/components/upset_plot.js`](./app/components/upset_plot.js): provenance matrix renderer
-- [`app/components/visualization_shared.js`](./app/components/visualization_shared.js): shared trace parsing and glyph helpers
-- [`app/components/provenance_copilot.tsx`](./app/components/provenance_copilot.tsx): minimal chat UI for the selected runs
-- [`app/api/provenance-agent/route.ts`](./app/api/provenance-agent/route.ts): chat proxy route
-- [`../agent_provenance_backend/app.py`](../agent_provenance_backend/app.py): PROV graph and LLM backend
+- [`app/page.tsx`](./app/page.tsx): page shell and state.
+- [`app/components/upset_plot.js`](./app/components/upset_plot.js): provenance
+  matrix renderer.
+- [`app/components/provenance_graph.tsx`](./app/components/provenance_graph.tsx):
+  single and joined graph visualization.
+- [`app/components/provenance_copilot.tsx`](./app/components/provenance_copilot.tsx):
+  chat panel for selected runs.
+- [`app/components/visualization_shared.js`](./app/components/visualization_shared.js):
+  shared trace parsing and glyph helpers.

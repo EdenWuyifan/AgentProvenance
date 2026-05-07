@@ -12,11 +12,16 @@ import {
 
 import {
   AgentDagGraphView,
+  JoinedProvenanceGraphView,
   ProvenanceGraphView,
-  TracingComparisonView,
 } from "./components/provenance_graph";
 import { ProvenanceCopilot } from "./components/provenance_copilot";
-import type { AgentDag, GraphMode, Tracing } from "./components/types";
+import type {
+  AgentDag,
+  GraphMode,
+  JoinedProvenanceGraph,
+  Tracing,
+} from "./components/types";
 import { renderUpsetPlot } from "./components/upset_plot";
 import {
   extractToolCallRecords,
@@ -42,6 +47,11 @@ type AgentDagState =
   | { status: "loading" }
   | { status: "ready"; dag: AgentDag }
   | { status: "error" };
+type JoinedGraphState =
+  | { status: "idle" }
+  | { status: "loading"; key: string }
+  | { status: "ready"; key: string; graph: JoinedProvenanceGraph }
+  | { status: "error"; key: string; message: string };
 
 function getGroupingOptions(tracings: Tracing[]) {
   const keys = new Set<string>();
@@ -380,6 +390,9 @@ export default function Home() {
   const [agentDagStates, setAgentDagStates] = useState<
     Record<string, AgentDagState>
   >({});
+  const [joinedGraphState, setJoinedGraphState] = useState<JoinedGraphState>({
+    status: "idle",
+  });
   const agentDagStatesRef = useRef<Record<string, AgentDagState>>({});
 
   const { data, loading, error } = useTracingData("/tracings.jsonl");
@@ -396,6 +409,16 @@ export default function Home() {
     : undefined;
   const agentDagReady = selectedAgentDagState?.status === "ready";
   const agentDagLoading = selectedAgentDagState?.status === "loading";
+  const selectedJoinKey = selectedTracingIds.map(String).join(":");
+  const selectedDagStates = selectedTracings.map(
+    (tracing) => agentDagStates[String(tracing.id)]
+  );
+  const selectedDagsReady =
+    selectedTracings.length >= 2 &&
+    selectedDagStates.every((state) => state?.status === "ready");
+  const selectedDagsError =
+    selectedTracings.length >= 2 &&
+    selectedDagStates.some((state) => state?.status === "error");
   const selectedTracingColors = useMemo(
     () =>
       Object.fromEntries(
@@ -490,6 +513,96 @@ export default function Home() {
   }, [data]);
 
   useEffect(() => {
+    if (selectedTracingIds.length < 2) {
+      setJoinedGraphState({ status: "idle" });
+      return;
+    }
+
+    if (selectedDagsError) {
+      setJoinedGraphState({
+        status: "error",
+        key: selectedJoinKey,
+        message: "Unable to build one of the selected PROV graphs.",
+      });
+      return;
+    }
+
+    if (!selectedDagsReady) {
+      setJoinedGraphState({ status: "loading", key: selectedJoinKey });
+      return;
+    }
+
+    let cancelled = false;
+
+    async function loadJoinedGraph() {
+      setJoinedGraphState({ status: "loading", key: selectedJoinKey });
+
+      try {
+        const graphs = selectedTracingIds.flatMap((selectedTracingId) => {
+          const tracing = data.find((item) => item.id === selectedTracingId);
+          const state = agentDagStates[String(selectedTracingId)];
+
+          return tracing && state?.status === "ready"
+            ? [{
+                traceId: tracing.id,
+                score: tracing.score,
+                dag: state.dag,
+                toolCalls: tracing.toolCalls,
+              }]
+            : [];
+        });
+        const response = await fetch("/api/joined-provenance-graph", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ graphs }),
+        });
+
+        if (!response.ok) {
+          throw new Error((await response.text()) || "Unable to join PROV graphs.");
+        }
+
+        const payload = (await response.json()) as {
+          joinedGraph: JoinedProvenanceGraph;
+        };
+
+        if (!cancelled) {
+          setJoinedGraphState({
+            status: "ready",
+            key: selectedJoinKey,
+            graph: payload.joinedGraph,
+          });
+        }
+      } catch (loadError) {
+        if (!cancelled) {
+          setJoinedGraphState({
+            status: "error",
+            key: selectedJoinKey,
+            message:
+              loadError instanceof Error
+                ? loadError.message
+                : "Unable to join PROV graphs.",
+          });
+        }
+      }
+    }
+
+    void loadJoinedGraph();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    agentDagStates,
+    data,
+    selectedDagsError,
+    selectedDagsReady,
+    selectedJoinKey,
+    selectedTracingIds,
+  ]);
+
+  useEffect(() => {
     const element = upsetRef.current;
     if (!element || loading || error || data.length === 0) {
       return;
@@ -498,6 +611,7 @@ export default function Home() {
     const render = () => {
       renderUpsetPlot(element, data, {}, {
         width: Math.max(element.clientWidth, 720),
+        matrixMaxHeight: 360,
         topChartMode,
         rowGroupBy: upsetGroupBy || undefined,
         collapsedGroups,
@@ -543,7 +657,7 @@ export default function Home() {
 
         <Card
           title="Tracings provenance"
-          description="Click up to 3 runs to inspect a provenance graph or compare them on a shared LCS branch."
+          description="Click up to 3 runs to inspect one PROV graph or join multiple PROV graphs on a shared canvas."
         >
           {loading && <StatusMessage message="Loading traces…" />}
           {!loading && error && <StatusMessage message={error} />}
@@ -593,10 +707,8 @@ export default function Home() {
           title="Provenance graph"
           description={
             selectedTracings.length >= 2
-              ? `Compare ${selectedTracings
-                  .map((tracing, index) =>
-                    `run #${tracing.id} in ${index === 0 ? "blue" : index === 1 ? "orange" : "green"}`
-                  )
+              ? `Joined graph for ${selectedTracings
+                  .map((tracing) => `run #${tracing.id}`)
                   .join(", ")}.`
               : selectedTracing
                 ? `Run #${selectedTracing.id}`
@@ -634,7 +746,22 @@ export default function Home() {
             )
           )}
           {!loading && !error && selectedTracings.length >= 2 && (
-            <TracingComparisonView traces={selectedTracings} />
+            joinedGraphState.status === "ready" &&
+            joinedGraphState.key === selectedJoinKey ? (
+              <JoinedProvenanceGraphView
+                graph={joinedGraphState.graph}
+                traceIds={selectedTracingIds}
+              />
+            ) : (
+              <StatusMessage
+                message={
+                  joinedGraphState.status === "error" &&
+                  joinedGraphState.key === selectedJoinKey
+                    ? joinedGraphState.message
+                    : "Building joined PROV graph…"
+                }
+              />
+            )
           )}
         </Card>
       </main>

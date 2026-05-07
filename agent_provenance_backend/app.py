@@ -11,6 +11,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
+from joined_provenance import build_joined_provenance_graph
+
 ROOT = Path(__file__).resolve().parents[1]
 REACT_DIR = ROOT / "agent_provenance_react"
 CACHE_DIR = REACT_DIR / ".cache"
@@ -520,19 +522,17 @@ def parse_llm_graph_patch(text: str) -> dict[str, Any]:
 
 
 def chat_config() -> tuple[str, str, str, dict[str, str]]:
-    api_key = os.getenv("PROVENANCE_AGENT_API_KEY") or os.getenv("PORTKEY_API_KEY")
+    api_key = os.getenv("PORTKEY_API_KEY")
     if not api_key:
-        raise RuntimeError("Missing PROVENANCE_AGENT_API_KEY.")
+        raise RuntimeError("Missing PORTKEY_API_KEY.")
 
-    base_url = (
-        os.getenv("PROVENANCE_AGENT_BASE_URL")
-        or os.getenv("PORTKEY_BASE_URL")
-        or DEFAULT_BASE_URL
-    ).rstrip("/")
-    model = os.getenv("PROVENANCE_AGENT_MODEL") or os.getenv("PORTKEY_MODEL") or DEFAULT_MODEL
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-    if not os.getenv("PROVENANCE_AGENT_API_KEY") and os.getenv("PORTKEY_API_KEY"):
-        headers["x-portkey-api-key"] = api_key
+    base_url = (os.getenv("PORTKEY_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+    model = os.getenv("PORTKEY_MODEL") or DEFAULT_MODEL
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "x-portkey-api-key": api_key,
+    }
     return base_url, model, f"{base_url}/chat/completions", headers
 
 
@@ -821,6 +821,20 @@ async def prov_graph(request: Request):
     cache_path.write_text(json.dumps(dag, indent=2))
 
     return {"dag": dag, "cached": False, "cachePath": public_path}
+
+
+@app.post("/api/joined-provenance-graph")
+async def joined_provenance_graph(request: Request):
+    body = await request.json()
+    graphs = body.get("graphs") if isinstance(body.get("graphs"), list) else []
+    threshold = body.get("threshold")
+
+    return {
+        "joinedGraph": build_joined_provenance_graph(
+            graphs,
+            threshold if isinstance(threshold, (int, float)) else 0.75,
+        )
+    }
 
 
 @app.post("/api/provenance-agent")
