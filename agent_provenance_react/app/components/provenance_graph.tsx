@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Background,
   BaseEdge,
@@ -8,9 +8,12 @@ import {
   Handle,
   MarkerType,
   NodeToolbar,
+  Panel,
   Position,
   ReactFlow,
+  useNodesInitialized,
   useNodesState,
+  useReactFlow,
   type Edge,
   type EdgeProps,
   type Node,
@@ -20,7 +23,13 @@ import {
   ToolCallTooltip,
   type ToolCallTooltipDetail,
 } from './tool_call_tooltip';
-import type { AgentDag, GraphMode, ToolCall, Tracing } from './types';
+import type {
+  AgentDag,
+  GraphMode,
+  JoinedProvenanceGraph,
+  ToolCall,
+  Tracing,
+} from './types';
 import { createGlyphSystem } from './visualization_shared';
 
 type ComparisonNodeDetail = ToolCallTooltipDetail;
@@ -29,7 +38,7 @@ type GraphNodeData = {
   label: string;
   glyph: string;
   group: string;
-  kind?: 'Activity' | 'Entity';
+  kind?: 'Activity' | 'Entity' | 'Root' | 'JoinedActivity';
   nodeType?: string;
   provProperties?: Array<{ name: string; value: string | string[] }>;
   details?: ComparisonNodeDetail[];
@@ -43,6 +52,9 @@ type GraphEdgeData = {
   curveOffset?: number;
   curveDirection?: 1 | -1;
   color?: string;
+  strokeWidth?: number;
+  opacity?: number;
+  strokeDasharray?: string;
 };
 
 type GraphNode = Node<GraphNodeData, 'tool'>;
@@ -54,6 +66,7 @@ const COLLAPSED_LAYOUT = { x: 0, y: 0, gapY: 50 };
 const TREE_LAYOUT = { x: 0, y: 0, gapX: 176, gapY: 112 };
 const COMPARE_LAYOUT = { x: 0, y: 0, gapX: 176, gapY: 112 };
 const AGENT_DAG_LAYOUT = { x: 0, y: 0, gapX: 248, gapY: 128 };
+const JOINED_LAYOUT = { x: 0, y: 0, gapX: 170, gapY: 74 };
 const EDGE_LAYOUT = {
   curveGap: 28,
   markerEnd: { type: MarkerType.Arrow, width: 24, height: 24 },
@@ -127,8 +140,10 @@ function ToolNode({
   const variant =
     data.kind === 'Entity'
       ? 'entity'
-      : data.kind === 'Activity'
+      : data.kind === 'Activity' || data.kind === 'JoinedActivity'
         ? 'activity'
+        : data.kind === 'Root'
+          ? 'root'
         : 'tool';
 
   return (
@@ -293,7 +308,12 @@ function SequentialEdge(props: GraphEdgeProps) {
   } = props;
   const label = data?.label;
   const edgeStyle = data?.color
-    ? { stroke: data.color, strokeWidth: 2 }
+    ? {
+        stroke: data.color,
+        strokeWidth: data.strokeWidth ?? 2,
+        opacity: data.opacity,
+        strokeDasharray: data.strokeDasharray,
+      }
     : undefined;
 
   if (source === target) {
@@ -1178,16 +1198,219 @@ function renderAgentDagGraph(dag: AgentDag) {
   return { nodes, edges };
 }
 
+function formatJoinedEdge(
+  edge: JoinedProvenanceGraph['edges'][number],
+  direction: 'from' | 'to'
+) {
+  const relation = edge.relationTypes.join('/') || 'edge';
+  const peer = direction === 'from' ? edge.source : edge.target;
+
+  return `${relation} ${direction} ${peer} (${edge.supportCount})`;
+}
+
+function buildJoinedProperties(
+  node: JoinedProvenanceGraph['nodes'][number],
+  incoming: string[],
+  outgoing: string[]
+) {
+  const properties: Array<{ name: string; value: string | string[] }> = [
+    { name: 'id', value: node.id },
+    { name: 'kind', value: node.kind },
+    { name: 'supportTraces', value: node.supportTraces },
+    { name: 'supportCount', value: String(node.supportCount) },
+    { name: 'multiplicityByTrace', value: propertyValue(node.multiplicityByTrace) },
+    { name: 'confidence', value: String(node.confidence) },
+    { name: 'scoreSummary', value: propertyValue(node.scoreSummary) },
+    { name: 'rootSetsByTrace', value: propertyValue(node.rootSetsByTrace) },
+    { name: 'representativeSignature', value: propertyValue(node.representativeSignature) },
+    { name: 'members', value: propertyValue(node.members) },
+  ];
+
+  if (incoming.length > 0) {
+    properties.push({ name: 'incoming', value: incoming });
+  }
+
+  if (outgoing.length > 0) {
+    properties.push({ name: 'outgoing', value: outgoing });
+  }
+
+  return properties;
+}
+
+function joinedTraceColors(supportTraces: string[], traceIds: string[]) {
+  return traceIds
+    .map((traceId, index) =>
+      supportTraces.includes(traceId)
+        ? COMPARISON_TRACE_COLORS[index]
+        : null
+    )
+    .filter((colors): colors is typeof COMPARISON_TRACE_COLORS[number] => colors !== null);
+}
+
+function joinedNodeBackground(colors: Array<typeof COMPARISON_TRACE_COLORS[number]>) {
+  if (colors.length === 0) {
+    return undefined;
+  }
+
+  if (colors.length === 1) {
+    return colors[0].fill;
+  }
+
+  const step = 100 / colors.length;
+  return `linear-gradient(90deg, ${colors
+    .map((colors, index) => {
+      const start = Math.round(index * step);
+      const end = Math.round((index + 1) * step);
+      return `${colors.fill} ${start}% ${end}%`;
+    })
+    .join(', ')})`;
+}
+
+function renderJoinedProvenanceGraph(graph: JoinedProvenanceGraph, traceIds: string[]) {
+  const nodeIds = new Set(graph.nodes.map((node) => node.id));
+  const graphEdges = graph.edges.filter(
+    (edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target)
+  );
+  const nodeLevels = new Map(graph.nodes.map((node) => [node.id, 0]));
+  const rowsByLevel = new Map<number, number>();
+  const incomingByNode = new Map<string, string[]>();
+  const outgoingByNode = new Map<string, string[]>();
+
+  for (let pass = 0; pass < graph.nodes.length; pass += 1) {
+    let changed = false;
+
+    graphEdges.forEach((edge) => {
+      const nextLevel = (nodeLevels.get(edge.source) ?? 0) + 1;
+
+      if (nextLevel > (nodeLevels.get(edge.target) ?? 0)) {
+        nodeLevels.set(edge.target, nextLevel);
+        changed = true;
+      }
+    });
+
+    if (!changed) {
+      break;
+    }
+  }
+
+  graphEdges.forEach((edge) => {
+    incomingByNode.set(edge.target, [
+      ...(incomingByNode.get(edge.target) ?? []),
+      formatJoinedEdge(edge, 'from'),
+    ]);
+    outgoingByNode.set(edge.source, [
+      ...(outgoingByNode.get(edge.source) ?? []),
+      formatJoinedEdge(edge, 'to'),
+    ]);
+  });
+
+  const nodes: GraphNode[] = graph.nodes.map((node) => {
+    const level = nodeLevels.get(node.id) ?? 0;
+    const row = rowsByLevel.get(level) ?? 0;
+    const anomaly = Boolean(node.scoreSummary?.isAnomaly);
+    const highScore = Boolean(node.scoreSummary?.highScoreTraces.length);
+    const colors = joinedTraceColors(node.supportTraces, traceIds);
+    rowsByLevel.set(level, row + 1);
+
+    return {
+      id: node.id,
+      type: 'tool',
+      className:
+        node.kind === 'Root' ? 'prov-node--root' : 'prov-node--activity',
+      position: {
+        x: JOINED_LAYOUT.x + level * JOINED_LAYOUT.gapX,
+        y: JOINED_LAYOUT.y + row * JOINED_LAYOUT.gapY,
+      },
+      sourcePosition: Position.Right,
+      targetPosition: Position.Left,
+      data: buildNodeData(node.label, undefined, {
+        glyph: node.kind === 'Root' ? 'diamond' : 'circle',
+        group: node.kind,
+        kind: node.kind,
+        nodeType:
+          node.kind === 'Root'
+            ? `${node.supportCount} traces`
+            : [
+                `${node.supportCount} traces`,
+                `${Math.round(node.confidence * 100)}%`,
+                highScore ? 'high score' : '',
+                anomaly ? 'anomaly' : '',
+              ].filter(Boolean).join(', '),
+        provProperties: buildJoinedProperties(
+          node,
+          incomingByNode.get(node.id) ?? [],
+          outgoingByNode.get(node.id) ?? []
+        ),
+      }),
+      style: {
+        borderColor:
+          colors.length === 1
+            ? colors[0].border
+            : colors.length > 1
+              ? '#71717a'
+              : undefined,
+        borderWidth: anomaly || highScore ? 2 : undefined,
+        borderStyle: anomaly ? 'dashed' : undefined,
+        background: joinedNodeBackground(colors),
+        boxShadow: highScore ? '0 0 0 3px rgba(34, 197, 94, 0.18)' : undefined,
+      },
+    };
+  });
+  const edgeCounts = new Map<string, number>();
+  const edges: GraphEdge[] = graphEdges.map((edge) => {
+    const edgeKey = `${edge.source}:${edge.target}`;
+    const count = edgeCounts.get(edgeKey) ?? 0;
+    const colors = joinedTraceColors(edge.supportTraces, traceIds);
+    edgeCounts.set(edgeKey, count + 1);
+
+    return {
+      id: edge.id,
+      type: 'sequential',
+      source: edge.source,
+      target: edge.target,
+      sourceHandle: null,
+      targetHandle: null,
+      data: {
+        color:
+          colors.length === 1
+            ? colors[0].edge
+            : colors.length > 1
+              ? '#475569'
+              : '#94a3b8',
+        strokeWidth: Math.min(2 + edge.supportCount * 2.5, 12),
+        opacity: edge.supportCount > 1 ? 0.78 : 0.42,
+        strokeDasharray: edge.scoreSummary?.isAnomaly ? '6 5' : undefined,
+        curveOffset: count > 0 ? count + 1 : undefined,
+        curveDirection: count % 2 === 0 ? 1 : -1,
+      },
+    };
+  });
+
+  const minX = Math.min(...nodes.map((node) => node.position.x));
+  const minY = Math.min(...nodes.map((node) => node.position.y));
+  const normalizedNodes = nodes.map((node) => ({
+    ...node,
+    position: {
+      x: node.position.x - minX,
+      y: node.position.y - minY,
+    },
+  }));
+
+  return { nodes: normalizedNodes, edges };
+}
+
 function FlowGraph({
   graph,
   graphKey,
   emptyMessage,
   heightClass = 'h-96',
+  fitPadding = 0.2,
 }: {
   graph: { nodes: GraphNode[]; edges: GraphEdge[] };
   graphKey: string;
   emptyMessage: string;
   heightClass?: string;
+  fitPadding?: number;
 }) {
   if (graph.nodes.length === 0) {
     return <div className="text-sm text-zinc-600">{emptyMessage}</div>;
@@ -1199,7 +1422,55 @@ function FlowGraph({
       graph={graph}
       graphKey={graphKey}
       heightClass={heightClass}
+      fitPadding={fitPadding}
     />
+  );
+}
+
+function FlowGraphAutoFit({
+  graphKey,
+  fitPadding,
+}: {
+  graphKey: string;
+  fitPadding: number;
+}) {
+  const nodesInitialized = useNodesInitialized();
+  const { fitView } = useReactFlow();
+  const centerGraph = () => {
+    fitView({ padding: fitPadding, duration: 160 });
+  };
+
+  useEffect(() => {
+    if (!nodesInitialized) {
+      return;
+    }
+
+    let timeout: number | undefined;
+    const frame = window.requestAnimationFrame(() => {
+      fitView({ padding: fitPadding, duration: 0 });
+      timeout = window.setTimeout(() => {
+        fitView({ padding: fitPadding, duration: 120 });
+      }, 80);
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (timeout !== undefined) {
+        window.clearTimeout(timeout);
+      }
+    };
+  }, [fitPadding, fitView, graphKey, nodesInitialized]);
+
+  return (
+    <Panel position="top-right">
+      <button
+        type="button"
+        className="nodrag nopan border border-zinc-300 bg-white/95 px-2 py-1 text-[11px] font-medium text-zinc-600 shadow-sm transition hover:text-zinc-950"
+        onClick={centerGraph}
+      >
+        Center
+      </button>
+    </Panel>
   );
 }
 
@@ -1207,13 +1478,20 @@ function FlowGraphBody({
   graph,
   graphKey,
   heightClass,
+  fitPadding,
 }: {
   graph: { nodes: GraphNode[]; edges: GraphEdge[] };
   graphKey: string;
   heightClass: string;
+  fitPadding: number;
 }) {
-  const [nodes, , onNodesChange] = useNodesState(graph.nodes);
+  const [nodes, setNodes, onNodesChange] = useNodesState(graph.nodes);
   const [openNodeIds, setOpenNodeIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    setNodes(graph.nodes);
+    setOpenNodeIds([]);
+  }, [graph.nodes, graphKey, setNodes]);
 
   const displayNodes = nodes.map((node) => ({
     ...node,
@@ -1247,12 +1525,13 @@ function FlowGraphBody({
           );
         }}
         fitView
-        fitViewOptions={{ padding: 0.2 }}
+        fitViewOptions={{ padding: fitPadding, minZoom: 0.65, maxZoom: 1.15 }}
         nodesDraggable
         nodesConnectable={false}
         elementsSelectable={false}
         proOptions={{ hideAttribution: true }}
       >
+        <FlowGraphAutoFit graphKey={graphKey} fitPadding={fitPadding} />
         <Background />
       </ReactFlow>
     </div>
@@ -1304,8 +1583,27 @@ function AgentDagGraphView({ dag }: { dag: AgentDag }) {
   );
 }
 
+function JoinedProvenanceGraphView({
+  graph,
+  traceIds,
+}: {
+  graph: JoinedProvenanceGraph;
+  traceIds: Array<string | number>;
+}) {
+  return (
+    <FlowGraph
+      graph={renderJoinedProvenanceGraph(graph, traceIds.map(String))}
+      graphKey={`joined:${traceIds.map(String).join(':')}:${graph.nodes.map((node) => node.id).join(':')}:${graph.edges.length}`}
+      emptyMessage="No joined provenance graph."
+      heightClass="h-[30rem]"
+      fitPadding={0.08}
+    />
+  );
+}
+
 export {
   AgentDagGraphView,
+  JoinedProvenanceGraphView,
   ProvenanceGraphView,
   TracingComparisonView,
   renderProvenanceGraph,

@@ -1057,6 +1057,173 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         return;
     }
 
+    const matrixMaxHeight = options.matrixMaxHeight;
+    if (
+        typeof matrixMaxHeight === "number" &&
+        matrixHeightRequired > matrixMaxHeight
+    ) {
+        svg.remove();
+
+        const innerWidth = width - margin.left - margin.right;
+        const matrixWidth = innerWidth * 0.75;
+        const scoreWidth = innerWidth - matrixWidth;
+        const lowerHeaderHeight = 36;
+        const lowerHeight = lowerHeaderHeight + matrixHeightRequired + margin.bottom;
+        const lowerViewportHeight = lowerHeaderHeight + matrixMaxHeight + margin.bottom;
+
+        const x = d3
+            .scaleBand()
+            .domain(orderedTools)
+            .range([0, matrixWidth])
+            .padding(0.3);
+
+        const maxToolValue =
+            topChartMode === "impact"
+                ? d3.max(upperBarChartData, (d) => Math.abs(d.impact)) || 1
+                : d3.max(upperBarChartData, (d) => d.usageCount) || 1;
+        const yBar = d3
+            .scaleLinear()
+            .domain(
+                topChartMode === "impact"
+                    ? [-maxToolValue, maxToolValue]
+                    : [0, maxToolValue]
+            )
+            .nice()
+            .range([topBarHeightFixed, 0]);
+
+        const topSvg = containerSelection
+            .append("svg")
+            .attr("width", width)
+            .attr("height", margin.top + topBarHeightFixed);
+        const topGroup = topSvg
+            .append("g")
+            .attr("transform", `translate(${margin.left},${margin.top})`);
+
+        renderToolGroupBreaks({
+            group: topGroup,
+            breaks: toolGroupBreaks,
+            tools: orderedTools,
+            xScale: x,
+            height: topBarHeightFixed,
+        });
+
+        const barHighlightControls = renderToolCoverageBars({
+            group: topGroup,
+            data: upperBarChartData,
+            xScale: x,
+            yScale: yBar,
+            glyphSystem,
+            mode: topChartMode,
+            traceCount: tracings.length,
+            showTooltip,
+            hideTooltip,
+            formatScore,
+        });
+
+        const lowerWrapper = containerSelection
+            .append("div")
+            .style("max-height", `${lowerViewportHeight}px`)
+            .style("overflow-y", "auto")
+            .style("overflow-x", "hidden")
+            .style("border-top", "1px solid rgb(228 228 231)");
+        const lowerSvg = lowerWrapper
+            .append("svg")
+            .attr("width", width)
+            .attr("height", lowerHeight);
+        const lowerGroup = lowerSvg
+            .append("g")
+            .attr("transform", `translate(${margin.left},0)`);
+        const matrixTop = lowerHeaderHeight;
+        const matrixHeight = matrixHeightRequired;
+        const traceScale = d3
+            .scaleBand()
+            .domain(orderedTracings.domain)
+            .range([matrixTop, matrixTop + matrixHeight])
+            .paddingInner(0.25);
+
+        renderToolGroupBreaks({
+            group: lowerGroup,
+            breaks: toolGroupBreaks,
+            tools: orderedTools,
+            xScale: x,
+            height: matrixTop + matrixHeight,
+        });
+
+        renderTraceGroupBreaks({
+            group: lowerGroup,
+            groups: orderedTracings.groups,
+            traceScale,
+            width: matrixWidth + scoreWidth,
+            onGroupToggle: options.onGroupToggle,
+        });
+
+        const maxScore = d3.max(lowerBarChartData, (d) => d.score) || 1;
+        const scoreX = d3
+            .scaleLinear()
+            .domain([0, maxScore])
+            .range([0, scoreWidth]);
+
+        const matrixControls = renderCoverageGrid({
+            svg: lowerSvg,
+            group: lowerGroup,
+            tracings: orderedTracings.tracings,
+            tools: orderedTools,
+            matrixWidth,
+            matrixTop,
+            matrixHeight,
+            scoreWidth,
+            xScale: x,
+            traceScale,
+            tracingToolCalls,
+            glyphSystem,
+            barHighlightControls,
+            showTooltip,
+            hideTooltip,
+            formatArgs,
+            selectedTracingColors: options.selectedTracingColors,
+            onTracingSelect: options.onTracingSelect,
+        });
+
+        lowerGroup.append("g")
+            .selectAll("text.set-label")
+            .data(lowerBarChartData)
+            .join("text")
+            .attr("class", "set-label")
+            .attr("x", -12)
+            .attr("y", (d) => traceScale(d.id) + traceScale.bandwidth() / 2)
+            .attr("dy", "0.35em")
+            .attr("text-anchor", "end")
+            .attr("fill", "#111827")
+            .attr("font-weight", (d) =>
+                options.selectedTracingColors?.[d.id] ? 600 : 400
+            )
+            .style("font-size", "10px")
+            .style("cursor", options.onTracingSelect ? "pointer" : null)
+            .on("click", (_, d) => {
+                options.onTracingSelect?.(d.id);
+            })
+            .text((d) => d.id);
+
+        const scoreControls = renderScoreRail({
+            group: lowerGroup,
+            data: lowerBarChartData,
+            traceScale,
+            scoreX,
+            matrixTop,
+            matrixWidth,
+            scoreWidth,
+            showTooltip,
+            hideTooltip,
+            formatScore,
+            onRowFocus: (tracingId) => matrixControls.setRowHighlight(tracingId),
+            onRowBlur: () => matrixControls.clearRowHighlight(),
+            onRowSelect: options.onTracingSelect,
+        });
+
+        matrixControls.registerExternalRowHighlight(scoreControls.setRowHighlight);
+        return;
+    }
+
     const innerWidth = width - margin.left - margin.right;
     const innerHeight = height - margin.top - margin.bottom;
 

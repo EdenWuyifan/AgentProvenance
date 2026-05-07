@@ -196,3 +196,7 @@ tmp.ipynb
 
 # scripts
 scripts/
+
+# tmp
+tmp*
+*tmp
