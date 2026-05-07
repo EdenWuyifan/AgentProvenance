@@ -41,12 +41,6 @@ PORTKEY_BASE_URL=...
 PORTKEY_MODEL=...
 ```
 
-Optional:
-
-```bash
-PROVENANCE_TOKEN_CHAMFER_THRESHOLD=0.5
-```
-
 ## API
 
 - `GET /health`: service status.
@@ -62,10 +56,17 @@ PROVENANCE_TOKEN_CHAMFER_THRESHOLD=0.5
 - Entity nodes contain sanitized output responses.
 - Responses are not duplicated on Activity nodes.
 - Entity metadata such as names and paths stays inside the response payload.
-- Dependency candidates need explicit artifact or token evidence; adjacency
-  alone is not evidence.
-- The refinement LLM receives only the sanitized draft graph and returns graph
-  edit operations.
+- The draft graph is strictly bipartite: `Activity -> Entity` for generated
+  outputs and `Entity -> Activity` for consumed inputs.
+- The default graph contains only structural generated outputs and exact
+  artifact `usedBy` edges.
+- Output entities whose artifact refs are inherited from a consumed input stay
+  visible but are not reused as downstream artifact sources.
+- Shared-token matches use plain string scalar extraction with a `0.2`
+  threshold, but they are only passed to the LLM as optional semantic
+  candidates.
+- The refinement LLM receives the sanitized draft graph plus optional semantic
+  candidates and returns graph edit operations.
 
 ## Main Files
 
