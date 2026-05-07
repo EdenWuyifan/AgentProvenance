@@ -20,8 +20,8 @@ GRAPH_CACHE_DIR = CACHE_DIR / "generated-prov-graphs"
 
 DEFAULT_BASE_URL = "https://ai-gateway.apps.cloud.rt.nyu.edu/v1/"
 DEFAULT_MODEL = "@vertexai/gemini-3-pro-preview"
-MAX_TOKEN_EDGE_CANDIDATES = 6
-TOKEN_CHAMFER_THRESHOLD = 0.5
+MAX_SEMANTIC_EDGE_CANDIDATES = 2
+TOKEN_CHAMFER_THRESHOLD = 0.2
 MAX_LABEL_LENGTH = 96
 MAX_ARRAY_ITEMS = 12
 MAX_OBJECT_KEYS = 16
@@ -133,10 +133,10 @@ def get_cache_path(trace_id: Any, calls: list[dict[str, Any]]) -> tuple[Path, st
     cache_key = sha256(
         json.dumps(
             {
-                "schema": "prov-workflow-py-v5",
+                "schema": "prov-workflow-py-v8",
                 "calls": calls,
-                "tokenCandidates": MAX_TOKEN_EDGE_CANDIDATES,
-                "tokenChamferThreshold": token_chamfer_threshold(),
+                "semanticCandidates": MAX_SEMANTIC_EDGE_CANDIDATES,
+                "tokenChamferThreshold": TOKEN_CHAMFER_THRESHOLD,
             },
             sort_keys=True,
             default=str,
@@ -194,9 +194,24 @@ def output_keys(call: dict[str, Any]) -> list[str]:
     return unique([metadata["id"], metadata["path"], metadata["name"], basename(key)] if key else [])
 
 
+def referenced_refs(args: Any, known_refs: dict[str, set[str]]) -> set[str]:
+    args_text = json.dumps(args, default=str)
+    refs: set[str] = set()
+    for key, equivalents in known_refs.items():
+        if key and key in args_text:
+            refs.update(equivalents)
+    return refs
+
+
 def summarize(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     summaries = []
+    known_refs: dict[str, set[str]] = {}
+
     for call in calls:
+        raw_output_keys = output_keys(call)
+        consumed_refs = referenced_refs(call["args"], known_refs)
+        reusable_output_keys = [key for key in raw_output_keys if key not in consumed_refs]
+
         summaries.append(
             {
                 "call": call,
@@ -209,9 +224,15 @@ def summarize(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "args": sanitize_value(call["args"]),
                 },
                 "output": output_entity(call),
-                "outputKeys": output_keys(call),
+                "outputKeys": reusable_output_keys,
             }
         )
+
+        if reusable_output_keys:
+            equivalent_refs = set(raw_output_keys)
+            for key in raw_output_keys:
+                known_refs[key] = equivalent_refs
+
     return summaries
 
 
@@ -230,7 +251,7 @@ def args_use_output(next_summary: dict[str, Any], previous: dict[str, Any]) -> b
 def artifact_evidence(next_summary: dict[str, Any], previous: dict[str, Any]) -> list[dict[str, Any]]:
     output_keys = previous.get("outputKeys") or []
     args_text = json.dumps(next_summary["call"]["args"], default=str)
-    shared = [basename(key) for key in output_keys if key and key in args_text]
+    shared = unique([basename(key) for key in output_keys if key and key in args_text])
     return [{"kind": "artifact", "shared": shared[:8]}] if shared else []
 
 
@@ -257,7 +278,9 @@ def exact_artifact_edges(summaries: list[dict[str, Any]]) -> list[dict[str, str]
 def scalar_texts(value: Any) -> list[str]:
     if isinstance(value, bool) or value is None:
         return []
-    if isinstance(value, (str, int, float)):
+    if isinstance(value, (int, float)):
+        return []
+    if isinstance(value, str):
         return [str(value)]
     if isinstance(value, list):
         return [text for item in value for text in scalar_texts(item)]
@@ -288,13 +311,6 @@ def tokens_from(value: Any) -> set[str]:
     return tokens
 
 
-def token_chamfer_threshold() -> float:
-    try:
-        return float(os.getenv("PROVENANCE_TOKEN_CHAMFER_THRESHOLD", ""))
-    except ValueError:
-        return TOKEN_CHAMFER_THRESHOLD
-
-
 def token_weights(output_tokens: list[set[str]]) -> dict[str, float]:
     output_count = max(len(output_tokens), 1)
     output_frequency = Counter(token for tokens in output_tokens for token in tokens)
@@ -305,15 +321,24 @@ def token_weights(output_tokens: list[set[str]]) -> dict[str, float]:
     }
 
 
-def suggested_edges(summaries: list[dict[str, Any]]) -> list[dict[str, str]]:
-    edges = {edge_key(edge): edge for edge in exact_artifact_edges(summaries)}
+def semantic_candidate_edges(
+    summaries: list[dict[str, Any]],
+    graph_edges: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    hard_targets = {edge["target"] for edge in graph_edges if edge["relation"] == "usedBy"}
     input_token_sets = [tokens_from(summary["call"]["args"]) for summary in summaries]
     output_token_sets = [tokens_from(summary["call"]["response"]) for summary in summaries]
     weights = token_weights(output_token_sets)
     output_index: dict[str, list[int]] = {}
-    threshold = token_chamfer_threshold()
+    threshold = TOKEN_CHAMFER_THRESHOLD
+    candidates = []
 
     for index, next_summary in enumerate(summaries):
+        if next_summary["activity"]["id"] in hard_targets:
+            for token in output_token_sets[index]:
+                output_index.setdefault(token, []).append(index)
+            continue
+
         input_tokens = input_token_sets[index]
         total_weight = sum(weights.get(token, 1.0) for token in input_tokens)
         matched_weight: dict[int, float] = {}
@@ -345,8 +370,11 @@ def suggested_edges(summaries: list[dict[str, Any]]) -> list[dict[str, str]]:
                 ),
             )
 
-            for item in ranked[:MAX_TOKEN_EDGE_CANDIDATES]:
+            for item in ranked[:MAX_SEMANTIC_EDGE_CANDIDATES]:
+                if not item["previous"].get("output"):
+                    continue
                 edge = edge_from(item["previous"], next_summary)
+                edge["relation"] = "informedBy"
                 edge["evidence"] = [
                     {
                         "kind": "shared_token",
@@ -354,20 +382,22 @@ def suggested_edges(summaries: list[dict[str, Any]]) -> list[dict[str, str]]:
                         "shared": sorted(item["shared"])[:16],
                     }
                 ]
-                edges[edge_key(edge)] = edge
+                candidates.append(edge)
 
         for token in output_token_sets[index]:
             output_index.setdefault(token, []).append(index)
 
-    return list(edges.values())
+    return candidates
 
 
-def build_graph(summaries: list[dict[str, Any]], selected: list[dict[str, str]]) -> dict[str, Any]:
+def build_graph(summaries: list[dict[str, Any]], selected: list[dict[str, Any]]) -> dict[str, Any]:
     nodes: dict[str, dict[str, Any]] = {}
-    edges: dict[str, dict[str, str]] = {}
+    edges: dict[str, dict[str, Any]] = {}
 
-    def add_edge(edge: dict[str, str]) -> None:
-        if edge["source"].startswith("ent:") and edge["target"].startswith("ent:"):
+    def add_edge(edge: dict[str, Any]) -> None:
+        source = nodes.get(edge["source"])
+        target = nodes.get(edge["target"])
+        if source and target and source.get("kind") == target.get("kind"):
             return
         edges[edge_key(edge)] = edge
 
@@ -389,14 +419,19 @@ def build_graph(summaries: list[dict[str, Any]], selected: list[dict[str, str]])
     return {"nodes": list(nodes.values()), "edges": list(edges.values())}
 
 
-def prompt(draft_graph: dict[str, Any]) -> str:
+def prompt(
+    draft_graph: dict[str, Any],
+    semantic_candidates: list[dict[str, Any]],
+) -> str:
     return f"""Select direct provenance connections from ordered tool calls.
 
-Model each call as input -> tool activity -> output.
+Model each call as input Entity -> tool Activity -> output Entity.
 Use Activity node args, Entity node responses, and edge evidence to refine direct tool-call dependencies.
-Do not connect Entity to Entity.
-Exact ids, filenames, paths, artifact names, and shared-token evidence are strong evidence.
-Token-overlap edges are recommendations; reject them if the provenance logic is not direct.
+Keep the graph strictly bipartite: Activity -> Entity for generated outputs, Entity -> Activity for consumed inputs. Do not connect Activity -> Activity or Entity -> Entity.
+The draft graph contains only structural generatedBy edges and exact artifact usedBy edges.
+Exact id/path/url/filename matches from Activity args to Entity response metadata are strong direct usedBy evidence.
+Optional semantic candidates are not graph edges. Add one only when the target Activity clearly uses information from the source Entity and no exact artifact edge already explains that Activity.
+Shared-token evidence is weak context. Schema words, column names, common labels, and generic domain words are insufficient for direct provenance.
 Use Activity args and Entity response JSON to reason about logical reuse of genes, pathways, ranked lists, candidate sets, files, and result artifacts.
 If a call has no direct predecessor, leave it as a root.
 Prune redundant nodes when they do not add a distinct artifact, transformation, decision, or analysis step.
@@ -425,7 +460,10 @@ Return JSON:
 ]}}
 
 draftGraph:
-{json.dumps(draft_graph, indent=2)}"""
+{json.dumps(draft_graph, indent=2)}
+
+optionalSemanticCandidateEdges:
+{json.dumps(semantic_candidates, indent=2)}"""
 
 
 def response_text(payload: dict[str, Any]) -> str:
@@ -538,21 +576,30 @@ def chat_config() -> tuple[str, str, str, dict[str, str]]:
 
 async def refine_graph(
     draft_graph: dict[str, Any],
+    semantic_candidates: list[dict[str, Any]],
 ) -> dict[str, Any]:
     try:
         _, model, url, headers = chat_config()
     except RuntimeError:
         return {"edits": []}
 
-    async with httpx.AsyncClient(timeout=180) as client:
-        response = await client.post(
-            url,
-            headers=headers,
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt(draft_graph)}],
-            },
-        )
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                json={
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt(draft_graph, semantic_candidates),
+                        }
+                    ],
+                },
+            )
+    except httpx.HTTPError:
+        return {"edits": []}
 
     if response.is_error:
         return {"edits": []}
@@ -576,18 +623,18 @@ def patch_node(node: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
 def apply_graph_patch(
     graph: dict[str, Any],
     patch: dict[str, Any],
-    suggested_edges: list[dict[str, str]],
+    suggested_edges: list[dict[str, Any]],
 ) -> dict[str, Any]:
     nodes = {node["id"]: node for node in graph["nodes"]}
     edges = {edge_key(edge): edge for edge in graph["edges"]}
     suggested = {edge_key(edge): edge for edge in suggested_edges}
 
-    def add_edge(edge: dict[str, str]) -> None:
+    def add_edge(edge: dict[str, Any]) -> None:
         source = nodes.get(edge["source"])
         target = nodes.get(edge["target"])
         if not source or not target:
             return
-        if source.get("kind") == "Entity" and target.get("kind") == "Entity":
+        if source.get("kind") == target.get("kind"):
             return
         edges[edge_key(edge)] = edge
 
@@ -812,10 +859,11 @@ async def prov_graph(request: Request):
         }
 
     summaries = summarize(calls)
-    edges = suggested_edges(summaries)
-    draft_graph = build_graph(summaries, edges)
-    patch = await refine_graph(draft_graph)
-    dag = apply_graph_patch(draft_graph, patch, edges)
+    graph_edges = exact_artifact_edges(summaries)
+    semantic_edges = semantic_candidate_edges(summaries, graph_edges)
+    draft_graph = build_graph(summaries, graph_edges)
+    patch = await refine_graph(draft_graph, semantic_edges)
+    dag = apply_graph_patch(draft_graph, patch, [*graph_edges, *semantic_edges])
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(dag, indent=2))
