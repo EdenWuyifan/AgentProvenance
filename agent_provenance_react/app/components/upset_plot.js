@@ -156,6 +156,8 @@ function buildToolImpactData(tools, tracings, tracingToolCalls) {
 function buildTraceScoreData(tracings, tracingToolCalls) {
     return tracings.map((tracing) => ({
         id: tracing.id,
+        label: traceLabel(tracing),
+        tracing,
         score: tracingToolCalls.get(tracing.id)?.score ?? getTracingScore(tracing),
     }));
 }
@@ -165,6 +167,34 @@ function compareLabels(a, b) {
         numeric: true,
         sensitivity: "base",
     });
+}
+
+function shortenText(value, maxLength = 34) {
+    const text = String(value ?? "");
+    return text.length > maxLength ? `${text.slice(0, maxLength - 1)}...` : text;
+}
+
+function compactTraceId(id) {
+    const text = String(id ?? "");
+    const suffix = text.split(":").at(-1) || text;
+    return shortenText(suffix, suffix.includes("-") ? 9 : 18);
+}
+
+function traceLabel(tracing) {
+    return tracing.config
+        ? `${shortenText(tracing.config, 10)}:${compactTraceId(tracing.id)}`
+        : `#${compactTraceId(tracing.id)}`;
+}
+
+function traceMetadataRows(tracing) {
+    const label = traceLabel(tracing);
+    return [
+        `<strong>Run:</strong> ${label}`,
+        String(tracing.id) !== label ? `<strong>ID:</strong> ${tracing.id}` : null,
+        tracing.category ? `<strong>Category:</strong> ${tracing.category}` : null,
+        tracing.subcategory ? `<strong>Subcategory:</strong> ${tracing.subcategory}` : null,
+        tracing.task ? `<strong>Task:</strong> ${tracing.task}` : null,
+    ].filter(Boolean);
 }
 
 function getTracingGroupValue(tracing, groupBy) {
@@ -316,7 +346,7 @@ function createTooltip(containerSelection) {
     const tooltip = containerSelection
         .append("div")
         .attr("class", "upset-tooltip")
-        .style("position", "absolute")
+        .style("position", "fixed")
         .style("pointer-events", "none")
         .style("background", "#0f172a")
         .style("color", "#f8fafc")
@@ -324,16 +354,30 @@ function createTooltip(containerSelection) {
         .style("padding", "8px 10px")
         .style("font-size", "11px")
         .style("box-shadow", "0 8px 20px rgba(15,23,42,0.25)")
+        .style("max-width", "360px")
+        .style("max-height", "280px")
+        .style("overflow", "hidden")
+        .style("overflow-wrap", "anywhere")
         .style("opacity", 0)
-        .style("transition", "opacity 120ms ease");
+        .style("transition", "opacity 120ms ease")
+        .style("z-index", 50);
 
     const showTooltip = (event, html) => {
-        const [xPos, yPos] = d3.pointer(event, containerSelection.node());
+        const padding = 12;
+        const node = tooltip.node();
+
         tooltip
             .style("opacity", 1)
-            .html(html)
-            .style("left", `${xPos + 14}px`)
-            .style("top", `${yPos + 14}px`);
+            .html(html);
+
+        const width = node?.offsetWidth || 360;
+        const height = node?.offsetHeight || 120;
+        const xPos = Math.min(event.clientX + 14, window.innerWidth - width - padding);
+        const yPos = Math.min(event.clientY + 14, window.innerHeight - height - padding);
+
+        tooltip
+            .style("left", `${Math.max(padding, xPos)}px`)
+            .style("top", `${Math.max(padding, yPos)}px`);
     };
 
     const hideTooltip = () => {
@@ -536,6 +580,7 @@ function renderTraceGroupBreaks({
     traceScale,
     width,
     onGroupToggle,
+    onGroupSelect,
 }) {
     if (groups.length === 0) {
         return;
@@ -560,23 +605,48 @@ function renderTraceGroupBreaks({
         .attr("stroke", "#a1a1aa")
         .attr("stroke-dasharray", "2 4");
 
-    group
+    const labels = group
         .append("g")
         .attr("class", "trace-group-labels")
-        .selectAll("text")
+        .selectAll("g")
         .data(groups)
-        .join("text")
-        .attr("x", -12)
-        .attr("y", getGapCenter)
+        .join("g")
+        .attr("transform", (item) => `translate(-12,${getGapCenter(item)})`);
+
+    labels
+        .append("text")
         .attr("dy", "0.35em")
         .attr("text-anchor", "end")
         .attr("fill", "#71717a")
         .style("font-size", "10px")
-        .style("cursor", onGroupToggle ? "pointer" : null)
-        .text((item) => `${item.collapsed ? "[+]" : "[-]"} ${item.label}`)
-        .on("click", (_, item) => {
-            onGroupToggle?.(item.label);
+        .selectAll("tspan")
+        .data((item) => [
+            { item, text: item.collapsed ? "[+]" : "[-]", action: "toggle" },
+            { item, text: ` ${shortenText(item.label)}`, action: "select" },
+        ])
+        .join("tspan")
+        .style("cursor", (part) =>
+            part.action === "toggle" && onGroupToggle
+                ? "pointer"
+                : part.action === "select" && (onGroupSelect || onGroupToggle)
+                  ? "pointer"
+                  : null
+        )
+        .text((part) => part.text)
+        .on("click", (event, part) => {
+            event.stopPropagation();
+            if (part.action === "toggle") {
+                onGroupToggle?.(part.item.label);
+                return;
+            }
+            if (onGroupSelect) {
+                onGroupSelect(part.item.label);
+                return;
+            }
+            onGroupToggle?.(part.item.label);
         });
+
+    labels.append("title").text((item) => item.label);
 }
 
 function renderCoverageGrid({
@@ -723,7 +793,7 @@ function renderCoverageGrid({
                     const tooltipHtml = [
                         `<strong>Tool:</strong> ${tool}`,
                         `<strong>Group:</strong> ${toolGroup}`,
-                        `<strong>Run:</strong> #${tracing.id}`,
+                        ...traceMetadataRows(tracing),
                         score !== undefined
                             ? `<strong>Score:</strong> ${score}`
                             : null,
@@ -949,7 +1019,10 @@ function renderScoreRail({
     };
 
     const scoreTooltipContent = (d) =>
-        [`<strong>Run:</strong> #${d.id}`, `<strong>Score:</strong> ${formatScore(d.score)}`].join("<br/>");
+        [
+            ...traceMetadataRows(d.tracing),
+            `<strong>Score:</strong> ${formatScore(d.score)}`,
+        ].join("<br/>");
 
     scoreBars
         .on("mouseenter", (event, d) => {
@@ -1155,6 +1228,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
             traceScale,
             width: matrixWidth + scoreWidth,
             onGroupToggle: options.onGroupToggle,
+            onGroupSelect: options.onGroupSelect,
         });
 
         const maxScore = d3.max(lowerBarChartData, (d) => d.score) || 1;
@@ -1184,7 +1258,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
             onTracingSelect: options.onTracingSelect,
         });
 
-        lowerGroup.append("g")
+        const lowerLabels = lowerGroup.append("g")
             .selectAll("text.set-label")
             .data(lowerBarChartData)
             .join("text")
@@ -1202,7 +1276,9 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
             .on("click", (_, d) => {
                 options.onTracingSelect?.(d.id);
             })
-            .text((d) => d.id);
+            .text((d) => d.label);
+
+        lowerLabels.append("title").text((d) => String(d.id));
 
         const scoreControls = renderScoreRail({
             group: lowerGroup,
@@ -1291,6 +1367,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         traceScale,
         width: matrixWidth + scoreWidth,
         onGroupToggle: options.onGroupToggle,
+        onGroupSelect: options.onGroupSelect,
     });
 
     const maxScore = d3.max(lowerBarChartData, (d) => d.score) || 1;
@@ -1320,7 +1397,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         onTracingSelect: options.onTracingSelect,
     });
 
-    g.append("g")
+    const labels = g.append("g")
         .selectAll("text.set-label")
         .data(lowerBarChartData)
         .join("text")
@@ -1338,7 +1415,9 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         .on("click", (_, d) => {
             options.onTracingSelect?.(d.id);
         })
-        .text((d) => d.id);
+        .text((d) => d.label);
+
+    labels.append("title").text((d) => String(d.id));
 
     const scoreControls = renderScoreRail({
         group: g,

@@ -41,6 +41,7 @@ type GraphNodeData = {
   kind?: 'Activity' | 'Entity' | 'Root' | 'JoinedActivity';
   nodeType?: string;
   provProperties?: Array<{ name: string; value: string | string[] }>;
+  traceMembership?: Array<{ id: string; color: string; active: boolean }>;
   details?: ComparisonNodeDetail[];
   tooltipOpen?: boolean;
   onCloseDetails?: () => void;
@@ -48,7 +49,6 @@ type GraphNodeData = {
 
 type GraphEdgeData = {
   repeats?: number;
-  label?: string;
   curveOffset?: number;
   curveDirection?: 1 | -1;
   color?: string;
@@ -61,12 +61,18 @@ type GraphNode = Node<GraphNodeData, 'tool'>;
 type GraphEdge = Edge<GraphEdgeData, 'repeat' | 'sequential'>;
 type GraphNodeProps = NodeProps<GraphNode>;
 type GraphEdgeProps = EdgeProps<GraphEdge>;
+type JoinedFilterMode = 'fade' | 'prune';
+type JoinedFilters = {
+  mode: JoinedFilterMode;
+  minSupport: number;
+  minMaxScore: number;
+};
 
 const COLLAPSED_LAYOUT = { x: 0, y: 0, gapY: 50 };
 const TREE_LAYOUT = { x: 0, y: 0, gapX: 176, gapY: 112 };
 const COMPARE_LAYOUT = { x: 0, y: 0, gapX: 176, gapY: 112 };
 const AGENT_DAG_LAYOUT = { x: 0, y: 0, gapX: 248, gapY: 128 };
-const JOINED_LAYOUT = { x: 0, y: 0, gapX: 170, gapY: 74 };
+const JOINED_LAYOUT = { x: 0, y: 0, gapX: 230, gapY: 112 };
 const EDGE_LAYOUT = {
   curveGap: 28,
   markerEnd: { type: MarkerType.Arrow, width: 24, height: 24 },
@@ -86,23 +92,12 @@ const TRACE_C_COLORS = {
   fill: '#dcfce7',
   border: '#86efac',
 };
-const COMPARISON_TRACE_COLORS = [TRACE_A_COLORS, TRACE_B_COLORS, TRACE_C_COLORS] as const;
+type TraceColor = typeof TRACE_A_COLORS;
+const COMPARISON_TRACE_COLORS: TraceColor[] = [TRACE_A_COLORS, TRACE_B_COLORS, TRACE_C_COLORS];
 const GLYPH_SYSTEM = createGlyphSystem();
 
 const nodeTypes = { tool: ToolNode };
 const edgeTypes = { repeat: RepeatEdge, sequential: SequentialEdge };
-
-function getPathMidpoint(path: string, fallbackX: number, fallbackY: number) {
-  if (typeof document === 'undefined') {
-    return { x: fallbackX, y: fallbackY };
-  }
-
-  const pathNode = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  pathNode.setAttribute('d', path);
-  const midpoint = pathNode.getPointAtLength(pathNode.getTotalLength() / 2);
-
-  return { x: midpoint.x, y: midpoint.y };
-}
 
 function EdgeBadge({
   x,
@@ -137,6 +132,8 @@ function ToolNode({
   const color = GLYPH_SYSTEM.getGroupColor(data.group);
   const title = data.nodeType ? `${data.label} (${data.nodeType})` : data.label;
   const hasTooltip = Boolean(data.details?.length || data.provProperties?.length);
+  const traceMembership = data.traceMembership ?? [];
+  const hasTraceRing = traceMembership.length > 0;
   const variant =
     data.kind === 'Entity'
       ? 'entity'
@@ -164,17 +161,37 @@ function ToolNode({
         </NodeToolbar>
       ) : null}
       <Handle type="target" position={targetPosition} />
-      <div className={`provenance-node provenance-node--${variant}`} title={title}>
-        {data.kind !== 'Entity' ? (
-          <span
-            className="provenance-node__glyph"
-            style={{ color }}
-            aria-hidden="true"
-          >
-            <ToolGlyph glyph={data.glyph} />
-          </span>
-        ) : null}
-        <span className="provenance-node__label">{data.label}</span>
+      <div
+        className={`provenance-node provenance-node--${variant}`}
+        title={title}
+        style={
+          hasTraceRing
+            ? {
+                alignItems: 'center',
+                background: '#ffffff',
+                borderRadius: 9999,
+                height: '100%',
+                justifyContent: 'center',
+                maxWidth: 'none',
+                padding: 8,
+                textAlign: 'center',
+                width: '100%',
+              }
+            : undefined
+        }
+      >
+        <span className="inline-flex min-w-0 max-w-full items-center gap-1.5">
+          {data.kind !== 'Entity' ? (
+            <span
+              className="provenance-node__glyph"
+              style={{ color }}
+              aria-hidden="true"
+            >
+              <ToolGlyph glyph={data.glyph} />
+            </span>
+          ) : null}
+          <span className="provenance-node__label">{data.label}</span>
+        </span>
       </div>
       <Handle type="source" position={sourcePosition} />
     </>
@@ -236,6 +253,48 @@ function ToolGlyph({ glyph }: { glyph: string }) {
       return (
         <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
           <rect x="7" y="7" width="10" height="10" transform="rotate(45 12 12)" />
+        </svg>
+      );
+
+    case 'square':
+      return (
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+          <rect x="7" y="7" width="10" height="10" />
+        </svg>
+      );
+
+    case 'triangle':
+      return (
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+          <path d="M12 5l8 14H4z" />
+        </svg>
+      );
+
+    case 'star':
+      return (
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+          <path d="M12 3l2.4 5.7 6.1.5-4.6 4 1.4 6-5.3-3.1-5.3 3.1 1.4-6-4.6-4 6.1-.5z" />
+        </svg>
+      );
+
+    case 'wye':
+      return (
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+          <path d="M10 4h4v6l5.2-3 2 3.5-5.2 3 5.2 3-2 3.5-7.2-4.2-7.2 4.2-2-3.5 5.2-3-5.2-3 2-3.5 5.2 3z" />
+        </svg>
+      );
+
+    case 'plus':
+      return (
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+          <path d="M10 4h4v6h6v4h-6v6h-4v-6H4v-4h6z" />
+        </svg>
+      );
+
+    case 'times':
+      return (
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+          <path d="M6.8 4L12 9.2 17.2 4 20 6.8 14.8 12 20 17.2 17.2 20 12 14.8 6.8 20 4 17.2 9.2 12 4 6.8z" />
         </svg>
       );
 
@@ -306,7 +365,6 @@ function SequentialEdge(props: GraphEdgeProps) {
     markerEnd,
     data,
   } = props;
-  const label = data?.label;
   const edgeStyle = data?.color
     ? {
         stroke: data.color,
@@ -321,63 +379,46 @@ function SequentialEdge(props: GraphEdgeProps) {
     const radiusX = 50 + (loopOffset - 1) * 12;
     const radiusY = 50 + (loopOffset - 1) * 12;
     const path = `M ${sourceX} ${sourceY} A ${radiusX} ${radiusY} 0 1 0 ${targetX + 2} ${targetY}`;
-    const labelX = Math.min(sourceX, targetX) + radiusX * 2;
-    const labelY = Math.max(sourceY, targetY) - radiusY * 0.35;
 
     return (
-      <>
-        <BaseEdge
-          id={id}
-          path={path}
-          markerEnd={markerEnd}
-          style={edgeStyle}
-        />
-        {label && <EdgeBadge x={labelX} y={labelY} label={label} />}
-      </>
-    );
-  }
-
-  const horizontalFlow =
-    sourcePosition === Position.Right && targetPosition === Position.Left;
-  let path = '';
-  let labelX = (sourceX + targetX) / 2;
-  let labelY = (sourceY + targetY) / 2;
-
-  {
-    const curveOffset = data?.curveOffset ?? 0;
-    const bend = (data?.curveDirection ?? 1) * curveOffset * EDGE_LAYOUT.curveGap;
-    if (horizontalFlow) {
-      const controlX1 = sourceX + 40 + curveOffset * 10;
-      const controlY1 = sourceY + bend;
-      const controlX2 = targetX - 40 - curveOffset * 10;
-      const controlY2 = targetY + bend;
-
-      path = `M ${sourceX} ${sourceY} C ${controlX1} ${controlY1} ${controlX2} ${controlY2} ${targetX} ${targetY}`;
-    } else {
-      const controlX1 = sourceX + bend;
-      const controlY1 = sourceY + 40 + curveOffset * 10;
-      const controlX2 = targetX + bend;
-      const controlY2 = targetY - 40 - curveOffset * 10;
-
-      path = `M ${sourceX} ${sourceY} C ${controlX1} ${controlY1} ${controlX2} ${controlY2} ${targetX} ${targetY}`;
-    }
-    ({ x: labelX, y: labelY } = getPathMidpoint(
-      path,
-      (sourceX + targetX) / 2,
-      (sourceY + targetY) / 2
-    ));
-  }
-
-  return (
-    <>
       <BaseEdge
         id={id}
         path={path}
         markerEnd={markerEnd}
         style={edgeStyle}
       />
-      {label && <EdgeBadge x={labelX} y={labelY} label={label} />}
-    </>
+    );
+  }
+
+  const horizontalFlow =
+    sourcePosition === Position.Right && targetPosition === Position.Left;
+  let path = '';
+
+  const curveOffset = data?.curveOffset ?? 0;
+  const bend = (data?.curveDirection ?? 1) * curveOffset * EDGE_LAYOUT.curveGap;
+  if (horizontalFlow) {
+    const controlX1 = sourceX + 40 + curveOffset * 10;
+    const controlY1 = sourceY + bend;
+    const controlX2 = targetX - 40 - curveOffset * 10;
+    const controlY2 = targetY + bend;
+
+    path = `M ${sourceX} ${sourceY} C ${controlX1} ${controlY1} ${controlX2} ${controlY2} ${targetX} ${targetY}`;
+  } else {
+    const controlX1 = sourceX + bend;
+    const controlY1 = sourceY + 40 + curveOffset * 10;
+    const controlX2 = targetX + bend;
+    const controlY2 = targetY - 40 - curveOffset * 10;
+
+    path = `M ${sourceX} ${sourceY} C ${controlX1} ${controlY1} ${controlX2} ${controlY2} ${targetX} ${targetY}`;
+  }
+
+  return (
+    <BaseEdge
+      id={id}
+      path={path}
+      markerEnd={markerEnd}
+      style={edgeStyle}
+    />
   );
 }
 
@@ -397,7 +438,10 @@ function buildNodeData(
   name: string,
   details?: ComparisonNodeDetail[],
   options: Partial<
-    Pick<GraphNodeData, 'glyph' | 'group' | 'kind' | 'nodeType' | 'provProperties'>
+    Pick<
+      GraphNodeData,
+      'glyph' | 'group' | 'kind' | 'nodeType' | 'provProperties' | 'traceMembership'
+    >
   > = {}
 ): GraphNodeData {
   return {
@@ -407,6 +451,7 @@ function buildNodeData(
     kind: options.kind,
     nodeType: options.nodeType,
     provProperties: options.provProperties,
+    traceMembership: options.traceMembership,
     details,
   };
 }
@@ -643,7 +688,6 @@ function renderTreeGraph(tracing: Tracing) {
       sourceHandle: null,
       targetHandle: null,
       data: {
-        label: String(index + 1),
         curveOffset:
           sourceName === targetName || !isTreeEdge || transitionCount > 0
             ? transitionCount + 1
@@ -797,7 +841,7 @@ function renderComparisonGraph(traces: Tracing[]) {
             traceToolCalls[traceIndex][match.indexes[traceIndex]],
             match.indexes[traceIndex] + 1,
             traceLabels[traceIndex],
-            COMPARISON_TRACE_COLORS[traceIndex].edge
+            traceColor(traceIndex).edge
           )
         )
       ),
@@ -823,7 +867,7 @@ function renderComparisonGraph(traces: Tracing[]) {
     trace: Tracing,
     laneY: number,
     traceLabel: string,
-    colors: typeof TRACE_A_COLORS
+    colors: TraceColor
   ) => {
     let previousMatch = -1;
 
@@ -934,13 +978,13 @@ function renderComparisonGraph(traces: Tracing[]) {
       trace,
       laneYs[index],
       traceLabels[index],
-      COMPARISON_TRACE_COLORS[index]
+      traceColor(index)
     );
   });
 
   if (nodes.length === 0) {
     traces.forEach((trace, traceIndex) => {
-      const colors = COMPARISON_TRACE_COLORS[traceIndex];
+      const colors = traceColor(traceIndex);
 
       comparison.sequences[traceIndex].forEach((name, index) => {
         nodes.push({
@@ -1181,7 +1225,6 @@ function renderAgentDagGraph(dag: AgentDag) {
       sourceHandle: null,
       targetHandle: null,
       data: {
-        label: edge.relation,
         color:
           edge.relation === 'usedBy'
             ? '#0284c7'
@@ -1237,46 +1280,127 @@ function buildJoinedProperties(
   return properties;
 }
 
+function traceColor(index: number): TraceColor {
+  const base = COMPARISON_TRACE_COLORS[index];
+  if (base) {
+    return base;
+  }
+
+  const hue = (index * 137.508) % 360;
+  return {
+    edge: `hsl(${hue} 70% 42%)`,
+    fill: `hsl(${hue} 86% 94%)`,
+    border: `hsl(${hue} 66% 72%)`,
+  };
+}
+
+function supportRatio(count: number, maxCount: number) {
+  return maxCount <= 1 ? 0 : (count - 1) / (maxCount - 1);
+}
+
+function joinedNodeSize(count: number, maxCount: number) {
+  const ratio = supportRatio(count, maxCount);
+  return Math.round(72 + ratio * 48);
+}
+
+function joinedEdgeWidth(count: number, maxCount: number) {
+  return 2 + supportRatio(count, maxCount) * 9;
+}
+
 function joinedTraceColors(supportTraces: string[], traceIds: string[]) {
   return traceIds
     .map((traceId, index) =>
       supportTraces.includes(traceId)
-        ? COMPARISON_TRACE_COLORS[index]
+        ? traceColor(index)
         : null
     )
-    .filter((colors): colors is typeof COMPARISON_TRACE_COLORS[number] => colors !== null);
+    .filter((colors): colors is TraceColor => colors !== null);
 }
 
-function joinedNodeBackground(colors: Array<typeof COMPARISON_TRACE_COLORS[number]>) {
-  if (colors.length === 0) {
-    return undefined;
-  }
-
-  if (colors.length === 1) {
-    return colors[0].fill;
-  }
-
-  const step = 100 / colors.length;
-  return `linear-gradient(90deg, ${colors
-    .map((colors, index) => {
-      const start = Math.round(index * step);
-      const end = Math.round((index + 1) * step);
-      return `${colors.fill} ${start}% ${end}%`;
-    })
-    .join(', ')})`;
+function joinedTraceMembership(supportTraces: string[], traceIds: string[]) {
+  return traceIds.map((traceId, index) => ({
+    id: traceId,
+    color: traceColor(index).edge,
+    active: supportTraces.includes(traceId),
+  }));
 }
 
-function renderJoinedProvenanceGraph(graph: JoinedProvenanceGraph, traceIds: string[]) {
-  const nodeIds = new Set(graph.nodes.map((node) => node.id));
-  const graphEdges = graph.edges.filter(
-    (edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target)
+function joinedTraceRing(supportTraces: string[], traceIds: string[]) {
+  if (traceIds.length === 0) {
+    return '#e4e4e7';
+  }
+
+  const supportSet = new Set(supportTraces);
+  const step = 360 / traceIds.length;
+  const segments = traceIds.map((traceId, index) => {
+    const color = supportSet.has(traceId) ? traceColor(index).edge : '#e4e4e7';
+    const start = index * step;
+    const end = (index + 1) * step;
+    return `${color} ${start}deg ${end}deg`;
+  });
+
+  return `conic-gradient(${segments.join(', ')})`;
+}
+
+function joinedPrimaryTool(node: JoinedProvenanceGraph['nodes'][number]) {
+  const member = node.members.find(
+    (item): item is { tool?: unknown } =>
+      item !== null && typeof item === 'object' && 'tool' in item
   );
-  const nodeLevels = new Map(graph.nodes.map((node) => [node.id, 0]));
+  const tool = typeof member?.tool === 'string' ? member.tool : node.label.split('/')[0];
+  return tool.trim() || node.label;
+}
+
+function joinedPatternScore(item: {
+  scoreSummary?: { maxScore?: number | null };
+}) {
+  const score = item.scoreSummary?.maxScore;
+  return typeof score === 'number' ? score : null;
+}
+
+function hasLowJoinedPattern(
+  item: { supportCount: number; scoreSummary?: { maxScore?: number | null } },
+  filters: JoinedFilters
+) {
+  const score = joinedPatternScore(item);
+  return (
+    item.supportCount < filters.minSupport ||
+    (filters.minMaxScore > 0
+      && (score === null || score < filters.minMaxScore))
+  );
+}
+
+function renderJoinedProvenanceGraph(
+  graph: JoinedProvenanceGraph,
+  traceIds: string[],
+  filters: JoinedFilters
+) {
+  const lowNodeIds = new Set(
+    graph.nodes
+      .filter((node) => hasLowJoinedPattern(node, filters))
+      .map((node) => node.id)
+  );
+  const graphNodes =
+    filters.mode === 'prune'
+      ? graph.nodes.filter((node) => !lowNodeIds.has(node.id))
+      : graph.nodes;
+  const nodeIds = new Set(graphNodes.map((node) => node.id));
+  const graphEdges = graph.edges.filter(
+    (edge) =>
+      nodeIds.has(edge.source) && nodeIds.has(edge.target)
+      && (filters.mode === 'fade'
+        || (!lowNodeIds.has(edge.source)
+          && !lowNodeIds.has(edge.target)
+          && !hasLowJoinedPattern(edge, filters)))
+  );
+  const nodeLevels = new Map(graphNodes.map((node) => [node.id, 0]));
   const rowsByLevel = new Map<number, number>();
   const incomingByNode = new Map<string, string[]>();
   const outgoingByNode = new Map<string, string[]>();
+  const maxNodeSupport = Math.max(...graphNodes.map((node) => node.supportCount), 1);
+  const maxEdgeSupport = Math.max(...graphEdges.map((edge) => edge.supportCount), 1);
 
-  for (let pass = 0; pass < graph.nodes.length; pass += 1) {
+  for (let pass = 0; pass < graphNodes.length; pass += 1) {
     let changed = false;
 
     graphEdges.forEach((edge) => {
@@ -1304,12 +1428,14 @@ function renderJoinedProvenanceGraph(graph: JoinedProvenanceGraph, traceIds: str
     ]);
   });
 
-  const nodes: GraphNode[] = graph.nodes.map((node) => {
+  const nodes: GraphNode[] = graphNodes.map((node) => {
     const level = nodeLevels.get(node.id) ?? 0;
     const row = rowsByLevel.get(level) ?? 0;
     const anomaly = Boolean(node.scoreSummary?.isAnomaly);
-    const highScore = Boolean(node.scoreSummary?.highScoreTraces.length);
-    const colors = joinedTraceColors(node.supportTraces, traceIds);
+    const maxScore = joinedPatternScore(node);
+    const size = joinedNodeSize(node.supportCount, maxNodeSupport);
+    const primaryTool = node.kind === 'JoinedActivity' ? joinedPrimaryTool(node) : node.label;
+    const lowPattern = lowNodeIds.has(node.id);
     rowsByLevel.set(level, row + 1);
 
     return {
@@ -1324,8 +1450,8 @@ function renderJoinedProvenanceGraph(graph: JoinedProvenanceGraph, traceIds: str
       sourcePosition: Position.Right,
       targetPosition: Position.Left,
       data: buildNodeData(node.label, undefined, {
-        glyph: node.kind === 'Root' ? 'diamond' : 'circle',
-        group: node.kind,
+        glyph: node.kind === 'Root' ? 'diamond' : GLYPH_SYSTEM.getGlyph(primaryTool),
+        group: node.kind === 'Root' ? node.kind : GLYPH_SYSTEM.getGroup(primaryTool),
         kind: node.kind,
         nodeType:
           node.kind === 'Root'
@@ -1333,7 +1459,7 @@ function renderJoinedProvenanceGraph(graph: JoinedProvenanceGraph, traceIds: str
             : [
                 `${node.supportCount} traces`,
                 `${Math.round(node.confidence * 100)}%`,
-                highScore ? 'high score' : '',
+                maxScore === null ? '' : `max ${maxScore.toFixed(2)}`,
                 anomaly ? 'anomaly' : '',
               ].filter(Boolean).join(', '),
         provProperties: buildJoinedProperties(
@@ -1341,18 +1467,19 @@ function renderJoinedProvenanceGraph(graph: JoinedProvenanceGraph, traceIds: str
           incomingByNode.get(node.id) ?? [],
           outgoingByNode.get(node.id) ?? []
         ),
+        traceMembership: joinedTraceMembership(node.supportTraces, traceIds),
       }),
       style: {
-        borderColor:
-          colors.length === 1
-            ? colors[0].border
-            : colors.length > 1
-              ? '#71717a'
-              : undefined,
-        borderWidth: anomaly || highScore ? 2 : undefined,
-        borderStyle: anomaly ? 'dashed' : undefined,
-        background: joinedNodeBackground(colors),
-        boxShadow: highScore ? '0 0 0 3px rgba(34, 197, 94, 0.18)' : undefined,
+        width: size,
+        height: size,
+        minWidth: size,
+        minHeight: size,
+        border: 'none',
+        borderRadius: 9999,
+        background: joinedTraceRing(node.supportTraces, traceIds),
+        boxShadow: '0 3px 8px rgba(15, 23, 42, 0.12)',
+        opacity: lowPattern ? 0.2 : 1,
+        padding: 4,
       },
     };
   });
@@ -1361,6 +1488,10 @@ function renderJoinedProvenanceGraph(graph: JoinedProvenanceGraph, traceIds: str
     const edgeKey = `${edge.source}:${edge.target}`;
     const count = edgeCounts.get(edgeKey) ?? 0;
     const colors = joinedTraceColors(edge.supportTraces, traceIds);
+    const lowPattern =
+      lowNodeIds.has(edge.source)
+      || lowNodeIds.has(edge.target)
+      || hasLowJoinedPattern(edge, filters);
     edgeCounts.set(edgeKey, count + 1);
 
     return {
@@ -1377,14 +1508,20 @@ function renderJoinedProvenanceGraph(graph: JoinedProvenanceGraph, traceIds: str
             : colors.length > 1
               ? '#475569'
               : '#94a3b8',
-        strokeWidth: Math.min(2 + edge.supportCount * 2.5, 12),
-        opacity: edge.supportCount > 1 ? 0.78 : 0.42,
+        strokeWidth: joinedEdgeWidth(edge.supportCount, maxEdgeSupport),
+        opacity: lowPattern
+          ? 0.2
+          : 0.3 + supportRatio(edge.supportCount, maxEdgeSupport) * 0.38,
         strokeDasharray: edge.scoreSummary?.isAnomaly ? '6 5' : undefined,
         curveOffset: count > 0 ? count + 1 : undefined,
         curveDirection: count % 2 === 0 ? 1 : -1,
       },
     };
   });
+
+  if (nodes.length === 0) {
+    return { nodes, edges };
+  }
 
   const minX = Math.min(...nodes.map((node) => node.position.x));
   const minY = Math.min(...nodes.map((node) => node.position.y));
@@ -1590,14 +1727,84 @@ function JoinedProvenanceGraphView({
   graph: JoinedProvenanceGraph;
   traceIds: Array<string | number>;
 }) {
+  const [filterMode, setFilterMode] = useState<JoinedFilterMode>('fade');
+  const [minSupport, setMinSupport] = useState(1);
+  const [minMaxScore, setMinMaxScore] = useState(0);
+  const maxSupport = Math.max(
+    ...graph.nodes.map((node) => node.supportCount),
+    ...graph.edges.map((edge) => edge.supportCount),
+    1
+  );
+  const maxScore = Math.max(
+    ...graph.nodes.map((node) => joinedPatternScore(node) ?? 0),
+    ...graph.edges.map((edge) => joinedPatternScore(edge) ?? 0),
+    graph.scoreSummary?.max ?? 0,
+    1
+  );
+  const supportThreshold = Math.min(minSupport, maxSupport);
+  const scoreThreshold = Math.min(minMaxScore, maxScore);
+  const filters: JoinedFilters = {
+    mode: filterMode,
+    minSupport: supportThreshold,
+    minMaxScore: scoreThreshold,
+  };
+
   return (
-    <FlowGraph
-      graph={renderJoinedProvenanceGraph(graph, traceIds.map(String))}
-      graphKey={`joined:${traceIds.map(String).join(':')}:${graph.nodes.map((node) => node.id).join(':')}:${graph.edges.length}`}
-      emptyMessage="No joined provenance graph."
-      heightClass="h-[30rem]"
-      fitPadding={0.08}
-    />
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-600">
+        <div className="inline-flex overflow-hidden border border-zinc-300 bg-white">
+          {(['fade', 'prune'] as JoinedFilterMode[]).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              className={`px-2 py-1 font-medium capitalize transition ${
+                filterMode === mode
+                  ? 'bg-zinc-900 text-white'
+                  : 'text-zinc-600 hover:bg-zinc-100'
+              }`}
+              onClick={() => setFilterMode(mode)}
+            >
+              {mode}
+            </button>
+          ))}
+        </div>
+        <label className="inline-flex items-center gap-1">
+          Support {'>='} {supportThreshold}
+          <input
+            type="range"
+            min={1}
+            max={maxSupport}
+            step={1}
+            value={supportThreshold}
+            className="w-36 accent-zinc-900"
+            onChange={(event) =>
+              setMinSupport(Math.max(1, Math.floor(Number(event.target.value) || 1)))
+            }
+          />
+        </label>
+        <label className="inline-flex items-center gap-1">
+          Max score {'>='} {scoreThreshold.toFixed(2)}
+          <input
+            type="range"
+            min={0}
+            max={maxScore}
+            step={0.05}
+            value={scoreThreshold}
+            className="w-40 accent-zinc-900"
+            onChange={(event) =>
+              setMinMaxScore(Math.min(maxScore, Math.max(0, Number(event.target.value) || 0)))
+            }
+          />
+        </label>
+      </div>
+      <FlowGraph
+        graph={renderJoinedProvenanceGraph(graph, traceIds.map(String), filters)}
+        graphKey={`joined:${traceIds.map(String).join(':')}:${filterMode}:${supportThreshold}:${scoreThreshold}:${graph.nodes.map((node) => node.id).join(':')}:${graph.edges.length}`}
+        emptyMessage="No joined provenance graph."
+        heightClass="h-[30rem]"
+        fitPadding={0.08}
+      />
+    </div>
   );
 }
 

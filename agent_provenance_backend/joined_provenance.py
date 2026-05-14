@@ -12,6 +12,8 @@ IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg|tiff?|bmp)$", re.IGNORECAS
 CODE_RE = re.compile(r"\b(def|class|function|const|let|var|import|SELECT|FROM)\b|[{};]\s*$")
 TYPE_KEYS = ("null", "boolean", "number", "string", "array", "object")
 TOOL_CALL_KEYS = ("toolCalls", "tool_calls", "calls", "steps")
+ERROR_KEYS = {"error", "errors", "exception", "traceback", "stack"}
+THRESHOLD_KEYS = {"threshold", "cutoff", "limit", "min", "max", "top_k", "topk"}
 
 
 def build_joined_provenance_graph(
@@ -236,27 +238,47 @@ def trace_roots(
     order: list[str],
 ) -> list[dict[str, Any]]:
     roots = []
-    seen: set[str] = set()
-
-    for node_id in order:
-        if not incoming.get(node_id):
-            roots.append(root_record(trace_id, len(roots), node_id, nodes[node_id]))
-            seen.add(node_id)
 
     for node_id in order:
         node = nodes[node_id]
-        if node_id in seen or node.get("kind") != "Entity" or not outgoing.get(node_id):
-            continue
-        has_activity_generator = any(
-            nodes.get(edge["source"], {}).get("kind") == "Activity"
-            and edge.get("relation") == "generatedBy"
-            for edge in incoming.get(node_id, [])
-        )
-        if not has_activity_generator:
-            roots.append(root_record(trace_id, len(roots), node_id, node))
-            seen.add(node_id)
+        if node.get("kind") == "Activity" and not has_activity_parent(
+            node_id,
+            nodes,
+            incoming,
+        ):
+            roots.append(root_record(trace_id, len(roots), node_id, nodes[node_id]))
 
     return roots
+
+
+def has_activity_parent(
+    node_id: str,
+    nodes: dict[str, dict[str, Any]],
+    incoming: dict[str, list[dict[str, Any]]],
+) -> bool:
+    for edge in incoming.get(node_id, []):
+        source = nodes.get(edge["source"], {})
+        if source.get("kind") == "Activity":
+            return True
+        if source.get("kind") == "Entity" and entity_has_activity_generator(
+            edge["source"],
+            nodes,
+            incoming,
+        ):
+            return True
+    return False
+
+
+def entity_has_activity_generator(
+    node_id: str,
+    nodes: dict[str, dict[str, Any]],
+    incoming: dict[str, list[dict[str, Any]]],
+) -> bool:
+    return any(
+        nodes.get(edge["source"], {}).get("kind") == "Activity"
+        and edge.get("relation") == "generatedBy"
+        for edge in incoming.get(node_id, [])
+    )
 
 
 def root_record(
@@ -265,12 +287,16 @@ def root_record(
     node_id: str,
     node: dict[str, Any],
 ) -> dict[str, Any]:
+    artifact_kind = infer_artifact_kind(root_value(node))
+    if artifact_kind == "unknown":
+        artifact_kind = infer_node_artifact_kind(node)
     return {
         "rootId": f"root_{index}",
         "traceId": trace_id,
         "nodeId": node_id,
         "kind": node.get("kind") or "unknown",
-        "artifactKind": infer_node_artifact_kind(node),
+        "artifactKind": artifact_kind,
+        "rootSignature": root_signature(node, artifact_kind),
     }
 
 
@@ -421,6 +447,7 @@ def input_signature(
     nodes: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     entity_kinds = [infer_node_artifact_kind(nodes[entity_id]) for entity_id in input_entities]
+    entity_values = [entity_response_value(nodes[entity_id]) for entity_id in input_entities]
     arg_kind = infer_artifact_kind(args)
     kinds = sorted({kind for kind in [*entity_kinds, arg_kind] if kind != "unknown"})
 
@@ -428,6 +455,8 @@ def input_signature(
         "artifactKinds": kinds or ["unknown"],
         "paramKeys": top_level_keys(args),
         "valueTypeHistogram": value_type_histogram(args),
+        "featureFlags": combined_feature_flags(args, entity_values),
+        "structureHash": side_structure_hash(args, entity_values),
     }
 
 
@@ -442,9 +471,11 @@ def output_signature(
     kinds = sorted({kind for kind in [*entity_kinds, output_kind] if kind != "unknown"})
     keys = set(top_level_keys(output))
     histogram = Counter(value_type_histogram(output))
+    response_values = []
 
     for entity in entity_values:
-        value = entity.get("response", entity.get("keys", entity.get("label")))
+        value = entity_response_value(entity)
+        response_values.append(value)
         keys.update(top_level_keys(value))
         histogram.update(value_type_histogram(value))
 
@@ -452,6 +483,8 @@ def output_signature(
         "artifactKinds": kinds or ["unknown"],
         "paramKeys": sorted(keys),
         "valueTypeHistogram": dict(sorted(histogram.items())),
+        "featureFlags": combined_feature_flags(output, response_values),
+        "structureHash": side_structure_hash(output, response_values),
     }
 
 
@@ -471,7 +504,9 @@ def graph_context_signature(
         "depthBucket": depth_bucket(depth.get(node_id, 0)),
         "fanIn": fan_in,
         "fanOut": fan_out,
-        "isRootAdjacent": fan_in == 0 or any(edge["source"] in root_node_ids for edge in in_edges),
+        "isRootAdjacent": node_id in root_node_ids
+        or fan_in == 0
+        or any(edge["source"] in root_node_ids for edge in in_edges),
         "isLeafAdjacent": fan_out == 0 or any(not outgoing.get(edge["target"]) for edge in out_edges),
         "isMergePoint": fan_in > 1,
         "isBranchPoint": fan_out > 1,
@@ -593,6 +628,156 @@ def top_level_keys(value: Any) -> list[str]:
         }
         return sorted(keys)[:24]
     return []
+
+
+def entity_response_value(node: dict[str, Any]) -> Any:
+    for key in ("response", "keys", "output", "value", "data", "label"):
+        if key in node and node[key] is not None:
+            return node[key]
+    return None
+
+
+def root_value(node: dict[str, Any]) -> Any:
+    if node.get("kind") == "Activity":
+        for key in ("response", "output", "args", "label", "tool"):
+            if key in node and node[key] is not None:
+                return node[key]
+    return entity_response_value(node)
+
+
+def combined_feature_flags(value: Any, entity_values: list[Any]) -> list[str]:
+    return sorted(
+        {flag for item in [value, *entity_values] for flag in feature_flags(item)}
+    )
+
+
+def side_structure_hash(value: Any, entity_values: list[Any]) -> str:
+    return structure_hash(
+        value if not entity_values else {"value": value, "entities": entity_values}
+    )
+
+
+def feature_flags(value: Any) -> list[str]:
+    flags: set[str] = set()
+
+    def add_key_flags(key: Any) -> str:
+        key_text = str(key)
+        key_name = normalized_key(key_text)
+        if key_name == "id" or key_name.endswith("_id") or key_text.endswith("Id"):
+            flags.add("hasId")
+        if "url" in key_name or "uri" in key_name or key_name == "href":
+            flags.add("hasUrl")
+        if key_name in {"path", "file", "filename", "filepath"} or key_name.endswith(
+            "_path"
+        ):
+            flags.add("hasPath")
+        if "row" in key_name:
+            flags.add("hasRows")
+        if "column" in key_name or key_name == "cols":
+            flags.add("hasColumns")
+        if "storage" in key_name or key_name == "bucket":
+            flags.add("hasStorageEntry")
+        if key_name in ERROR_KEYS:
+            flags.add("hasError")
+        return key_name
+
+    def visit(item: Any, key: Any = None, depth: int = 0) -> None:
+        key_name = add_key_flags(key) if key is not None else ""
+
+        if isinstance(item, bool):
+            flags.add("hasBooleanParam")
+        elif isinstance(item, (int, float)) and key_name in THRESHOLD_KEYS:
+            flags.add("hasNumericThreshold")
+        elif isinstance(item, str):
+            text = item.strip()
+            lower_text = text.lower()
+            if is_url_string(text):
+                flags.add("hasUrl")
+            elif PATH_RE.search(text):
+                flags.add("hasPath")
+            if len(text) > 500:
+                flags.add("hasLongText")
+            if CODE_RE.search(text):
+                flags.add("hasCodeLikeText")
+            if (
+                "traceback" in lower_text
+                or "exception" in lower_text
+                or "error:" in lower_text
+            ):
+                flags.add("hasError")
+        elif isinstance(item, list):
+            flags.add("hasArrayParam")
+            if any(isinstance(child, dict) for child in item[:16]):
+                flags.add("hasObjectList")
+            if depth < 2:
+                for child in item[:16]:
+                    visit(child, depth=depth + 1)
+        elif isinstance(item, dict):
+            keys = {add_key_flags(child_key) for child_key in item}
+            if "storage" in " ".join(keys) or (
+                "bucket" in keys and bool(keys & {"key", "path", "uri", "url"})
+            ):
+                flags.add("hasStorageEntry")
+            if depth < 2:
+                for child_key in sorted(item, key=str)[:24]:
+                    visit(item[child_key], child_key, depth + 1)
+
+    visit(value)
+    return sorted(flags)
+
+
+def normalized_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+
+
+def structure_hash(value: Any, max_depth: int = 2) -> str:
+    return structure_shape(value, 0, max_depth)
+
+
+def structure_shape(value: Any, depth: int, max_depth: int) -> str:
+    if depth >= max_depth:
+        return value_type(value)
+    if isinstance(value, dict):
+        if not value:
+            return "object"
+        parts = [
+            f"{key}:{structure_shape(value[key], depth + 1, max_depth)}"
+            for key in sorted(value, key=str)[:24]
+        ]
+        return f"object({','.join(parts)})"
+    if isinstance(value, list):
+        if not value:
+            return "array"
+        shapes = []
+        for item in value[:8]:
+            shape = structure_shape(item, depth + 1, max_depth)
+            if shape not in shapes:
+                shapes.append(shape)
+        return f"array<{'|'.join(shapes[:4])}>"
+    return value_type(value)
+
+
+def root_signature(node: dict[str, Any], artifact_kind: str) -> str:
+    value = root_value(node)
+    parts = [
+        f"kind={artifact_kind}",
+        f"keys={','.join(top_level_keys(value))}",
+        f"flags={','.join(feature_flags(value))}",
+        f"shape={structure_hash(value)}",
+    ]
+    if isinstance(value, dict):
+        parts.append(f"size=keys:{count_bucket(len(value))}")
+    elif isinstance(value, list):
+        parts.append(f"size=items:{count_bucket(len(value))}")
+    elif isinstance(value, str):
+        if len(value) < 128:
+            size = "short"
+        elif len(value) < 1024:
+            size = "medium"
+        else:
+            size = "long"
+        parts.append(f"size=chars:{size if value else '0'}")
+    return "|".join(parts)
 
 
 def value_type_histogram(value: Any) -> dict[str, int]:
@@ -718,7 +903,7 @@ def cluster_sort_key(cluster: list[dict[str, Any]]) -> tuple[float, str]:
 
 def similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
     score = (
-        0.20 * token_similarity(a["tool"], b["tool"])
+        0.15 * token_similarity(a["tool"], b["tool"])
         + 0.30
         * side_signature_similarity(
             a["inputParamShapeSignature"],
@@ -729,10 +914,15 @@ def similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
             a["outputParamShapeSignature"],
             b["outputParamShapeSignature"],
         )
-        + 0.20
+        + 0.15
         * graph_context_similarity(
             a["graphContextSignature"],
             b["graphContextSignature"],
+        )
+        + 0.10
+        * root_pattern_similarity(
+            a["rootPatternSignature"],
+            b["rootPatternSignature"],
         )
     )
     return round(score, 4)
@@ -752,9 +942,12 @@ def tokens(value: str) -> set[str]:
 
 def side_signature_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
     return (
-        0.45 * jaccard(set(a["artifactKinds"]), set(b["artifactKinds"]))
-        + 0.35 * jaccard(set(a["paramKeys"]), set(b["paramKeys"]))
-        + 0.20 * histogram_similarity(a["valueTypeHistogram"], b["valueTypeHistogram"])
+        0.25 * jaccard(set(a["artifactKinds"]), set(b["artifactKinds"]))
+        + 0.25 * jaccard(set(a["paramKeys"]), set(b["paramKeys"]))
+        + 0.25 * histogram_similarity(a["valueTypeHistogram"], b["valueTypeHistogram"])
+        + 0.15
+        * jaccard(set(a.get("featureFlags", [])), set(b.get("featureFlags", [])))
+        + 0.10 * (1 if a.get("structureHash") == b.get("structureHash") else 0)
     )
 
 
@@ -773,6 +966,14 @@ def graph_context_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
         + 0.20 * bool_score
         + 0.15 * relation_score
     )
+
+
+def root_pattern_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
+    return (
+        (1 if a["rootCountBucket"] == b["rootCountBucket"] else 0)
+        + (1 if a["isMultiRoot"] == b["isMultiRoot"] else 0)
+        + jaccard(set(a["rootKindPattern"]), set(b["rootKindPattern"]))
+    ) / 3
 
 
 def count_similarity(a: int, b: int) -> float:
@@ -832,6 +1033,7 @@ def support_score_summary(
     return {
         "highScoreTraces": sorted(support_traces & score_groups["high"]),
         "lowScoreTraces": sorted(support_traces & score_groups["low"]),
+        "maxScore": round(max(values), 3) if values else None,
         "averageScore": round(sum(values) / len(values), 3) if values else None,
         "isAnomaly": trace_count > 1 and len(support_traces) == 1,
     }
@@ -953,6 +1155,14 @@ def common_side_signature(signatures: Any) -> dict[str, Any]:
         ),
         "paramKeys": top_counts(key for signature in items for key in signature["paramKeys"]),
         "valueTypeHistogram": dict(sorted(histogram.items())),
+        "featureFlags": top_counts(
+            flag for signature in items for flag in signature.get("featureFlags", [])
+        ),
+        "structureHash": top_counts(
+            signature["structureHash"]
+            for signature in items
+            if signature.get("structureHash")
+        ),
     }
 
 
@@ -983,34 +1193,40 @@ def build_root_nodes(
     analyses: list[dict[str, Any]],
     score_groups: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[tuple[str, str], str]]:
-    by_root_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    root_node_ids = {}
+    by_signature: dict[str, list[dict[str, Any]]] = defaultdict(list)
     trace_count = len(analyses)
 
     for analysis in analyses:
         for root in analysis["roots"]:
             if root["kind"] == "Activity":
                 continue
-            by_root_id[root["rootId"]].append(root)
-            root_node_ids[(analysis["traceId"], root["nodeId"])] = root["rootId"]
+            by_signature[root["rootSignature"]].append(root)
+
+    root_groups = sorted(by_signature.items())
+    root_ids = {
+        signature: f"R{index}" for index, (signature, _) in enumerate(root_groups, 1)
+    }
+    root_node_ids = {
+        (root["traceId"], root["nodeId"]): root_ids[signature]
+        for signature, roots in root_groups
+        for root in roots
+    }
 
     nodes = [
         {
-            "id": root_id,
+            "id": root_ids[signature],
             "kind": "Root",
-            "label": root_label(root_id, roots),
+            "label": root_label(root_ids[signature], roots),
             **support_fields(roots, score_groups, trace_count),
             "members": roots,
             "representativeSignature": {
                 "artifactKinds": top_counts(root["artifactKind"] for root in roots),
+                "rootSignatures": top_counts(root["rootSignature"] for root in roots),
             },
-            "rootSetsByTrace": {
-                trace_id: [[root_id]]
-                for trace_id in sorted({root["traceId"] for root in roots})
-            },
+            "rootSetsByTrace": root_lineage_sets_by_trace(roots),
             "confidence": 1,
         }
-        for root_id, roots in sorted(by_root_id.items())
+        for signature, roots in root_groups
     ]
 
     return nodes, root_node_ids
@@ -1019,6 +1235,15 @@ def build_root_nodes(
 def root_label(root_id: str, roots: list[dict[str, Any]]) -> str:
     kinds = Counter(root["artifactKind"] for root in roots if root["artifactKind"] != "unknown")
     return f"Root {kinds.most_common(1)[0][0]}" if kinds else root_id.replace("_", " ").title()
+
+
+def root_lineage_sets_by_trace(roots: list[dict[str, Any]]) -> dict[str, list[list[str]]]:
+    result: dict[str, list[list[str]]] = defaultdict(list)
+    for root in roots:
+        lineage = [root["rootId"]]
+        if lineage not in result[root["traceId"]]:
+            result[root["traceId"]].append(lineage)
+    return dict(sorted(result.items()))
 
 
 def build_joined_edges(
