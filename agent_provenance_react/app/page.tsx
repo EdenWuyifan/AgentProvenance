@@ -41,6 +41,16 @@ const TRACE_SELECTION_COLORS = [
   "rgba(74, 222, 128, 0.18)",
 ] as const;
 
+function traceSelectionColor(index: number) {
+  const color = TRACE_SELECTION_COLORS[index];
+  if (color) {
+    return color;
+  }
+
+  const hue = (index * 137.508) % 360;
+  return `hsl(${hue} 86% 90% / 0.42)`;
+}
+
 type TopChartMode = "usage" | "impact";
 type BottomGraphView = "trace" | "agent";
 type AgentDagState =
@@ -424,7 +434,7 @@ export default function Home() {
       Object.fromEntries(
         selectedTracingIds.map((selectedTracingId, index) => [
           selectedTracingId,
-          TRACE_SELECTION_COLORS[index],
+          traceSelectionColor(index),
         ])
       ),
     [selectedTracingIds]
@@ -488,13 +498,46 @@ export default function Home() {
         return current.filter((selectedTracingId) => selectedTracingId !== tracingId);
       }
 
-      if (current.length < 3) {
-        return [...current, tracingId];
-      }
-
-      return [...current.slice(0, 2), tracingId];
+      return [...current, tracingId];
     });
   }, [data, loadAgentDag, selectedTracingIds]);
+
+  const handleGroupSelect = useCallback((group: string) => {
+    if (!upsetGroupBy) {
+      return;
+    }
+
+    const groupTracingIds = data
+      .filter((tracing) => {
+        const value = tracing[upsetGroupBy];
+        const label =
+          value === null || value === undefined || value === ""
+            ? "unknown"
+            : String(value);
+        return label === group;
+      })
+      .map((tracing) => tracing.id);
+    const groupIdSet = new Set(groupTracingIds);
+
+    data
+      .filter((tracing) => groupIdSet.has(tracing.id))
+      .forEach((tracing) => {
+        void loadAgentDag(tracing);
+      });
+
+    setSelectedTracingIds((current) => {
+      const selectedGroupCount = groupTracingIds.filter((id) => current.includes(id)).length;
+
+      if (selectedGroupCount === groupTracingIds.length) {
+        return current.filter((id) => !groupIdSet.has(id));
+      }
+
+      return [
+        ...current.filter((id) => !groupIdSet.has(id)),
+        ...groupTracingIds,
+      ];
+    });
+  }, [data, loadAgentDag, upsetGroupBy]);
 
   useEffect(() => {
     const validGroups = new Set(getGroupingValues(data, upsetGroupBy));
@@ -608,9 +651,10 @@ export default function Home() {
       return;
     }
 
-    const render = () => {
+    let currentWidth = Math.max(Math.floor(element.getBoundingClientRect().width), 720);
+    const render = (width = currentWidth) => {
       renderUpsetPlot(element, data, {}, {
-        width: Math.max(element.clientWidth, 720),
+        width,
         matrixMaxHeight: 360,
         topChartMode,
         rowGroupBy: upsetGroupBy || undefined,
@@ -623,13 +667,20 @@ export default function Home() {
               : [...current, group]
           );
         },
+        onGroupSelect: handleGroupSelect,
         onTracingSelect: handleTracingSelect,
       });
     };
 
     render();
 
-    const observer = new ResizeObserver(render);
+    const observer = new ResizeObserver(([entry]) => {
+      const nextWidth = Math.max(Math.floor(entry.contentRect.width), 720);
+      if (nextWidth !== currentWidth) {
+        currentWidth = nextWidth;
+        render(nextWidth);
+      }
+    });
     observer.observe(element);
 
     return () => {
@@ -639,6 +690,7 @@ export default function Home() {
     collapsedGroups,
     data,
     error,
+    handleGroupSelect,
     handleTracingSelect,
     loading,
     selectedTracingColors,

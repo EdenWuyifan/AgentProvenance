@@ -118,6 +118,7 @@ export type JoinedProvenanceEdge = {
 export type JoinedScoreSummary = {
   highScoreTraces: string[];
   lowScoreTraces: string[];
+  maxScore?: number | null;
   averageScore: number | null;
   isAnomaly: boolean;
 };
