@@ -1102,6 +1102,68 @@ function propertyValue(value: unknown): string | string[] {
   return JSON.stringify(value) ?? 'undefined';
 }
 
+function buildCompactNodeLevels(
+  nodeIds: string[],
+  edges: Array<{ source: string; target: string }>
+) {
+  const levels = new Map(nodeIds.map((nodeId) => [nodeId, 0]));
+  const incomingCounts = new Map(nodeIds.map((nodeId) => [nodeId, 0]));
+  const outgoingByNode = new Map(nodeIds.map((nodeId) => [nodeId, [] as string[]]));
+
+  for (const edge of edges) {
+    if (
+      edge.source === edge.target
+      || !incomingCounts.has(edge.source)
+      || !incomingCounts.has(edge.target)
+    ) {
+      continue;
+    }
+
+    incomingCounts.set(edge.target, (incomingCounts.get(edge.target) ?? 0) + 1);
+    outgoingByNode.get(edge.source)?.push(edge.target);
+  }
+
+  const placed = new Set<string>();
+  const queue = nodeIds.filter((nodeId) => incomingCounts.get(nodeId) === 0);
+  let queueIndex = 0;
+
+  const drainQueue = () => {
+    while (queueIndex < queue.length) {
+      const nodeId = queue[queueIndex];
+      queueIndex += 1;
+
+      if (placed.has(nodeId)) {
+        continue;
+      }
+
+      placed.add(nodeId);
+
+      for (const target of outgoingByNode.get(nodeId) ?? []) {
+        if (placed.has(target)) {
+          continue;
+        }
+
+        levels.set(target, Math.max(levels.get(target) ?? 0, (levels.get(nodeId) ?? 0) + 1));
+        incomingCounts.set(target, (incomingCounts.get(target) ?? 0) - 1);
+
+        if (incomingCounts.get(target) === 0) {
+          queue.push(target);
+        }
+      }
+    }
+  };
+
+  drainQueue();
+  nodeIds.forEach((nodeId) => {
+    if (!placed.has(nodeId)) {
+      queue.push(nodeId);
+      drainQueue();
+    }
+  });
+
+  return levels;
+}
+
 function buildProvProperties(
   node: AgentDag['nodes'][number],
   incoming: string[],
@@ -1138,27 +1200,13 @@ function buildProvProperties(
 }
 
 function renderAgentDagGraph(dag: AgentDag) {
-  const nodeLevels = new Map(dag.nodes.map((node) => [node.id, 0]));
+  const nodeLevels = buildCompactNodeLevels(
+    dag.nodes.map((node) => node.id),
+    dag.edges
+  );
   const rowsByLevel = new Map<number, number>();
   const incomingByNode = new Map<string, string[]>();
   const outgoingByNode = new Map<string, string[]>();
-
-  for (let pass = 0; pass < dag.nodes.length; pass += 1) {
-    let changed = false;
-
-    dag.edges.forEach((edge) => {
-      const nextLevel = (nodeLevels.get(edge.source) ?? 0) + 1;
-
-      if (nextLevel > (nodeLevels.get(edge.target) ?? 0)) {
-        nodeLevels.set(edge.target, nextLevel);
-        changed = true;
-      }
-    });
-
-    if (!changed) {
-      break;
-    }
-  }
 
   dag.edges.forEach((edge) => {
     incomingByNode.set(edge.target, [
@@ -1393,29 +1441,15 @@ function renderJoinedProvenanceGraph(
           && !lowNodeIds.has(edge.target)
           && !hasLowJoinedPattern(edge, filters)))
   );
-  const nodeLevels = new Map(graphNodes.map((node) => [node.id, 0]));
+  const nodeLevels = buildCompactNodeLevels(
+    graphNodes.map((node) => node.id),
+    graphEdges
+  );
   const rowsByLevel = new Map<number, number>();
   const incomingByNode = new Map<string, string[]>();
   const outgoingByNode = new Map<string, string[]>();
   const maxNodeSupport = Math.max(...graphNodes.map((node) => node.supportCount), 1);
   const maxEdgeSupport = Math.max(...graphEdges.map((edge) => edge.supportCount), 1);
-
-  for (let pass = 0; pass < graphNodes.length; pass += 1) {
-    let changed = false;
-
-    graphEdges.forEach((edge) => {
-      const nextLevel = (nodeLevels.get(edge.source) ?? 0) + 1;
-
-      if (nextLevel > (nodeLevels.get(edge.target) ?? 0)) {
-        nodeLevels.set(edge.target, nextLevel);
-        changed = true;
-      }
-    });
-
-    if (!changed) {
-      break;
-    }
-  }
 
   graphEdges.forEach((edge) => {
     incomingByNode.set(edge.target, [
@@ -1627,7 +1661,6 @@ function FlowGraphBody({
 
   useEffect(() => {
     setNodes(graph.nodes);
-    setOpenNodeIds([]);
   }, [graph.nodes, graphKey, setNodes]);
 
   const displayNodes = nodes.map((node) => ({

@@ -1091,6 +1091,8 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
     const height = options.height ?? calculatedHeight;
 
     const containerSelection = d3.select(container);
+    const lowerScrollTop =
+        container.querySelector(".upset-lower-wrapper")?.scrollTop ?? 0;
 
     containerSelection.selectAll("*").remove();
     containerSelection.style("position", "relative");
@@ -1195,6 +1197,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
 
         const lowerWrapper = containerSelection
             .append("div")
+            .attr("class", "upset-lower-wrapper")
             .style("max-height", `${lowerViewportHeight}px`)
             .style("overflow-y", "auto")
             .style("overflow-x", "hidden")
@@ -1203,6 +1206,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
             .append("svg")
             .attr("width", width)
             .attr("height", lowerHeight);
+        lowerWrapper.property("scrollTop", lowerScrollTop);
         const lowerGroup = lowerSvg
             .append("g")
             .attr("transform", `translate(${margin.left},0)`);
