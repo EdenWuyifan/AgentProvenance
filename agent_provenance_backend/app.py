@@ -17,9 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 REACT_DIR = ROOT / "agent_provenance_react"
 CACHE_DIR = REACT_DIR / ".cache"
 GRAPH_CACHE_DIR = CACHE_DIR / "generated-prov-graphs"
+TOOL_SET_CACHE_DIR = CACHE_DIR / "generated-tool-sets"
 
 DEFAULT_BASE_URL = "https://ai-gateway.apps.cloud.rt.nyu.edu/v1/"
-DEFAULT_MODEL = "@vertexai/gemini-3-pro-preview"
+DEFAULT_MODEL = "@vertexai/gemini-3.1-flash-lite-preview"
 MAX_SEMANTIC_EDGE_CANDIDATES = 2
 TOKEN_CHAMFER_THRESHOLD = 0.2
 MAX_LABEL_LENGTH = 96
@@ -598,6 +599,13 @@ async def refine_graph(
                     ],
                 },
             )
+
+            print(
+                f"[graph-refine] LLM status={response.status_code} content_type={response.headers.get('content-type')}",
+                flush=True,
+            )
+
+            print(f"[graph-refine] LLM raw response:\n{response.text}", flush=True)
     except httpx.HTTPError:
         return {"edits": []}
 
@@ -605,6 +613,91 @@ async def refine_graph(
         return {"edits": []}
 
     return parse_llm_graph_patch(response_text(response.json()))
+
+
+def tool_sets_prompt(tool_names: list[str]) -> str:
+    return f"""Group these exact tool names into semantic visualization sets.
+
+Return JSON only, with group names as keys and arrays of exact tool names as values.
+Every tool name must appear exactly once. Do not invent tool names.
+
+toolNames:
+{json.dumps(tool_names, indent=2)}"""
+
+
+def parse_tool_sets(text: str, tool_names: list[str]) -> dict[str, list[str]]:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end < start:
+        return {}
+
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return {}
+
+    allowed = set(tool_names)
+    used: set[str] = set()
+    tool_sets: dict[str, list[str]] = {}
+
+    for group_name, tools in parsed.items():
+        if not isinstance(group_name, str) or not isinstance(tools, list):
+            continue
+        items = [tool for tool in tools if tool in allowed and tool not in used]
+        if items:
+            tool_sets[group_name] = items
+            used.update(items)
+
+    missing = [tool for tool in tool_names if tool not in used]
+    if missing and tool_sets:
+        tool_sets["other tools"] = missing
+
+    return tool_sets
+
+
+async def generate_tool_sets(tool_names: list[str]) -> dict[str, list[str]]:
+    try:
+        _, model, url, headers = chat_config()
+    except RuntimeError as error:
+        print(f"[tool-sets] config error: {error}", flush=True)
+        return {}
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                json={
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": tool_sets_prompt(tool_names),
+                        }
+                    ],
+                },
+            )
+    except httpx.HTTPError as error:
+        print(f"[tool-sets] LLM request failed: {type(error).__name__}: {error}", flush=True)
+        return {}
+
+    print(
+        f"[tool-sets] LLM status={response.status_code} content_type={response.headers.get('content-type')}",
+        flush=True,
+    )
+    print(f"[tool-sets] LLM raw response:\n{response.text}", flush=True)
+
+    if response.is_error:
+        return {}
+
+    text = response_text(response.json())
+    print(f"[tool-sets] LLM message content:\n{text}", flush=True)
+
+    generated = parse_tool_sets(text, tool_names)
+    if not generated:
+        print("[tool-sets] parsed no valid tool-set groups", flush=True)
+
+    return generated
 
 
 def patch_node(node: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -883,6 +976,36 @@ async def joined_provenance_graph(request: Request):
             threshold if isinstance(threshold, (int, float)) else 0.75,
         )
     }
+
+
+@app.post("/api/tool-sets")
+async def tool_sets(request: Request):
+    body = await request.json()
+    tool_names = sorted({
+        item
+        for item in body.get("toolNames", [])
+        if isinstance(item, str) and item.strip()
+    })
+    cache_key = body.get("cacheKey") if isinstance(body.get("cacheKey"), str) else ""
+
+    if not tool_names:
+        return {"toolSets": {}, "cached": False}
+
+    if not re.fullmatch(r"[a-f0-9]{64}", cache_key):
+        cache_key = sha256(json.dumps(tool_names, sort_keys=True).encode()).hexdigest()
+
+    cache_path = TOOL_SET_CACHE_DIR / f"{cache_key}.json"
+    if cache_path.exists():
+        return {"toolSets": json.loads(cache_path.read_text()), "cached": True}
+
+    generated = await generate_tool_sets(tool_names)
+    if not generated:
+        return PlainTextResponse("Unable to generate tool sets.", status_code=502)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(generated, indent=2))
+
+    return {"toolSets": generated, "cached": False}
 
 
 @app.post("/api/provenance-agent")

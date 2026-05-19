@@ -74,7 +74,7 @@ function solveLinearSystem(matrix, vector) {
     return augmented.map((row) => row[size]);
 }
 
-function buildToolImpactData(tools, tracings, tracingToolCalls) {
+function buildToolImpactData(tools, tracings, tracingToolCalls, scoreKey) {
     if (tools.length === 0 || tracings.length === 0) {
         return [];
     }
@@ -83,7 +83,7 @@ function buildToolImpactData(tools, tracings, tracingToolCalls) {
         const toolCallsByName = tracingToolCalls.get(tracing.id)?.toolCallsByName;
         return tools.map((tool) => (toolCallsByName?.has(tool) ? 1 : 0));
     });
-    const scores = tracings.map((tracing) => getTracingScore(tracing));
+    const scores = tracings.map((tracing) => getTracingScore(tracing, scoreKey));
     const featureMeans = tools.map(
         (_, toolIndex) => d3.mean(rows, (row) => row[toolIndex]) ?? 0
     );
@@ -153,12 +153,12 @@ function buildToolImpactData(tools, tracings, tracingToolCalls) {
     });
 }
 
-function buildTraceScoreData(tracings, tracingToolCalls) {
+function buildTraceScoreData(tracings, tracingToolCalls, scoreKey) {
     return tracings.map((tracing) => ({
         id: tracing.id,
         label: traceLabel(tracing),
         tracing,
-        score: tracingToolCalls.get(tracing.id)?.score ?? getTracingScore(tracing),
+        score: tracingToolCalls.get(tracing.id)?.score ?? getTracingScore(tracing, scoreKey),
     }));
 }
 
@@ -206,9 +206,10 @@ function getTracingGroupValue(tracing, groupBy) {
     return value === null || value === undefined || value === "" ? "unknown" : String(value);
 }
 
-function orderTracings(tracings, groupBy, collapsedGroups = []) {
+function orderTracings(tracings, groupBy, collapsedGroups = [], scoreKey = "score") {
     const byScore = (a, b) =>
-        getTracingScore(b) - getTracingScore(a) || compareLabels(a.id, b.id);
+        getTracingScore(b, scoreKey) - getTracingScore(a, scoreKey) ||
+        compareLabels(a.id, b.id);
     const collapsedGroupSet = new Set(collapsedGroups);
 
     if (!groupBy) {
@@ -225,7 +226,7 @@ function orderTracings(tracings, groupBy, collapsedGroups = []) {
         .map(([label, items]) => ({
             label,
             items: items.slice().sort(byScore),
-            topScore: d3.max(items, (item) => getTracingScore(item)) ?? 0,
+            topScore: d3.max(items, (item) => getTracingScore(item, scoreKey)) ?? 0,
         }))
         .sort(
             (a, b) => b.topScore - a.topScore || compareLabels(a.label, b.label)
@@ -293,7 +294,7 @@ function getToolGroupBreaks(tools, glyphSystem) {
     return breaks;
 }
 
-function buildTracingToolIndex(tracings) {
+function buildTracingToolIndex(tracings, scoreKey) {
     const tools = new Set();
     const tracingToolCalls = new Map();
 
@@ -317,7 +318,7 @@ function buildTracingToolIndex(tracings) {
 
         tracingToolCalls.set(tracing.id, {
             toolCallsByName,
-            score: getTracingScore(tracing),
+            score: getTracingScore(tracing, scoreKey),
         });
     });
 
@@ -398,6 +399,7 @@ function renderToolCoverageBars({
     showTooltip,
     hideTooltip,
     formatScore,
+    scoreLabel,
 }) {
     const barsGroup = group.append("g").attr("class", "tool-coverage");
     const zeroY = yScale(0);
@@ -508,8 +510,8 @@ function renderToolCoverageBars({
                 `<strong>Approx. Shapley impact:</strong> ${formatSigned(datum.impact)}`,
                 `<strong>|Impact|:</strong> ${formatScore(datum.impactAbs)}`,
                 `<strong>Runs with tool:</strong> ${datum.usageCount}/${traceCount}`,
-                `<strong>Mean score when present:</strong> ${formatScore(datum.meanPresentScore)}`,
-                `<strong>Mean score when absent:</strong> ${formatScore(datum.meanAbsentScore)}`,
+                `<strong>Mean ${scoreLabel} when present:</strong> ${formatScore(datum.meanPresentScore)}`,
+                `<strong>Mean ${scoreLabel} when absent:</strong> ${formatScore(datum.meanAbsentScore)}`,
             ].join("<br/>");
         }
 
@@ -666,6 +668,8 @@ function renderCoverageGrid({
     showTooltip,
     hideTooltip,
     formatArgs,
+    formatScore,
+    scoreLabel,
     selectedTracingColors,
     onTracingSelect,
 }) {
@@ -789,13 +793,13 @@ function renderCoverageGrid({
                             .text(callsForTool.length);
                     }
 
-                    const score = entry?.score ?? tracing.score;
+                    const score = entry?.score;
                     const tooltipHtml = [
                         `<strong>Tool:</strong> ${tool}`,
                         `<strong>Group:</strong> ${toolGroup}`,
                         ...traceMetadataRows(tracing),
                         score !== undefined
-                            ? `<strong>Score:</strong> ${score}`
+                            ? `<strong>Score (${scoreLabel}):</strong> ${formatScore(score)}`
                             : null,
                         `<strong>Calls:</strong> ${callsForTool.length}`,
                         `<div style="margin-top:4px;max-width:340px;max-height:220px;overflow:auto;">${formatToolCallList(callsForTool, formatArgs)}</div>`,
@@ -948,6 +952,7 @@ function renderScoreRail({
     showTooltip,
     hideTooltip,
     formatScore,
+    scoreLabel,
     onRowFocus,
     onRowBlur,
     onRowSelect,
@@ -976,22 +981,23 @@ function renderScoreRail({
         .attr("fill", "#4b5563")
         .attr("font-size", 11)
         .attr("text-anchor", "middle")
-        .text("Run Score");
+        .text(`Score: ${shortenText(scoreLabel, 18)}`);
 
     const scoreBarBaseFill = BAR_FILL;
     const scoreBarHighlightFill = BAR_HIGHLIGHT_FILL;
     const scoreLabelBaseColor = "#475569";
     const scoreLabelHighlightColor = "#0f172a";
+    const zeroX = scoreX(0);
 
     const scoreBars = scoreGroup
         .selectAll("rect.score-bar")
         .data(data)
         .join("rect")
         .attr("class", "score-bar")
-        .attr("x", 0)
+        .attr("x", (d) => Math.min(zeroX, scoreX(d.score ?? 0)))
         .attr("y", (d) => traceScale(d.id))
         .attr("height", traceScale.bandwidth())
-        .attr("width", (d) => scoreX(d.score ?? 0))
+        .attr("width", (d) => Math.abs(scoreX(d.score ?? 0) - zeroX))
         .attr("fill", scoreBarBaseFill);
 
     const scoreLabels = scoreGroup
@@ -999,10 +1005,11 @@ function renderScoreRail({
         .data(data)
         .join("text")
         .attr("class", "score-value")
-        .attr("x", (d) => scoreX(d.score ?? 0) + 6)
+        .attr("x", (d) => scoreX(d.score ?? 0) + (scoreX(d.score ?? 0) >= zeroX ? 6 : -6))
         .attr("y", (d) => traceScale(d.id) + traceScale.bandwidth() / 2)
         .attr("dy", "0.35em")
         .attr("fill", scoreLabelBaseColor)
+        .attr("text-anchor", (d) => scoreX(d.score ?? 0) >= zeroX ? "start" : "end")
         .style("font-size", "10px")
         .text((d) => formatScore(d.score));
 
@@ -1021,7 +1028,7 @@ function renderScoreRail({
     const scoreTooltipContent = (d) =>
         [
             ...traceMetadataRows(d.tracing),
-            `<strong>Score:</strong> ${formatScore(d.score)}`,
+            `<strong>Score (${scoreLabel}):</strong> ${formatScore(d.score)}`,
         ].join("<br/>");
 
     scoreBars
@@ -1043,28 +1050,45 @@ function renderScoreRail({
     return { setRowHighlight };
 }
 
+function createScoreScale(data, scoreWidth) {
+    const minScore = d3.min(data, (d) => d.score) ?? 0;
+    const maxScore = d3.max(data, (d) => d.score) ?? 1;
+    const domain = [Math.min(0, minScore), Math.max(0, maxScore)];
+    const barWidth = Math.max(scoreWidth - 44, 1);
+
+    return d3
+        .scaleLinear()
+        .domain(domain[0] === domain[1] ? [0, 1] : domain)
+        .nice()
+        .range([0, barWidth]);
+}
+
 
 export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
     if (!container) return;
 
     const tracings = prepareTracings(data);
     const topChartMode = options.topChartMode === "impact" ? "impact" : "usage";
+    const scoreKey = options.scoreKey || "score";
+    const scoreLabel = options.scoreLabel || scoreKey;
     const glyphSystem = createGlyphSystem(toolSets);
-    const { tools, tracingToolCalls } = buildTracingToolIndex(tracings);
+    const { tools, tracingToolCalls } = buildTracingToolIndex(tracings, scoreKey);
     const orderedTracings = orderTracings(
         tracings,
         options.rowGroupBy,
-        options.collapsedGroups
+        options.collapsedGroups,
+        scoreKey
     );
     const orderedTools = orderTools(tools, glyphSystem);
     const toolGroupBreaks = getToolGroupBreaks(orderedTools, glyphSystem);
     const upperBarChartData =
         topChartMode === "impact"
-            ? buildToolImpactData(orderedTools, tracings, tracingToolCalls)
+            ? buildToolImpactData(orderedTools, tracings, tracingToolCalls, scoreKey)
             : buildToolCoverageData(orderedTools, tracingToolCalls);
     const lowerBarChartData = buildTraceScoreData(
         orderedTracings.tracings,
-        tracingToolCalls
+        tracingToolCalls,
+        scoreKey
     );
 
     const width = options.width ?? Math.max(container.clientWidth || 0, 640);
@@ -1193,6 +1217,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
             showTooltip,
             hideTooltip,
             formatScore,
+            scoreLabel,
         });
 
         const lowerWrapper = containerSelection
@@ -1235,11 +1260,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
             onGroupSelect: options.onGroupSelect,
         });
 
-        const maxScore = d3.max(lowerBarChartData, (d) => d.score) || 1;
-        const scoreX = d3
-            .scaleLinear()
-            .domain([0, maxScore])
-            .range([0, scoreWidth]);
+        const scoreX = createScoreScale(lowerBarChartData, scoreWidth);
 
         const matrixControls = renderCoverageGrid({
             svg: lowerSvg,
@@ -1258,6 +1279,8 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
             showTooltip,
             hideTooltip,
             formatArgs,
+            formatScore,
+            scoreLabel,
             selectedTracingColors: options.selectedTracingColors,
             onTracingSelect: options.onTracingSelect,
         });
@@ -1295,6 +1318,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
             showTooltip,
             hideTooltip,
             formatScore,
+            scoreLabel,
             onRowFocus: (tracingId) => matrixControls.setRowHighlight(tracingId),
             onRowBlur: () => matrixControls.clearRowHighlight(),
             onRowSelect: options.onTracingSelect,
@@ -1357,6 +1381,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         showTooltip,
         hideTooltip,
         formatScore,
+        scoreLabel,
     });
 
     const traceScale = d3
@@ -1374,11 +1399,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         onGroupSelect: options.onGroupSelect,
     });
 
-    const maxScore = d3.max(lowerBarChartData, (d) => d.score) || 1;
-    const scoreX = d3
-        .scaleLinear()
-        .domain([0, maxScore])
-        .range([0, scoreWidth]);
+    const scoreX = createScoreScale(lowerBarChartData, scoreWidth);
 
     const matrixControls = renderCoverageGrid({
         svg,
@@ -1397,6 +1418,8 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         showTooltip,
         hideTooltip,
         formatArgs,
+        formatScore,
+        scoreLabel,
         selectedTracingColors: options.selectedTracingColors,
         onTracingSelect: options.onTracingSelect,
     });
@@ -1434,6 +1457,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         showTooltip,
         hideTooltip,
         formatScore,
+        scoreLabel,
         onRowFocus: (tracingId) => matrixControls.setRowHighlight(tracingId),
         onRowBlur: () => matrixControls.clearRowHighlight(),
         onRowSelect: options.onTracingSelect,

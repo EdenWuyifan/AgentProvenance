@@ -20,6 +20,7 @@ import type {
   AgentDag,
   GraphMode,
   JoinedProvenanceGraph,
+  ToolSets,
   Tracing,
 } from "./components/types";
 import { renderUpsetPlot } from "./components/upset_plot";
@@ -35,6 +36,7 @@ const GROUPING_EXCLUDED_KEYS = new Set([
   "toolCalls",
   "tool_calls",
 ]);
+const SCORING_EXCLUDED_KEYS = new Set(["id", "trace_id", "toolCalls", "tool_calls"]);
 const TRACE_SELECTION_COLORS = [
   "rgba(56, 189, 248, 0.18)",
   "rgba(251, 146, 60, 0.18)",
@@ -53,6 +55,7 @@ function traceSelectionColor(index: number) {
 
 type TopChartMode = "usage" | "impact";
 type BottomGraphView = "trace" | "agent";
+type TraceSource = { name: string; path?: string; text?: string };
 type AgentDagState =
   | { status: "loading" }
   | { status: "ready"; dag: AgentDag }
@@ -62,6 +65,11 @@ type JoinedGraphState =
   | { status: "loading"; key: string }
   | { status: "ready"; key: string; graph: JoinedProvenanceGraph }
   | { status: "error"; key: string; message: string };
+
+const DEFAULT_TRACE_SOURCE: TraceSource = {
+  name: "tracings.jsonl",
+  path: "/tracings.jsonl",
+};
 
 function getGroupingOptions(tracings: Tracing[]) {
   const keys = new Set<string>();
@@ -111,6 +119,32 @@ function getGroupingValues(tracings: Tracing[], groupBy: string) {
   return Array.from(values).sort((a, b) => a.localeCompare(b));
 }
 
+function isScoringValue(value: unknown) {
+  if (typeof value === "boolean") {
+    return true;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+
+  return typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value));
+}
+
+function getScoringOptions(tracings: Tracing[]) {
+  const keys = new Set<string>();
+
+  tracings.forEach((tracing) => {
+    Object.entries(tracing).forEach(([key, value]) => {
+      if (!SCORING_EXCLUDED_KEYS.has(key) && isScoringValue(value)) {
+        keys.add(key);
+      }
+    });
+  });
+
+  return Array.from(keys).sort((a, b) => a.localeCompare(b));
+}
+
 function normalizeTracing(
   tracing: Record<string, unknown> & { id: Tracing["id"]; score?: unknown }
 ): Tracing {
@@ -120,16 +154,41 @@ function normalizeTracing(
     ),
     id: tracing.id,
     score:
-      typeof tracing.score === "number" || tracing.score === null
-        ? tracing.score
-        : undefined,
+      tracing.score === null
+        ? null
+        : isScoringValue(tracing.score)
+          ? Number(tracing.score)
+          : undefined,
     toolCalls: extractToolCallRecords(tracing),
   };
 }
 
-function useTracingData(path: string) {
+async function hashText(text: string) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(text)
+  );
+
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function uniqueToolNames(tracings: Tracing[]) {
+  return Array.from(
+    new Set(
+      tracings.flatMap((tracing) =>
+        tracing.toolCalls.map((toolCall) => toolCall.name).filter(Boolean)
+      )
+    )
+  ).sort((a, b) => a.localeCompare(b));
+}
+
+function useTracingData(source: TraceSource) {
   const [data, setData] = useState<Tracing[]>([]);
+  const [cacheKey, setCacheKey] = useState("");
   const [loading, setLoading] = useState(true);
+  const [loadedSource, setLoadedSource] = useState<TraceSource | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -137,19 +196,21 @@ function useTracingData(path: string) {
 
     async function load() {
       try {
-        const response = await fetch(path);
-        if (!response.ok) {
-          throw new Error(`Request failed with status ${response.status}`);
-        }
-
-        const text = await response.text();
+        const text = source.text ?? await fetchTraceText(source);
         if (cancelled) {
           return;
         }
 
         const parsed = prepareTracings(parseTracingPayload(text)).map(normalizeTracing);
+        const nextCacheKey = await hashText(text);
+        if (cancelled) {
+          return;
+        }
+
         startTransition(() => {
           setData(parsed);
+          setCacheKey(nextCacheKey);
+          setLoadedSource(source);
           setError(null);
           setLoading(false);
         });
@@ -165,6 +226,8 @@ function useTracingData(path: string) {
 
         startTransition(() => {
           setData([]);
+          setCacheKey("");
+          setLoadedSource(source);
           setError(message);
           setLoading(false);
         });
@@ -176,9 +239,22 @@ function useTracingData(path: string) {
     return () => {
       cancelled = true;
     };
-  }, [path]);
+  }, [source]);
 
-  return { data, loading, error };
+  return { data, cacheKey, loading: loading || loadedSource !== source, error };
+}
+
+async function fetchTraceText(source: TraceSource) {
+  if (!source.path) {
+    throw new Error("Trace source is missing a path.");
+  }
+
+  const response = await fetch(source.path);
+  if (!response.ok) {
+    throw new Error(`Request failed with status ${response.status}`);
+  }
+
+  return response.text();
 }
 
 function Card({
@@ -305,10 +381,10 @@ function UpsetGroupBySelect({
   onChange: (value: string) => void;
 }) {
   return (
-    <label className="inline-flex h-full items-center text-[11px] text-zinc-600">
-      <span className="border-r border-zinc-300 px-2">Group rows</span>
+    <label className="inline-flex h-full min-w-0 flex-1 items-center text-[11px] text-zinc-600">
+      <span className="shrink-0 border-r border-zinc-300 px-2">Group rows</span>
       <select
-        className="h-full border-0 bg-transparent px-2 text-[11px] text-zinc-950 outline-none"
+        className="h-full min-w-0 flex-1 border-0 bg-transparent px-2 text-[11px] text-zinc-950 outline-none"
         value={value}
         onChange={(event) => onChange(event.target.value)}
       >
@@ -318,6 +394,38 @@ function UpsetGroupBySelect({
             {option}
           </option>
         ))}
+      </select>
+    </label>
+  );
+}
+
+function UpsetScoreBySelect({
+  value,
+  options,
+  onChange,
+}: {
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="inline-flex h-full min-w-0 flex-1 items-center text-[11px] text-zinc-600">
+      <span className="shrink-0 border-r border-zinc-300 px-2">Score by</span>
+      <select
+        className="h-full min-w-0 flex-1 border-0 bg-transparent px-2 text-[11px] text-zinc-950 outline-none disabled:text-zinc-400"
+        value={value}
+        disabled={options.length === 0}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        {options.length === 0 ? (
+          <option value="score">score</option>
+        ) : (
+          options.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))
+        )}
       </select>
     </label>
   );
@@ -333,7 +441,7 @@ function UpsetFoldActions({
   onExpandAll: () => void;
 }) {
   return (
-    <div className="inline-flex h-full items-center text-[11px]">
+    <div className="inline-flex h-full shrink-0 items-center border-l border-zinc-300 text-[11px]">
       <button
         type="button"
         className="h-full px-2 text-zinc-500 transition hover:text-zinc-950 disabled:cursor-default disabled:text-zinc-300"
@@ -391,9 +499,13 @@ function UpsetTopChartToggle({
 
 export default function Home() {
   const upsetRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [traceSource, setTraceSource] = useState<TraceSource>(DEFAULT_TRACE_SOURCE);
   const [selectedTracingIds, setSelectedTracingIds] = useState<Array<Tracing["id"]>>([]);
+  const [toolSets, setToolSets] = useState<ToolSets>({});
   const [topChartMode, setTopChartMode] = useState<TopChartMode>("impact");
   const [upsetGroupBy, setUpsetGroupBy] = useState("");
+  const [upsetScoreBy, setUpsetScoreBy] = useState("score");
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
   const [graphMode, setGraphMode] = useState<GraphMode>("tree");
   const [bottomGraphView, setBottomGraphView] = useState<BottomGraphView>("trace");
@@ -405,9 +517,13 @@ export default function Home() {
   });
   const agentDagStatesRef = useRef<Record<string, AgentDagState>>({});
 
-  const { data, loading, error } = useTracingData("/tracings.jsonl");
+  const { data, cacheKey, loading, error } = useTracingData(traceSource);
   const groupingOptions = getGroupingOptions(data);
   const groupingValues = getGroupingValues(data, upsetGroupBy);
+  const scoringOptions = getScoringOptions(data);
+  const selectedScoreBy = scoringOptions.includes(upsetScoreBy)
+    ? upsetScoreBy
+    : scoringOptions[0] ?? "score";
   const selectedTracings = selectedTracingIds
     .map((selectedTracingId) =>
       data.find((tracing) => tracing.id === selectedTracingId) ?? null
@@ -439,6 +555,21 @@ export default function Home() {
       ),
     [selectedTracingIds]
   );
+
+  const handleFileOpen = useCallback(async (file: File | undefined) => {
+    if (!file) {
+      return;
+    }
+
+    setSelectedTracingIds([]);
+    setCollapsedGroups([]);
+    agentDagStatesRef.current = {};
+    setAgentDagStates({});
+    setJoinedGraphState({ status: "idle" });
+    setToolSets({});
+    setUpsetScoreBy("score");
+    setTraceSource({ name: file.name, text: await file.text() });
+  }, []);
 
   const setAgentDagState = useCallback((traceId: Tracing["id"], state: AgentDagState) => {
     agentDagStatesRef.current = {
@@ -556,6 +687,47 @@ export default function Home() {
   }, [data]);
 
   useEffect(() => {
+    const toolNames = uniqueToolNames(data);
+    if (!cacheKey || toolNames.length === 0) {
+      setToolSets({});
+      return;
+    }
+
+    let cancelled = false;
+
+    async function loadToolSets() {
+      try {
+        const response = await fetch("/api/tool-sets", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ cacheKey, toolNames }),
+        });
+
+        if (!response.ok) {
+          throw new Error("Unable to generate tool sets.");
+        }
+
+        const payload = await response.json() as { toolSets?: ToolSets };
+        if (!cancelled) {
+          setToolSets(payload.toolSets ?? {});
+        }
+      } catch {
+        if (!cancelled) {
+          setToolSets({});
+        }
+      }
+    }
+
+    void loadToolSets();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [cacheKey, data]);
+
+  useEffect(() => {
     if (selectedTracingIds.length < 2) {
       setJoinedGraphState({ status: "idle" });
       return;
@@ -653,11 +825,13 @@ export default function Home() {
 
     let currentWidth = Math.max(Math.floor(element.getBoundingClientRect().width), 720);
     const render = (width = currentWidth) => {
-      renderUpsetPlot(element, data, {}, {
+      renderUpsetPlot(element, data, toolSets, {
         width,
         matrixMaxHeight: 360,
         topChartMode,
         rowGroupBy: upsetGroupBy || undefined,
+        scoreKey: selectedScoreBy,
+        scoreLabel: selectedScoreBy,
         collapsedGroups,
         selectedTracingColors,
         onGroupToggle: (group: string) => {
@@ -694,6 +868,8 @@ export default function Home() {
     handleTracingSelect,
     loading,
     selectedTracingColors,
+    selectedScoreBy,
+    toolSets,
     topChartMode,
     upsetGroupBy,
   ]);
@@ -703,13 +879,13 @@ export default function Home() {
       <main className="mx-auto flex w-full max-w-7xl flex-col gap-6">
         <header className="px-1">
           <p className="text-xs font-semibold uppercase tracking-[0.24em] text-zinc-500">
-            AgentProvenance
+            AgentTrails
           </p>
         </header>
 
         <Card
-          title="Tracings provenance"
-          description="Click up to 3 runs to inspect one PROV graph or join multiple PROV graphs on a shared canvas."
+          title="Traces overview"
+          description="Visualize and explore the provenance of your agent runs, including the tools they used and their outcomes."
         >
           {loading && <StatusMessage message="Loading traces…" />}
           {!loading && error && <StatusMessage message={error} />}
@@ -721,6 +897,24 @@ export default function Home() {
               <div className="relative min-w-[720px] pt-16">
                   <div className="pointer-events-none absolute inset-x-0 top-0 z-10 grid w-full grid-cols-[3fr_1fr]">
                     <div className="pointer-events-auto flex h-7 items-center border border-zinc-300 bg-zinc-50/95 backdrop-blur-sm">
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        accept=".json,.jsonl,application/json"
+                        className="hidden"
+                        onChange={(event) => {
+                          void handleFileOpen(event.target.files?.[0]);
+                          event.target.value = "";
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="h-full border-r border-zinc-300 px-2 text-[11px] font-medium text-zinc-500 transition hover:text-zinc-950"
+                        title={traceSource.name}
+                        onClick={() => fileInputRef.current?.click()}
+                      >
+                        Open JSONL
+                      </button>
                       <UpsetTopChartToggle
                         mode={topChartMode}
                         onChange={setTopChartMode}
@@ -728,7 +922,7 @@ export default function Home() {
                       <div className="h-full flex-1 border-l border-zinc-300" />
                     </div>
                   </div>
-                  <div className="pointer-events-none absolute inset-x-0 top-63 z-10 grid w-full grid-cols-[3fr_1fr]">
+                  <div className="pointer-events-none absolute inset-x-0 top-63 z-10 grid w-full grid-cols-[minmax(0,1fr)_280px]">
                     <div />
                     <div className="pointer-events-auto flex h-14 flex-col border border-zinc-300 bg-zinc-50/95 backdrop-blur-sm">
                       <div className="flex h-7 items-center">
@@ -737,15 +931,18 @@ export default function Home() {
                           options={groupingOptions}
                           onChange={setUpsetGroupBy}
                         />
-                        <div className="h-full flex-1 border-l border-zinc-300" />
-                      </div>
-                      <div className="flex h-7 items-center border-t border-zinc-300">
                         <UpsetFoldActions
                           disabled={!upsetGroupBy}
                           onFoldAll={() => setCollapsedGroups(groupingValues)}
                           onExpandAll={() => setCollapsedGroups([])}
                         />
-                        <div className="h-full flex-1 border-l border-zinc-300" />
+                      </div>
+                      <div className="flex h-7 items-center border-t border-zinc-300">
+                        <UpsetScoreBySelect
+                          value={selectedScoreBy}
+                          options={scoringOptions}
+                          onChange={setUpsetScoreBy}
+                        />
                       </div>
                     </div>
                   </div>
@@ -792,9 +989,13 @@ export default function Home() {
           )}
           {!loading && !error && selectedTracings.length === 1 && selectedTracing && (
             bottomGraphView === "agent" && agentDagReady ? (
-              <AgentDagGraphView dag={selectedAgentDagState.dag} />
+              <AgentDagGraphView dag={selectedAgentDagState.dag} toolSets={toolSets} />
             ) : (
-              <ProvenanceGraphView tracing={selectedTracing} mode={graphMode} />
+              <ProvenanceGraphView
+                tracing={selectedTracing}
+                mode={graphMode}
+                toolSets={toolSets}
+              />
             )
           )}
           {!loading && !error && selectedTracings.length >= 2 && (
@@ -803,6 +1004,7 @@ export default function Home() {
               <JoinedProvenanceGraphView
                 graph={joinedGraphState.graph}
                 traceIds={selectedTracingIds}
+                toolSets={toolSets}
               />
             ) : (
               <StatusMessage

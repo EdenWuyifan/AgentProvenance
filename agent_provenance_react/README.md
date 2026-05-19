@@ -55,6 +55,7 @@ The Next routes under `app/api/` only forward requests to the Python service:
 
 - `app/api/provenance-dag/route.ts` -> `POST /api/prov-graph`
 - `app/api/joined-provenance-graph/route.ts` -> `POST /api/joined-provenance-graph`
+- `app/api/tool-sets/route.ts` -> `POST /api/tool-sets`
 - `app/api/provenance-agent/route.ts` -> `POST /api/provenance-agent`
 
 Run the backend before using PROV graph generation, joined graphs, or the chat

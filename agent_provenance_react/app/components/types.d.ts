@@ -13,6 +13,8 @@ export interface ToolCall {
   status?: string | null;
 }
 
+export type ToolSets = Record<string, string[]>;
+
 export type GraphMode = "collapsed" | "tree";
 
 export type ProvenanceGraphMode = GraphMode | "comparison";
