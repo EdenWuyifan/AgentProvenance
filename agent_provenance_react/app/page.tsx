@@ -545,6 +545,20 @@ export default function Home() {
   const selectedDagsError =
     selectedTracings.length >= 2 &&
     selectedDagStates.some((state) => state?.status === "error");
+  const selectedTraceDags = selectedTracings.reduce<Record<string, AgentDag>>(
+    (graphs, tracing) => {
+      const state = agentDagStates[String(tracing.id)];
+      if (state?.status === "ready") {
+        graphs[String(tracing.id)] = state.dag;
+      }
+      return graphs;
+    },
+    {}
+  );
+  const activeJoinedGraph =
+    joinedGraphState.status === "ready" && joinedGraphState.key === selectedJoinKey
+      ? joinedGraphState.graph
+      : null;
   const selectedTracingColors = useMemo(
     () =>
       Object.fromEntries(
@@ -1022,6 +1036,8 @@ export default function Home() {
 
       <ProvenanceCopilot
         selectedTraces={selectedTracings}
+        selectedTraceDags={selectedTraceDags}
+        joinedGraph={activeJoinedGraph}
         graphMode={graphMode}
       />
     </div>

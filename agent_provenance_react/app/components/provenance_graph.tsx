@@ -20,6 +20,7 @@ import {
   type NodeProps,
 } from '@xyflow/react';
 import {
+  JsonField,
   ToolCallTooltip,
   type ToolCallTooltipDetail,
 } from './tool_call_tooltip';
@@ -42,7 +43,7 @@ type GraphNodeData = {
   color?: string;
   kind?: 'Activity' | 'Entity' | 'Root' | 'JoinedActivity';
   nodeType?: string;
-  provProperties?: Array<{ name: string; value: string | string[] }>;
+  provProperties?: Array<{ name: string; value: unknown }>;
   traceMembership?: Array<{ id: string; color: string; active: boolean }>;
   details?: ComparisonNodeDetail[];
   tooltipOpen?: boolean;
@@ -205,16 +206,12 @@ function ProvNodeTooltip({
   properties,
   onClose,
 }: {
-  properties: Array<{ name: string; value: string | string[] }>;
+  properties: Array<{ name: string; value: unknown }>;
   onClose: () => void;
 }) {
-  const json = Object.fromEntries(
-    properties.map((property) => [property.name, property.value])
-  );
-
   return (
     <div
-      className="nodrag nopan relative flex h-44 w-64 resize flex-col overflow-hidden rounded-md border border-zinc-200 bg-white shadow-sm"
+      className="nodrag nopan relative flex h-96 w-[34rem] resize flex-col overflow-hidden rounded-md border border-zinc-200 bg-white shadow-sm"
       onClick={(event) => event.stopPropagation()}
       onMouseDown={(event) => event.stopPropagation()}
     >
@@ -234,10 +231,14 @@ function ProvNodeTooltip({
           </svg>
         </button>
       </div>
-      <div className="min-h-0 flex-1 overflow-auto px-2 py-1.5 pr-4">
-        <pre className="whitespace-pre-wrap break-all font-mono text-[9px] leading-tight text-zinc-700">
-          {JSON.stringify(json, null, 2)}
-        </pre>
+      <div className="min-h-0 flex-1 space-y-1 overflow-auto px-2 py-1.5 pr-4">
+        {properties.map((property) => (
+          <JsonField
+            key={property.name}
+            name={property.name}
+            value={property.value}
+          />
+        ))}
       </div>
     </div>
   );
@@ -1132,16 +1133,8 @@ function entityResponseLabel(response: unknown) {
   return undefined;
 }
 
-function propertyValue(value: unknown): string | string[] {
-  if (Array.isArray(value) && value.every((item) => typeof item === 'string')) {
-    return value;
-  }
-
-  if (typeof value === 'string') {
-    return value;
-  }
-
-  return JSON.stringify(value) ?? 'undefined';
+function propertyValue(value: unknown): unknown {
+  return value === undefined ? 'undefined' : value;
 }
 
 function buildCompactNodeLevels(
@@ -1211,7 +1204,7 @@ function buildProvProperties(
   incoming: string[],
   outgoing: string[]
 ) {
-  const properties: Array<{ name: string; value: string | string[] }> = [
+  const properties: Array<{ name: string; value: unknown }> = [
     { name: 'id', value: node.id },
     { name: 'kind', value: node.kind },
   ];
@@ -1360,7 +1353,7 @@ function buildJoinedProperties(
   incoming: string[],
   outgoing: string[]
 ) {
-  const properties: Array<{ name: string; value: string | string[] }> = [
+  const properties: Array<{ name: string; value: unknown }> = [
     { name: 'id', value: node.id },
     { name: 'kind', value: node.kind },
     { name: 'supportTraces', value: node.supportTraces },
@@ -1472,6 +1465,23 @@ function hasLowJoinedPattern(
     (filters.minMaxScore > 0
       && (score === null || score < filters.minMaxScore))
   );
+}
+
+function singleTraceEdgeOpacity(
+  edge: JoinedProvenanceGraph['edges'][number],
+  scoreSummary: JoinedProvenanceGraph['scoreSummary']
+) {
+  const score = joinedPatternScore(edge);
+  const minScore = scoreSummary?.min;
+  const maxScore = scoreSummary?.max;
+  if (score === null || typeof minScore !== 'number' || typeof maxScore !== 'number') {
+    return 0.6;
+  }
+  const ratio =
+    maxScore <= minScore
+      ? 1
+      : Math.min(Math.max((score - minScore) / (maxScore - minScore), 0), 1);
+  return 0.6 + ratio * 0.4;
 }
 
 function renderJoinedProvenanceGraph(
@@ -1588,6 +1598,7 @@ function renderJoinedProvenanceGraph(
       lowNodeIds.has(edge.source)
       || lowNodeIds.has(edge.target)
       || hasLowJoinedPattern(edge, filters);
+    const anomaly = Boolean(edge.scoreSummary?.isAnomaly);
     edgeCounts.set(edgeKey, count + 1);
 
     return {
@@ -1606,9 +1617,13 @@ function renderJoinedProvenanceGraph(
               : '#94a3b8',
         strokeWidth: joinedEdgeWidth(edge.supportCount, maxEdgeSupport),
         opacity: lowPattern
-          ? 0.2
-          : 0.3 + supportRatio(edge.supportCount, maxEdgeSupport) * 0.38,
-        strokeDasharray: edge.scoreSummary?.isAnomaly ? '6 5' : undefined,
+          ? 0.12
+          : edge.supportCount === 1
+            ? singleTraceEdgeOpacity(edge, graph.scoreSummary)
+            : anomaly
+              ? 1
+              : 0.6,
+        strokeDasharray: anomaly ? '6 5' : undefined,
         curveOffset: count > 0 ? count + 1 : undefined,
         curveDirection: count % 2 === 0 ? 1 : -1,
       },
