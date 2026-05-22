@@ -1,31 +1,41 @@
-import type { GraphMode, ProvenanceGraphMode, Tracing } from "./types";
-
-export type CopilotTool = {
-  name: string;
-  execute: (args: unknown) => unknown | Promise<unknown>;
-};
-
-type CopilotAgentOptions = {
-  endpoint?: string;
-  tools?: CopilotTool[];
-};
+import type {
+  AgentDag,
+  GraphMode,
+  JoinedProvenanceGraph,
+  ProvenanceGraphMode,
+  Tracing,
+} from "./types";
 
 type CopilotRunInput = {
   question: string;
+  chatHistory: CopilotHistoryMessage[];
   selectedTraces: Tracing[];
+  selectedTraceDags: Record<string, AgentDag>;
+  joinedGraph: JoinedProvenanceGraph | null;
   graphMode: GraphMode;
 };
 
+export type CopilotHistoryMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+export type CopilotStreamEvent =
+  | { type: "message_delta"; delta: string }
+  | { type: "thinking_delta"; delta: string }
+  | { type: "tool_call"; id: string; name: string; args?: unknown }
+  | { type: "tool_result"; id: string; name?: string; result?: unknown }
+  | { type: "final"; output?: string }
+  | { type: "error"; message: string };
+
 export class ProvenanceCopilotAgent {
   private readonly endpoint: string;
-  private readonly tools: Map<string, CopilotTool>;
 
-  constructor(options: CopilotAgentOptions = {}) {
-    this.endpoint = options.endpoint ?? "/api/provenance-agent";
-    this.tools = new Map(options.tools?.map((tool) => [tool.name, tool]));
+  constructor(endpoint = "/api/provenance-agent") {
+    this.endpoint = endpoint;
   }
 
-  async run(input: CopilotRunInput, onText: (text: string) => void) {
+  async run(input: CopilotRunInput, onEvent: (event: CopilotStreamEvent) => void) {
     const response = await fetch(this.endpoint, {
       method: "POST",
       headers: {
@@ -33,7 +43,10 @@ export class ProvenanceCopilotAgent {
       },
       body: JSON.stringify({
         question: input.question.trim(),
+        chatHistory: input.chatHistory,
         selectedTraces: input.selectedTraces,
+        selectedTraceDags: input.selectedTraceDags,
+        joinedGraph: input.joinedGraph,
         graphMode: this.getGraphMode(input),
       }),
     });
@@ -46,30 +59,20 @@ export class ProvenanceCopilotAgent {
       throw new Error("Streaming is not available for this response.");
     }
 
-    await this.readTextStream(response.body, onText);
-  }
-
-  async callTool(name: string, args: unknown) {
-    const tool = this.tools.get(name);
-
-    if (!tool) {
-      throw new Error(`Unknown copilot tool: ${name}`);
-    }
-
-    return tool.execute(args);
+    await this.readEventStream(response.body, onEvent);
   }
 
   private getGraphMode(input: CopilotRunInput): ProvenanceGraphMode {
     return input.selectedTraces.length >= 2 ? "comparison" : input.graphMode;
   }
 
-  private async readTextStream(
+  private async readEventStream(
     body: ReadableStream<Uint8Array>,
-    onText: (text: string) => void
+    onEvent: (event: CopilotStreamEvent) => void
   ) {
     const reader = body.getReader();
     const decoder = new TextDecoder();
-    let text = "";
+    let buffer = "";
 
     while (true) {
       const { done, value } = await reader.read();
@@ -78,11 +81,30 @@ export class ProvenanceCopilotAgent {
         break;
       }
 
-      text += decoder.decode(value, { stream: true });
-      onText(text);
+      buffer += decoder.decode(value, { stream: true });
+      buffer = this.readLines(buffer, onEvent);
     }
 
-    text += decoder.decode();
-    onText(text);
+    buffer += decoder.decode();
+    this.readLines(`${buffer}\n`, onEvent);
+  }
+
+  private readLines(buffer: string, onEvent: (event: CopilotStreamEvent) => void) {
+    const lines = buffer.split("\n");
+    const rest = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.trim()) {
+        continue;
+      }
+
+      try {
+        onEvent(JSON.parse(line) as CopilotStreamEvent);
+      } catch {
+        onEvent({ type: "message_delta", delta: line });
+      }
+    }
+
+    return rest;
   }
 }

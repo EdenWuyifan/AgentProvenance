@@ -33,15 +33,37 @@ function renderScalar(value: string | number | boolean | null) {
   return String(value);
 }
 
-function JsonField({
+function parseJsonString(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed || !['{', '['].includes(trimmed[0])) {
+    return value;
+  }
+
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return value;
+  }
+}
+
+export function JsonField({
   name,
   value,
+  depth = 0,
 }: {
   name: string;
   value: unknown;
+  depth?: number;
 }) {
   if (value === undefined) {
     return null;
+  }
+
+  if (typeof value === 'string') {
+    const parsed = parseJsonString(value);
+    if (parsed !== value) {
+      return <JsonField name={name} value={parsed} depth={depth} />;
+    }
   }
 
   if (
@@ -90,13 +112,18 @@ function JsonField({
     }
 
     return (
-      <details className="text-[9px] leading-tight text-zinc-700">
+      <details className="text-[9px] leading-tight text-zinc-700" open={depth === 0 ? true : undefined}>
         <summary className="nodrag nopan cursor-pointer text-zinc-700">
           <span className="text-zinc-500">{name}:</span> [{value.length}]
         </summary>
-        <div className="mt-1 space-y-1 pl-2">
+        <div className="mt-1 space-y-1 border-l border-zinc-100 pl-2">
           {value.map((item, index) => (
-            <JsonField key={`${name}:${index}`} name={String(index)} value={item} />
+            <JsonField
+              key={`${name}:${index}`}
+              name={String(index)}
+              value={item}
+              depth={depth + 1}
+            />
           ))}
         </div>
       </details>
@@ -115,13 +142,18 @@ function JsonField({
     }
 
     return (
-      <details className="text-[9px] leading-tight text-zinc-700">
+      <details className="text-[9px] leading-tight text-zinc-700" open={depth === 0 ? true : undefined}>
         <summary className="nodrag nopan cursor-pointer text-zinc-700">
           <span className="text-zinc-500">{name}:</span> {'{'}{entries.length} fields{'}'}
         </summary>
-        <div className="mt-1 space-y-1 pl-2">
+        <div className="mt-1 space-y-1 border-l border-zinc-100 pl-2">
           {entries.map(([key, item]) => (
-            <JsonField key={`${name}:${key}`} name={key} value={item} />
+            <JsonField
+              key={`${name}:${key}`}
+              name={key}
+              value={item}
+              depth={depth + 1}
+            />
           ))}
         </div>
       </details>

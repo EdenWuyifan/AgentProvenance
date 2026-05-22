@@ -14,6 +14,17 @@ TYPE_KEYS = ("null", "boolean", "number", "string", "array", "object")
 TOOL_CALL_KEYS = ("toolCalls", "tool_calls", "calls", "steps")
 ERROR_KEYS = {"error", "errors", "exception", "traceback", "stack"}
 THRESHOLD_KEYS = {"threshold", "cutoff", "limit", "min", "max", "top_k", "topk"}
+STOP_TOKENS = {
+    "columns",
+    "conditions",
+    "entities",
+    "output",
+    "response",
+    "rows",
+    "status",
+    "storage",
+    "value",
+}
 
 
 def build_joined_provenance_graph(
@@ -407,6 +418,11 @@ def build_capsule(
         "rootSet": root_set,
         "inputParamShapeSignature": input_signature(args, input_entities, nodes),
         "outputParamShapeSignature": output_signature(output, output_entities, nodes),
+        "candidateEvidenceSignature": candidate_evidence_signature(
+            args,
+            output,
+            [node_id, *input_entities, *output_entities],
+        ),
         "graphContextSignature": graph_context_signature(
             node_id,
             incoming,
@@ -524,6 +540,18 @@ def root_pattern_signature(
         "rootCountBucket": count_bucket(len(root_set)),
         "isMultiRoot": len(root_set) > 1,
         "rootKindPattern": sorted(root_kinds.values()) or ["unknown"],
+    }
+
+
+def candidate_evidence_signature(
+    args: Any,
+    output: Any,
+    ids: list[str],
+) -> dict[str, Any]:
+    return {
+        "argKeywords": sorted(value_tokens(args))[:24],
+        "outputKeywords": sorted(value_tokens(output))[:24],
+        "ids": sorted(value_tokens(ids))[:24],
     }
 
 
@@ -807,6 +835,23 @@ def value_type(value: Any) -> str:
     return "string"
 
 
+def value_tokens(value: Any, depth: int = 0) -> set[str]:
+    if value is None or isinstance(value, (bool, int, float)) or depth > 3:
+        return set()
+    if isinstance(value, str):
+        return tokens(value[:2000])
+    if isinstance(value, list):
+        return set().union(*(value_tokens(item, depth + 1) for item in value[:16]))
+    if isinstance(value, dict):
+        key_tokens = set().union(*(tokens(str(key)) for key in list(value)[:24]))
+        value_token_sets = [
+            value_tokens(item, depth + 1)
+            for item in list(value.values())[:24]
+        ]
+        return key_tokens | set().union(*value_token_sets)
+    return tokens(str(value))
+
+
 def cluster_capsules(capsules: list[dict[str, Any]], threshold: float) -> list[list[dict[str, Any]]]:
     if not capsules:
         return []
@@ -903,26 +948,31 @@ def cluster_sort_key(cluster: list[dict[str, Any]]) -> tuple[float, str]:
 
 def similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
     score = (
-        0.15 * token_similarity(a["tool"], b["tool"])
-        + 0.30
+        0.14 * token_similarity(a["tool"], b["tool"])
+        + 0.29
         * side_signature_similarity(
             a["inputParamShapeSignature"],
             b["inputParamShapeSignature"],
         )
-        + 0.30
+        + 0.29
         * side_signature_similarity(
             a["outputParamShapeSignature"],
             b["outputParamShapeSignature"],
         )
-        + 0.15
+        + 0.14
         * graph_context_similarity(
             a["graphContextSignature"],
             b["graphContextSignature"],
         )
-        + 0.10
+        + 0.09
         * root_pattern_similarity(
             a["rootPatternSignature"],
             b["rootPatternSignature"],
+        )
+        + 0.05
+        * candidate_evidence_similarity(
+            a["candidateEvidenceSignature"],
+            b["candidateEvidenceSignature"],
         )
     )
     return round(score, 4)
@@ -936,7 +986,7 @@ def tokens(value: str) -> set[str]:
     return {
         token
         for token in re.findall(r"[A-Za-z0-9]+", value.lower())
-        if len(token) > 1
+        if len(token) > 1 and token not in STOP_TOKENS
     }
 
 
@@ -974,6 +1024,14 @@ def root_pattern_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
         + (1 if a["isMultiRoot"] == b["isMultiRoot"] else 0)
         + jaccard(set(a["rootKindPattern"]), set(b["rootKindPattern"]))
     ) / 3
+
+
+def candidate_evidence_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
+    return (
+        0.45 * jaccard(set(a["argKeywords"]), set(b["argKeywords"]))
+        + 0.45 * jaccard(set(a["outputKeywords"]), set(b["outputKeywords"]))
+        + 0.10 * jaccard(set(a["ids"]), set(b["ids"]))
+    )
 
 
 def count_similarity(a: int, b: int) -> float:
@@ -1108,6 +1166,7 @@ def member_record(capsule: dict[str, Any]) -> dict[str, Any]:
         "signatures": {
             "inputParamShapeSignature": capsule["inputParamShapeSignature"],
             "outputParamShapeSignature": capsule["outputParamShapeSignature"],
+            "candidateEvidenceSignature": capsule["candidateEvidenceSignature"],
             "graphContextSignature": capsule["graphContextSignature"],
             "rootPatternSignature": capsule["rootPatternSignature"],
         },
@@ -1122,6 +1181,9 @@ def representative_signature(cluster: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "outputParamShapeSignature": common_side_signature(
             capsule["outputParamShapeSignature"] for capsule in cluster
+        ),
+        "candidateEvidenceSignature": common_candidate_evidence_signature(
+            capsule["candidateEvidenceSignature"] for capsule in cluster
         ),
         "graphContextSignature": {
             "depthBuckets": top_counts(
@@ -1140,6 +1202,15 @@ def representative_signature(cluster: list[dict[str, Any]]) -> dict[str, Any]:
                 for kind in capsule["rootPatternSignature"]["rootKindPattern"]
             ),
         },
+    }
+
+
+def common_candidate_evidence_signature(signatures: Any) -> dict[str, Any]:
+    items = list(signatures)
+    return {
+        "argKeywords": top_counts(keyword for item in items for keyword in item["argKeywords"]),
+        "outputKeywords": top_counts(keyword for item in items for keyword in item["outputKeywords"]),
+        "ids": top_counts(identifier for item in items for identifier in item["ids"]),
     }
 
 

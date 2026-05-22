@@ -7,19 +7,21 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse
+from portkey_ai import AsyncPortkey
 
+from copilot import provenance_agent_response
 from joined_provenance import build_joined_provenance_graph
 
 ROOT = Path(__file__).resolve().parents[1]
 REACT_DIR = ROOT / "agent_provenance_react"
 CACHE_DIR = REACT_DIR / ".cache"
 GRAPH_CACHE_DIR = CACHE_DIR / "generated-prov-graphs"
+TOOL_SET_CACHE_DIR = CACHE_DIR / "generated-tool-sets"
 
 DEFAULT_BASE_URL = "https://ai-gateway.apps.cloud.rt.nyu.edu/v1/"
-DEFAULT_MODEL = "@vertexai/gemini-3-pro-preview"
+DEFAULT_MODEL = "@vertexai/gemini-3.1-flash-lite-preview"
 MAX_SEMANTIC_EDGE_CANDIDATES = 2
 TOKEN_CHAMFER_THRESHOLD = 0.2
 MAX_LABEL_LENGTH = 96
@@ -466,8 +468,8 @@ optionalSemanticCandidateEdges:
 {json.dumps(semantic_candidates, indent=2)}"""
 
 
-def response_text(payload: dict[str, Any]) -> str:
-    content = (payload.get("choices") or [{}])[0].get("message", {}).get("content", "")
+def completion_text(response: Any) -> str:
+    content = response.choices[0].message.content if response.choices else ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -559,19 +561,20 @@ def parse_llm_graph_patch(text: str) -> dict[str, Any]:
     return {"edits": edits}
 
 
-def chat_config() -> tuple[str, str, str, dict[str, str]]:
+def portkey_client() -> tuple[AsyncPortkey, str]:
     api_key = os.getenv("PORTKEY_API_KEY")
     if not api_key:
         raise RuntimeError("Missing PORTKEY_API_KEY.")
 
-    base_url = (os.getenv("PORTKEY_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-    model = os.getenv("PORTKEY_MODEL") or DEFAULT_MODEL
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-        "x-portkey-api-key": api_key,
-    }
-    return base_url, model, f"{base_url}/chat/completions", headers
+    return (
+        AsyncPortkey(
+            api_key=api_key,
+            base_url=(os.getenv("PORTKEY_BASE_URL") or DEFAULT_BASE_URL).rstrip("/"),
+            provider=os.getenv("PORTKEY_PROVIDER"),
+            strict_open_ai_compliance=False,
+        ),
+        os.getenv("PORTKEY_MODEL") or DEFAULT_MODEL,
+    )
 
 
 async def refine_graph(
@@ -579,32 +582,102 @@ async def refine_graph(
     semantic_candidates: list[dict[str, Any]],
 ) -> dict[str, Any]:
     try:
-        _, model, url, headers = chat_config()
+        client, model = portkey_client()
     except RuntimeError:
         return {"edits": []}
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                url,
-                headers=headers,
-                json={
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt(draft_graph, semantic_candidates),
-                        }
-                    ],
-                },
-            )
-    except httpx.HTTPError:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt(draft_graph, semantic_candidates),
+                }
+            ],
+        )
+        print(f"[graph-refine] LLM raw response:\n{response.model_dump_json(indent=2)}", flush=True)
+    except Exception as error:
+        print(f"[graph-refine] LLM request failed: {type(error).__name__}: {error}", flush=True)
         return {"edits": []}
+    finally:
+        await client.close()
 
-    if response.is_error:
-        return {"edits": []}
+    return parse_llm_graph_patch(completion_text(response))
 
-    return parse_llm_graph_patch(response_text(response.json()))
+
+def tool_sets_prompt(tool_names: list[str]) -> str:
+    return f"""Group these exact tool names into semantic visualization sets.
+
+Return JSON only, with group names as keys and arrays of exact tool names as values.
+Every tool name must appear exactly once. Do not invent tool names.
+
+toolNames:
+{json.dumps(tool_names, indent=2)}"""
+
+
+def parse_tool_sets(text: str, tool_names: list[str]) -> dict[str, list[str]]:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end < start:
+        return {}
+
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return {}
+
+    allowed = set(tool_names)
+    used: set[str] = set()
+    tool_sets: dict[str, list[str]] = {}
+
+    for group_name, tools in parsed.items():
+        if not isinstance(group_name, str) or not isinstance(tools, list):
+            continue
+        items = [tool for tool in tools if tool in allowed and tool not in used]
+        if items:
+            tool_sets[group_name] = items
+            used.update(items)
+
+    missing = [tool for tool in tool_names if tool not in used]
+    if missing and tool_sets:
+        tool_sets["other tools"] = missing
+
+    return tool_sets
+
+
+async def generate_tool_sets(tool_names: list[str]) -> dict[str, list[str]]:
+    try:
+        client, model = portkey_client()
+    except RuntimeError as error:
+        print(f"[tool-sets] config error: {error}", flush=True)
+        return {}
+
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": tool_sets_prompt(tool_names),
+                }
+            ],
+        )
+    except Exception as error:
+        print(f"[tool-sets] LLM request failed: {type(error).__name__}: {error}", flush=True)
+        return {}
+    finally:
+        await client.close()
+
+    print(f"[tool-sets] LLM raw response:\n{response.model_dump_json(indent=2)}", flush=True)
+    text = completion_text(response)
+    print(f"[tool-sets] LLM message content:\n{text}", flush=True)
+
+    generated = parse_tool_sets(text, tool_names)
+    if not generated:
+        print("[tool-sets] parsed no valid tool-set groups", flush=True)
+
+    return generated
 
 
 def patch_node(node: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -674,169 +747,6 @@ def apply_graph_patch(
     }
 
 
-def graph_mode(value: Any) -> str:
-    return value if value in {"collapsed", "tree", "comparison"} else "tree"
-
-
-def trace_score(score: Any) -> float | None:
-    return round(score, 3) if isinstance(score, (int, float)) else None
-
-
-def tool_sequence(trace: dict[str, Any]) -> list[str]:
-    return [tool.get("name", "") for tool in trace.get("toolCalls", [])]
-
-
-def shared_tools(traces: list[dict[str, Any]]) -> list[str]:
-    if not traces:
-        return []
-    shared = set(tool_sequence(traces[0]))
-    for trace in traces[1:]:
-        shared &= set(tool_sequence(trace))
-    return sorted(shared)
-
-
-def trace_metadata(trace: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in trace.items()
-        if key not in {"id", "score", "toolCalls"}
-        and value is not None
-        and not isinstance(value, (dict, list))
-    }
-
-
-def summarize_trace(trace: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": trace.get("id"),
-        "score": trace_score(trace.get("score")),
-        "metadata": trace_metadata(trace),
-        "toolSequence": tool_sequence(trace),
-        "toolCalls": [
-            {
-                "step": index + 1,
-                "id": tool_call.get("id"),
-                "name": tool_call.get("name"),
-                "args": sanitize_value(tool_call.get("args")),
-                "status": tool_call.get("status"),
-                "response": sanitize_value(tool_call.get("response")),
-            }
-            for index, tool_call in enumerate(trace.get("toolCalls", []))
-            if isinstance(tool_call, dict)
-        ],
-    }
-
-
-def score_summary(traces: list[dict[str, Any]]) -> dict[str, float] | None:
-    scores = [trace["score"] for trace in traces if isinstance(trace.get("score"), (int, float))]
-    if not scores:
-        return None
-    return {
-        "min": round(min(scores), 3),
-        "max": round(max(scores), 3),
-        "average": round(sum(scores) / len(scores), 3),
-    }
-
-
-def tool_frequency(traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    counts: dict[str, int] = {}
-    for trace in traces:
-        for name in tool_sequence(trace):
-            counts[name] = counts.get(name, 0) + 1
-    return [
-        {"name": name, "count": count}
-        for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-    ]
-
-
-def build_messages(question: str, traces: list[dict[str, Any]], mode: str) -> list[dict[str, str]]:
-    context = {
-        "graphView": mode,
-        "selectedTraceIds": [trace.get("id") for trace in traces],
-        "selectedTraceCount": len(traces),
-        "sharedTools": shared_tools(traces),
-        "scoreSummary": score_summary(traces),
-        "toolFrequency": tool_frequency(traces),
-        "traces": [summarize_trace(trace) for trace in traces],
-    }
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are a concise assistant for AgentProvenance. "
-                "Answer only from the provided provenance graph context. "
-                "Focus on selected traces, ordered tool calls, tool responses, parameters, scores, similarities, differences, and likely implications. "
-                "If the context is insufficient, say that plainly."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Current provenance graph context:\n"
-                f"{json.dumps(context, indent=2)}\n\n"
-                f"User question:\n{question}"
-            ),
-        },
-    ]
-
-
-def extract_stream_text(payload: dict[str, Any]) -> str:
-    delta = (payload.get("choices") or [{}])[0].get("delta", {})
-    content = delta.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-    blocks = delta.get("model_extra", {}).get("content_blocks", [])
-    return "".join(block.get("text", "") for block in blocks if isinstance(block, dict))
-
-
-async def stream_chat_response(messages: list[dict[str, str]]):
-    try:
-        _, model, url, headers = chat_config()
-    except RuntimeError as error:
-        return PlainTextResponse(str(error), status_code=500)
-
-    client = httpx.AsyncClient(timeout=None)
-    stream = client.stream("POST", url, headers=headers, json={"model": model, "stream": True, "messages": messages})
-
-    try:
-        response = await stream.__aenter__()
-    except Exception as error:
-        await client.aclose()
-        return PlainTextResponse(str(error), status_code=500)
-
-    if response.is_error:
-        text = await response.aread()
-        await stream.__aexit__(None, None, None)
-        await client.aclose()
-        return PlainTextResponse(text.decode() or "Model request failed.", status_code=500)
-
-    async def body():
-        try:
-            async for line in response.aiter_lines():
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    break
-                payload = json.loads(data)
-                if payload.get("error", {}).get("message"):
-                    raise RuntimeError(payload["error"]["message"])
-                text = extract_stream_text(payload)
-                if text:
-                    yield text
-        finally:
-            await stream.__aexit__(None, None, None)
-            await client.aclose()
-
-    return StreamingResponse(
-        body(),
-        media_type="text/plain; charset=utf-8",
-        headers={"Cache-Control": "no-cache, no-transform"},
-    )
-
-
 @app.get("/health")
 def health() -> dict[str, bool]:
     return {"ok": True}
@@ -885,17 +795,36 @@ async def joined_provenance_graph(request: Request):
     }
 
 
+@app.post("/api/tool-sets")
+async def tool_sets(request: Request):
+    body = await request.json()
+    tool_names = sorted({
+        item
+        for item in body.get("toolNames", [])
+        if isinstance(item, str) and item.strip()
+    })
+    cache_key = body.get("cacheKey") if isinstance(body.get("cacheKey"), str) else ""
+
+    if not tool_names:
+        return {"toolSets": {}, "cached": False}
+
+    if not re.fullmatch(r"[a-f0-9]{64}", cache_key):
+        cache_key = sha256(json.dumps(tool_names, sort_keys=True).encode()).hexdigest()
+
+    cache_path = TOOL_SET_CACHE_DIR / f"{cache_key}.json"
+    if cache_path.exists():
+        return {"toolSets": json.loads(cache_path.read_text()), "cached": True}
+
+    generated = await generate_tool_sets(tool_names)
+    if not generated:
+        return PlainTextResponse("Unable to generate tool sets.", status_code=502)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(generated, indent=2))
+
+    return {"toolSets": generated, "cached": False}
+
+
 @app.post("/api/provenance-agent")
 async def provenance_agent(request: Request):
-    body = await request.json()
-    question = body.get("question").strip() if isinstance(body.get("question"), str) else ""
-
-    if not question:
-        return PlainTextResponse("Question is required.", status_code=400)
-
-    selected_traces = (
-        body.get("selectedTraces") if isinstance(body.get("selectedTraces"), list) else []
-    )
-    messages = build_messages(question, selected_traces, graph_mode(body.get("graphMode")))
-
-    return await stream_chat_response(messages)
+    return await provenance_agent_response(await request.json(), portkey_client)

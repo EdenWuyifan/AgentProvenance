@@ -17,37 +17,6 @@ const GLYPH_TYPES = [
 const GROUP_COLORS = d3.schemeTableau10;
 const UNKNOWN_GROUP_COLOR = "#52525b";
 
-export const DEFAULT_TOOL_SETS = {
-  "data tools": [
-    "csv_aggregate",
-    "csv_filter",
-    "csv_join",
-    "csv_read",
-    "csv_record",
-    "csv_select",
-  ],
-  "analysis tools": [
-    "run_deseq2_gsea_pipe",
-    "run_deseq2_ora_pipe",
-    "gsea_pipe",
-    "ora_pipe",
-  ],
-  "rag tools": [
-    "enrich_rumma",
-    "gene_info",
-    "literature_trends",
-    "prioritize_genes",
-    "query_genes",
-    "query_string_rumma",
-    "query_table_rumma",
-    "sets_info_rumm",
-  ],
-};
-
-function resolveToolSets(toolSets = DEFAULT_TOOL_SETS) {
-  return Object.keys(toolSets).length > 0 ? toolSets : DEFAULT_TOOL_SETS;
-}
-
 function parseJsonLines(text) {
   return text
     .split(/\r?\n/)
@@ -77,8 +46,12 @@ export function parseTracingPayload(text) {
   }
 }
 
-export function getTracingScore(tracing) {
-  const rawScore = tracing?.score;
+export function getTracingScore(tracing, scoreKey = "score") {
+  const rawScore = tracing?.[scoreKey];
+  if (typeof rawScore === "boolean") {
+    return rawScore ? 1 : 0;
+  }
+
   if (rawScore === null || rawScore === undefined || rawScore === "") {
     return 0;
   }
@@ -187,12 +160,11 @@ export function extractToolCallRecords(tracing) {
 }
 
 export function createGlyphSystem(toolSets = {}) {
-  const resolvedToolSets = resolveToolSets(toolSets);
   const toolToGroup = new Map();
-  const groupNames = Object.keys(resolvedToolSets).sort();
+  const groupNames = Object.keys(toolSets).sort();
 
   groupNames.forEach((groupName) => {
-    const tools = resolvedToolSets[groupName] || [];
+    const tools = toolSets[groupName] || [];
     tools.forEach((toolName) => {
       toolToGroup.set(toolName, groupName);
     });

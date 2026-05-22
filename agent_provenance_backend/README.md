@@ -47,6 +47,8 @@ PORTKEY_MODEL=...
 - `POST /api/prov-graph`: builds or returns a cached PROV DAG for one trace.
 - `POST /api/joined-provenance-graph`: joins multiple trace DAGs into shared
   activity clusters, root nodes, support summaries, and motifs.
+- `POST /api/tool-sets`: generates and caches semantic tool groups for one
+  trace file hash.
 - `POST /api/provenance-agent`: streams chat answers for selected traces.
 
 ## PROV Graph Rules
