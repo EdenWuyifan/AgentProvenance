@@ -200,3 +200,9 @@ scripts/
 # tmp
 tmp*
 *tmp
+
+mid_result/
+*.db
+**/.claude/
+**/.codex/
+**/*.jsonl
