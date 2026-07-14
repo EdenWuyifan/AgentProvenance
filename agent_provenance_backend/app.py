@@ -21,7 +21,7 @@ GRAPH_CACHE_DIR = CACHE_DIR / "generated-prov-graphs"
 TOOL_SET_CACHE_DIR = CACHE_DIR / "generated-tool-sets"
 
 DEFAULT_BASE_URL = "https://ai-gateway.apps.cloud.rt.nyu.edu/v1/"
-DEFAULT_MODEL = "@vertexai/gemini-3.1-flash-lite-preview"
+DEFAULT_MODEL = "@vertexai/gemini-3.1-flash-lite"
 MAX_SEMANTIC_EDGE_CANDIDATES = 2
 TOKEN_CHAMFER_THRESHOLD = 0.2
 MAX_LABEL_LENGTH = 96

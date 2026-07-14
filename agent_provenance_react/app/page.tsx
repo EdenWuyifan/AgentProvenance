@@ -975,7 +975,7 @@ export default function Home() {
                   .join(", ")}.`
               : selectedTracing
                 ? `Run #${selectedTracing.id}`
-                : "Select up to 3 runs from the plot."
+                : "Select runs from the plot."
           }
           actions={
             selectedTracings.length === 1 ? (
@@ -999,7 +999,7 @@ export default function Home() {
             <StatusMessage message="No traces available." />
           )}
           {!loading && !error && data.length > 0 && selectedTracings.length === 0 && (
-            <StatusMessage message="Select up to 3 traces in the matrix to render a provenance graph or comparison." />
+            <StatusMessage message="Select traces in the matrix to render a provenance graph, or two or more to build a joined comparison." />
           )}
           {!loading && !error && selectedTracings.length === 1 && selectedTracing && (
             bottomGraphView === "agent" && agentDagReady ? (
