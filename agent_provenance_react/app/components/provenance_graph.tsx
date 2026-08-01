@@ -72,11 +72,11 @@ type JoinedFilters = {
   minMaxScore: number;
 };
 
-const COLLAPSED_LAYOUT = { x: 0, y: 0, gapY: 50 };
-const TREE_LAYOUT = { x: 0, y: 0, gapX: 176, gapY: 112 };
+const COLLAPSED_LAYOUT = { x: 0, y: 0, gapY: 76 };
+const TREE_LAYOUT = { x: 0, y: 0, gapX: 208, gapY: 138 };
 const COMPARE_LAYOUT = { x: 0, y: 0, gapX: 176, gapY: 112 };
-const AGENT_DAG_LAYOUT = { x: 0, y: 0, gapX: 248, gapY: 128 };
-const JOINED_LAYOUT = { x: 0, y: 0, gapX: 230, gapY: 112 };
+const AGENT_DAG_LAYOUT = { x: 0, y: 0, gapX: 254, gapY: 158 };
+const JOINED_LAYOUT = { x: 0, y: 0, gapX: 244, gapY: 134 };
 const EDGE_LAYOUT = {
   curveGap: 28,
   markerEnd: { type: MarkerType.Arrow, width: 24, height: 24 },
@@ -99,6 +99,14 @@ const TRACE_C_COLORS = {
 type TraceColor = typeof TRACE_A_COLORS;
 const COMPARISON_TRACE_COLORS: TraceColor[] = [TRACE_A_COLORS, TRACE_B_COLORS, TRACE_C_COLORS];
 const DEFAULT_GLYPH_SYSTEM = createGlyphSystem();
+
+// Figure mode: widens layout gaps so the larger .figure-mode node styles
+// (globals.css) do not overlap. Set per render by the exported views.
+let LAYOUT_SCALE = 1;
+
+function scaled(value: number) {
+  return Math.round(value * LAYOUT_SCALE);
+}
 
 const nodeTypes = { tool: ToolNode };
 const edgeTypes = { repeat: RepeatEdge, sequential: SequentialEdge };
@@ -194,7 +202,9 @@ function ToolNode({
               <ToolGlyph glyph={data.glyph} />
             </span>
           ) : null}
-          <span className="provenance-node__label">{data.label}</span>
+          <span className="provenance-node__label">
+            {String(data.label).replace(/_/g, '_\u200b')}
+          </span>
         </span>
       </div>
       <Handle type="source" position={sourcePosition} />
@@ -518,7 +528,7 @@ function renderCollapsedGraph(
       type: 'tool',
       position: {
         x: COLLAPSED_LAYOUT.x,
-        y: COLLAPSED_LAYOUT.y + nodes.length * COLLAPSED_LAYOUT.gapY,
+        y: COLLAPSED_LAYOUT.y + nodes.length * scaled(COLLAPSED_LAYOUT.gapY),
       },
       sourcePosition: Position.Bottom,
       targetPosition: Position.Top,
@@ -638,8 +648,8 @@ function renderTreeGraph(
       const column = nextColumn;
       nextColumn += 1;
       positions.set(name, {
-        x: TREE_LAYOUT.x + column * TREE_LAYOUT.gapX,
-        y: TREE_LAYOUT.y + depth * TREE_LAYOUT.gapY,
+        x: TREE_LAYOUT.x + column * scaled(TREE_LAYOUT.gapX),
+        y: TREE_LAYOUT.y + depth * scaled(TREE_LAYOUT.gapY),
         depth,
       });
       return column;
@@ -654,8 +664,8 @@ function renderTreeGraph(
 
     const column = (firstColumn + lastColumn) / 2;
     positions.set(name, {
-      x: TREE_LAYOUT.x + column * TREE_LAYOUT.gapX,
-      y: TREE_LAYOUT.y + depth * TREE_LAYOUT.gapY,
+      x: TREE_LAYOUT.x + column * scaled(TREE_LAYOUT.gapX),
+      y: TREE_LAYOUT.y + depth * scaled(TREE_LAYOUT.gapY),
       depth,
     });
     return column;
@@ -1268,8 +1278,8 @@ function renderAgentDagGraph(
       className:
         node.kind === 'Entity' ? 'prov-node--entity' : 'prov-node--activity',
       position: {
-        x: AGENT_DAG_LAYOUT.x + level * AGENT_DAG_LAYOUT.gapX,
-        y: AGENT_DAG_LAYOUT.y + row * AGENT_DAG_LAYOUT.gapY,
+        x: AGENT_DAG_LAYOUT.x + level * scaled(AGENT_DAG_LAYOUT.gapX),
+        y: AGENT_DAG_LAYOUT.y + row * scaled(AGENT_DAG_LAYOUT.gapY),
       },
       sourcePosition: Position.Right,
       targetPosition: Position.Left,
@@ -1397,7 +1407,7 @@ function supportRatio(count: number, maxCount: number) {
 
 function joinedNodeSize(count: number, maxCount: number) {
   const ratio = supportRatio(count, maxCount);
-  return Math.round(72 + ratio * 48);
+  return Math.round((104 + ratio * 56) * LAYOUT_SCALE);
 }
 
 function joinedEdgeWidth(count: number, maxCount: number) {
@@ -1517,6 +1527,12 @@ function renderJoinedProvenanceGraph(
   const outgoingByNode = new Map<string, string[]>();
   const maxNodeSupport = Math.max(...graphNodes.map((node) => node.supportCount), 1);
   const maxEdgeSupport = Math.max(...graphEdges.map((edge) => edge.supportCount), 1);
+  // The largest support-scaled nodes can outgrow the row gap, so keep rows
+  // at least one max-size node (plus breathing room) apart.
+  const rowGapY = Math.max(
+    scaled(JOINED_LAYOUT.gapY),
+    joinedNodeSize(maxNodeSupport, maxNodeSupport) + 16,
+  );
 
   graphEdges.forEach((edge) => {
     incomingByNode.set(edge.target, [
@@ -1545,8 +1561,8 @@ function renderJoinedProvenanceGraph(
       className:
         node.kind === 'Root' ? 'prov-node--root' : 'prov-node--activity',
       position: {
-        x: JOINED_LAYOUT.x + level * JOINED_LAYOUT.gapX,
-        y: JOINED_LAYOUT.y + row * JOINED_LAYOUT.gapY,
+        x: JOINED_LAYOUT.x + level * scaled(JOINED_LAYOUT.gapX),
+        y: JOINED_LAYOUT.y + row * rowGapY,
       },
       sourcePosition: Position.Right,
       targetPosition: Position.Left,
@@ -1789,11 +1805,14 @@ function ProvenanceGraphView({
   tracing,
   mode,
   toolSets = {},
+  figureScale = 1,
 }: {
   tracing: Tracing;
   mode: GraphMode;
   toolSets?: ToolSets;
+  figureScale?: number;
 }) {
+  LAYOUT_SCALE = figureScale;
   const graph = renderProvenanceGraph(tracing, mode, createGlyphSystem(toolSets));
   return (
     <FlowGraph
@@ -1826,10 +1845,13 @@ function TracingComparisonView({
 function AgentDagGraphView({
   dag,
   toolSets = {},
+  figureScale = 1,
 }: {
   dag: AgentDag;
   toolSets?: ToolSets;
+  figureScale?: number;
 }) {
+  LAYOUT_SCALE = figureScale;
   return (
     <FlowGraph
       graph={renderAgentDagGraph(dag, createGlyphSystem(toolSets))}
@@ -1844,11 +1866,14 @@ function JoinedProvenanceGraphView({
   graph,
   traceIds,
   toolSets = {},
+  figureScale = 1,
 }: {
   graph: JoinedProvenanceGraph;
   traceIds: Array<string | number>;
   toolSets?: ToolSets;
+  figureScale?: number;
 }) {
+  LAYOUT_SCALE = figureScale;
   const [filterMode, setFilterMode] = useState<JoinedFilterMode>('fade');
   const [minSupport, setMinSupport] = useState(1);
   const [minMaxScore, setMinMaxScore] = useState(0);

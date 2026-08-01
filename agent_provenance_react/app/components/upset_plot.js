@@ -13,6 +13,12 @@ const BAR_FILL = "#111827";
 const BAR_HIGHLIGHT_FILL = "#38bdf8";
 const GROUP_GAP_ROWS = 1;
 
+let FONT_SCALE = 1;
+
+function scaledFont(px) {
+    return `${Math.round(px * FONT_SCALE)}px`;
+}
+
 function buildToolCoverageData(tools, tracingToolCalls) {
     return tools.map((tool) => {
         let usageCount = 0;
@@ -439,7 +445,7 @@ function renderToolCoverageBars({
         .call(yAxis);
     yAxisGroup.select(".domain").attr("stroke", "#bababa");
     yAxisGroup.selectAll("line").attr("stroke", "#bababa");
-    yAxisGroup.selectAll("text").attr("fill", "#4b5563").style("font-size", "9px");
+    yAxisGroup.selectAll("text").attr("fill", "#4b5563").style("font-size", scaledFont(12));
 
     const toolNameGroup = barsGroup
         .append("g")
@@ -459,7 +465,7 @@ function renderToolCoverageBars({
     toolLabels.each(function (d) {
         const labelGroup = d3.select(this);
         const glyphType = glyphSystem.getGlyph(d.toolName);
-        renderGlyph(labelGroup, glyphType, 0, -10, "#111827", 4);
+        renderGlyph(labelGroup, glyphType, 0, -10, "#111827", 5.5 * FONT_SCALE);
     });
 
     const toolTexts = toolLabels
@@ -468,7 +474,7 @@ function renderToolCoverageBars({
         .attr("y", -10)
         .attr("text-anchor", "start")
         .attr("fill", "#4b5563")
-        .style("font-size", "10px")
+        .style("font-size", scaledFont(13))
         .attr("transform", () => `rotate(-60, 0, -12)`)
         .text((d) => d.toolName);
 
@@ -620,7 +626,7 @@ function renderTraceGroupBreaks({
         .attr("dy", "0.35em")
         .attr("text-anchor", "end")
         .attr("fill", "#71717a")
-        .style("font-size", "10px")
+        .style("font-size", scaledFont(12))
         .selectAll("tspan")
         .data((item) => [
             { item, text: item.collapsed ? "[+]" : "[-]", action: "toggle" },
@@ -767,14 +773,14 @@ function renderCoverageGrid({
                         .attr("transform", `translate(0,${yCenter})`)
                         .style("cursor", "pointer");
 
-                    renderGlyph(cellGroup, glyphType, 0, 0, "#111827", 5);
+                    renderGlyph(cellGroup, glyphType, 0, 0, "#111827", 6.5 * FONT_SCALE);
 
                     if (callsForTool.length > 1) {
                         cellGroup
                             .append("circle")
-                            .attr("cx", 8)
-                            .attr("cy", -8)
-                            .attr("r", 7)
+                            .attr("cx", Math.round(10 * FONT_SCALE))
+                            .attr("cy", Math.round(-10 * FONT_SCALE))
+                            .attr("r", Math.round(9 * FONT_SCALE))
                             .attr("fill", "#0ea5e9")
                             .attr("stroke", "#f8fafc")
                             .attr("stroke-width", 1.5)
@@ -782,12 +788,12 @@ function renderCoverageGrid({
 
                         cellGroup
                             .append("text")
-                            .attr("x", 8)
-                            .attr("y", -8)
+                            .attr("x", Math.round(10 * FONT_SCALE))
+                            .attr("y", Math.round(-10 * FONT_SCALE))
                             .attr("dy", "0.35em")
                             .attr("text-anchor", "middle")
                             .attr("fill", "#ffffff")
-                            .style("font-size", "8px")
+                            .style("font-size", scaledFont(10))
                             .style("font-weight", "700")
                             .style("pointer-events", "none")
                             .text(callsForTool.length);
@@ -972,14 +978,14 @@ function renderScoreRail({
     scoreAxisGroup
         .selectAll("text")
         .attr("fill", "#4b5563")
-        .style("font-size", "9px");
+        .style("font-size", scaledFont(12));
 
     scoreGroup
         .append("text")
         .attr("x", scoreWidth / 2)
-        .attr("y", matrixTop - 24)
+        .attr("y", matrixTop - Math.round(24 * FONT_SCALE))
         .attr("fill", "#4b5563")
-        .attr("font-size", 11)
+        .attr("font-size", Math.round(14 * FONT_SCALE))
         .attr("text-anchor", "middle")
         .text(`Score: ${shortenText(scoreLabel, 18)}`);
 
@@ -1010,7 +1016,7 @@ function renderScoreRail({
         .attr("dy", "0.35em")
         .attr("fill", scoreLabelBaseColor)
         .attr("text-anchor", (d) => scoreX(d.score ?? 0) >= zeroX ? "start" : "end")
-        .style("font-size", "10px")
+        .style("font-size", scaledFont(12))
         .text((d) => formatScore(d.score));
 
     const setRowHighlight = (tracingId) => {
@@ -1065,6 +1071,7 @@ function createScoreScale(data, scoreWidth) {
 
 
 export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
+    FONT_SCALE = options.fontScale ?? 1;
     if (!container) return;
 
     const tracings = prepareTracings(data);
@@ -1093,14 +1100,17 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
 
     const width = options.width ?? Math.max(container.clientWidth || 0, 640);
     const margin = {
-        top: 80,
-        right: 24,
+        // Rotated tool names need headroom for the large label font.
+        top: Math.round(118 * FONT_SCALE),
+        // Room for the last rotated tool labels at the right edge.
+        right: Math.round(72 * FONT_SCALE),
         bottom: 40,
-        left: 80,
+        // Wider left rail so the large trace labels do not clip.
+        left: Math.round(100 * FONT_SCALE),
         ...(options.margin || {}),
     };
 
-    const minRowHeight = 20;
+    const minRowHeight = Math.round(27 * FONT_SCALE);
     const topBarHeightFixed = 200;
     const numTracings = orderedTracings.domain.length;
     const matrixHeightRequired = Math.max(
@@ -1298,7 +1308,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
             .attr("font-weight", (d) =>
                 options.selectedTracingColors?.[d.id] ? 600 : 400
             )
-            .style("font-size", "10px")
+            .style("font-size", scaledFont(13))
             .style("cursor", options.onTracingSelect ? "pointer" : null)
             .on("click", (_, d) => {
                 options.onTracingSelect?.(d.id);
@@ -1437,7 +1447,7 @@ export function renderUpsetPlot(container, data, toolSets = {}, options = {}) {
         .attr("font-weight", (d) =>
             options.selectedTracingColors?.[d.id] ? 600 : 400
         )
-        .style("font-size", "10px")
+        .style("font-size", scaledFont(13))
         .style("cursor", options.onTracingSelect ? "pointer" : null)
         .on("click", (_, d) => {
             options.onTracingSelect?.(d.id);

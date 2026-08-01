@@ -497,9 +497,29 @@ function UpsetTopChartToggle({
   );
 }
 
+function parseFigureScale(search: string) {
+  const raw = new URLSearchParams(search).get("figure");
+  if (raw === null) {
+    return 1;
+  }
+
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed > 1) {
+    return Math.min(parsed, 2.5);
+  }
+
+  return 1.4;
+}
+
 export default function Home() {
   const upsetRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Figure mode (?figure or ?figure=1.6): larger fonts for paper screenshots.
+  const [figureScale, setFigureScale] = useState(1);
+
+  useEffect(() => {
+    setFigureScale(parseFigureScale(window.location.search));
+  }, []);
   const [traceSource, setTraceSource] = useState<TraceSource>(DEFAULT_TRACE_SOURCE);
   const [selectedTracingIds, setSelectedTracingIds] = useState<Array<Tracing["id"]>>([]);
   const [toolSets, setToolSets] = useState<ToolSets>({});
@@ -842,6 +862,7 @@ export default function Home() {
       renderUpsetPlot(element, data, toolSets, {
         width,
         matrixMaxHeight: 360,
+        fontScale: figureScale,
         topChartMode,
         rowGroupBy: upsetGroupBy || undefined,
         scoreKey: selectedScoreBy,
@@ -878,6 +899,7 @@ export default function Home() {
     collapsedGroups,
     data,
     error,
+    figureScale,
     handleGroupSelect,
     handleTracingSelect,
     loading,
@@ -889,7 +911,11 @@ export default function Home() {
   ]);
 
   return (
-    <div className="min-h-screen bg-stone-100 px-4 py-10 text-zinc-950">
+    <div
+      className={`min-h-screen bg-stone-100 px-4 py-10 text-zinc-950${
+        figureScale > 1 ? " figure-mode" : ""
+      }`}
+    >
       <main className="mx-auto flex w-full max-w-7xl flex-col gap-6">
         <header className="px-1">
           <p className="text-xs font-semibold uppercase tracking-[0.24em] text-zinc-500">
@@ -1003,12 +1029,17 @@ export default function Home() {
           )}
           {!loading && !error && selectedTracings.length === 1 && selectedTracing && (
             bottomGraphView === "agent" && agentDagReady ? (
-              <AgentDagGraphView dag={selectedAgentDagState.dag} toolSets={toolSets} />
+              <AgentDagGraphView
+                dag={selectedAgentDagState.dag}
+                toolSets={toolSets}
+                figureScale={figureScale}
+              />
             ) : (
               <ProvenanceGraphView
                 tracing={selectedTracing}
                 mode={graphMode}
                 toolSets={toolSets}
+                figureScale={figureScale}
               />
             )
           )}
@@ -1019,6 +1050,7 @@ export default function Home() {
                 graph={joinedGraphState.graph}
                 traceIds={selectedTracingIds}
                 toolSets={toolSets}
+                figureScale={figureScale}
               />
             ) : (
               <StatusMessage
