@@ -646,6 +646,7 @@ export default function Home() {
         status: "ready",
         dag: payload.dag,
       });
+      setBottomGraphView("agent");
     } catch {
       setAgentDagState(tracing.id, { status: "error" });
     }

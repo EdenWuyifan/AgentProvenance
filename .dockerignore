@@ -1,0 +1,11 @@
+.git
+.DS_Store
+**/.DS_Store
+**/.cache
+**/.env*
+!**/.env.example
+**/.next
+**/node_modules
+tmp
+agent_provenance_react/public/*
+!agent_provenance_react/public/tracings.jsonl

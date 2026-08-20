@@ -109,6 +109,19 @@ PROVENANCE_BACKEND_PORT=8008 PROVENANCE_FRONTEND_PORT=3000 ./run_agent_provenanc
 This script intentionally mirrors the future Docker Compose split: one backend
 service and one frontend service, connected by `PROVENANCE_BACKEND_URL`.
 
+### Docker Demo
+
+Build and run the combined frontend/backend image from the repository root:
+
+```bash
+docker build -t agent-provenance:demo .
+docker run --rm -p 3000:3000 \
+  -e PORTKEY_API_KEY \
+  -e PORTKEY_BASE_URL \
+  -e PORTKEY_MODEL \
+  agent-provenance:demo
+```
+
 ### Working with Trace Data
 
 ```python
