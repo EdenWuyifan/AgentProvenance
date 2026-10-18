@@ -24,7 +24,7 @@ fi
 echo "Starting provenance backend at $BACKEND_URL"
 (
   cd "$BACKEND_DIR"
-  "$PYTHON" -m uvicorn app:app --host "$BACKEND_HOST" --port "$BACKEND_PORT"
+  "$PYTHON" -m uvicorn app:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" --reload
 ) &
 
 echo "Starting React frontend at http://127.0.0.1:${FRONTEND_PORT}"

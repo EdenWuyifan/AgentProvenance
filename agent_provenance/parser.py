@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Union
 
-TOOL_CALL_KEYS = ("tool_calls", "toolCalls", "calls", "steps")
+TOOL_CALL_KEYS = ("events", "tool_calls", "toolCalls", "calls", "steps")
 
 
 def load_trace_records(
@@ -122,6 +122,9 @@ def _top_level_tool_calls(trace: Dict[str, Any]) -> List[Any]:
 
 def _minimal_trace(trace: Dict[str, Any], idx: int) -> Dict[str, Any]:
     """Normalize any supported trace into {id, tool_calls, score?, ...metadata}."""
+    if 'token_log' in trace and 'config' in trace and 'steps' in trace:
+        from .workflow_import import import_record
+        trace = import_record(trace)
     tool_calls = extract_tool_call_responses(trace)
     if not tool_calls:
         tool_calls = [
@@ -130,7 +133,10 @@ def _minimal_trace(trace: Dict[str, Any], idx: int) -> Dict[str, Any]:
             if (tool_call := _minimal_tool_call(call))
         ]
 
-    excluded_keys = {"id", "score", "tool_calls", "toolCalls", "calls", "steps", "outputs"}
+    excluded_keys = {
+        "id", "score", "tool_calls", "toolCalls", "calls", "steps", "outputs",
+        "finalOutput", "final_answer", "answer",
+    }
     metadata = {
         key: value
         for key, value in trace.items()
@@ -142,11 +148,54 @@ def _minimal_trace(trace: Dict[str, Any], idx: int) -> Dict[str, Any]:
         "tool_calls": tool_calls,
         **metadata,
     }
+    for key in ('participants', 'eventLinks', 'outcomes', 'importMetadata', 'workflowRef', 'workflowSummary'):
+        if key in trace:
+            minimal[key] = trace[key]
+    final_output = _final_output(trace)
+    if final_output is not None:
+        minimal["finalOutput"] = final_output
 
     if trace.get("score") is not None:
         minimal["score"] = trace["score"]
 
     return minimal
+
+
+def _message_text(content: Any) -> Optional[str]:
+    if isinstance(content, str):
+        return content.strip() or None
+    if isinstance(content, list):
+        parts = [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+        ]
+        text = "\n".join(part.strip() for part in parts if part.strip())
+        return text or None
+    return None
+
+
+def _final_output(trace: Dict[str, Any]) -> Optional[str]:
+    for key in ("finalOutput", "final_answer", "answer"):
+        value = trace.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    outputs = trace.get("outputs")
+    messages = outputs.get("messages") if isinstance(outputs, dict) else None
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get('role') in {'tool', 'user'} or message.get('type') in {'tool', 'user'}:
+            return None
+        if message.get("role") != "assistant" and message.get("type") != "assistant":
+            continue
+        if message.get('tool_calls') or message.get('toolCalls'):
+            return None
+        return _message_text(message.get("content"))
+    return None
 
 
 def _minimal_tool_call(call: Any) -> Optional[Dict[str, Any]]:
@@ -164,6 +213,13 @@ def _minimal_tool_call(call: Any) -> Optional[Dict[str, Any]]:
 
     if isinstance(call, dict) and call.get("status") is not None:
         tool_call["status"] = call["status"]
+    if isinstance(call, dict):
+        for key in ('eventType', 'agentId', 'role', 'round', 'phase', 'source', 'diagnostics', 'patterns'):
+            if key in call:
+                tool_call[key] = call[key]
+        for key in ("parent_call_id", "parentCallId", "parent_call_ids", "parentCallIds"):
+            if key in call:
+                tool_call[key] = call[key]
 
     return tool_call
 
@@ -265,6 +321,10 @@ def extract_tool_call_responses(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "args": _extract_tool_args(call),
                 "response": None,
             }
+            if isinstance(call, dict):
+                for key in ("status", "parent_call_id", "parentCallId", "parent_call_ids", "parentCallIds"):
+                    if key in call:
+                        pair[key] = call[key]
 
             if not pair["name"]:
                 continue

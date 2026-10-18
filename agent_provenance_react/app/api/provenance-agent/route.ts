@@ -17,6 +17,7 @@ export async function POST(request: Request) {
       headers: { "Content-Type": "application/json" },
       body: await request.text(),
       cache: "no-store",
+      signal: request.signal,
     });
 
     return new Response(response.body, {

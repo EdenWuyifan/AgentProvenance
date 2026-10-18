@@ -10,12 +10,11 @@ import {
   useState,
 } from "react";
 
-import {
-  AgentDagGraphView,
-  JoinedProvenanceGraphView,
-  ProvenanceGraphView,
-} from "./components/provenance_graph";
+import { SemanticGraphView } from "./components/semantic_graph";
+import { createGraphWorkspace } from "./components/graph_layout";
+import { graphScope, type GraphCommand, type GraphViewState } from "./components/graph_controls";
 import { ProvenanceCopilot } from "./components/provenance_copilot";
+import { corpusSource, DISCOVERA_SOURCE, type TraceSource, type WorkflowCorpus } from "./components/trace_sources";
 import type {
   AgentDag,
   GraphMode,
@@ -35,13 +34,17 @@ const GROUPING_EXCLUDED_KEYS = new Set([
   "score",
   "toolCalls",
   "tool_calls",
+  "finalOutput",
+  "final_answer",
+  "answer",
 ]);
-const SCORING_EXCLUDED_KEYS = new Set(["id", "trace_id", "toolCalls", "tool_calls"]);
+const SCORING_EXCLUDED_KEYS = new Set(["id", "trace_id", "toolCalls", "tool_calls", "seed", "isSummary", "eventCount", "participantCount"]);
 const TRACE_SELECTION_COLORS = [
   "rgba(56, 189, 248, 0.18)",
   "rgba(251, 146, 60, 0.18)",
   "rgba(74, 222, 128, 0.18)",
 ] as const;
+const TRACE_SELECTION_ACCENTS = ["#38bdf8", "#fb923c", "#22c55e"] as const;
 
 function traceSelectionColor(index: number) {
   const color = TRACE_SELECTION_COLORS[index];
@@ -53,23 +56,26 @@ function traceSelectionColor(index: number) {
   return `hsl(${hue} 86% 90% / 0.42)`;
 }
 
+function traceSelectionAccent(index: number) {
+  const color = TRACE_SELECTION_ACCENTS[index];
+  if (color) {
+    return color;
+  }
+
+  return `hsl(${(index * 137.508) % 360} 70% 42%)`;
+}
+
 type TopChartMode = "usage" | "impact";
-type BottomGraphView = "trace" | "agent";
-type TraceSource = { name: string; path?: string; text?: string };
+type ComparisonDetail = "overview" | "all";
 type AgentDagState =
   | { status: "loading" }
-  | { status: "ready"; dag: AgentDag }
-  | { status: "error" };
+  | { status: "ready"; dag: AgentDag; analysisKey: string; tracing?: Tracing }
+  | { status: "error"; message: string };
 type JoinedGraphState =
   | { status: "idle" }
   | { status: "loading"; key: string }
   | { status: "ready"; key: string; graph: JoinedProvenanceGraph }
   | { status: "error"; key: string; message: string };
-
-const DEFAULT_TRACE_SOURCE: TraceSource = {
-  name: "tracings.jsonl",
-  path: "/tracings.jsonl",
-};
 
 function getGroupingOptions(tracings: Tracing[]) {
   const keys = new Set<string>();
@@ -160,7 +166,23 @@ function normalizeTracing(
           ? Number(tracing.score)
           : undefined,
     toolCalls: extractToolCallRecords(tracing),
+    finalOutput: typeof tracing.finalOutput === "string" ? tracing.finalOutput : null,
   };
+}
+
+function workflowRequest(tracing: Tracing) {
+  return { eventSchemaVersion: tracing.eventSchemaVersion, participants: tracing.participants,
+    eventLinks: tracing.eventLinks, outcomes: tracing.outcomes, importMetadata: tracing.importMetadata,
+    workflowRef: tracing.workflowRef };
+}
+
+function resolveTaskDescription(tracing: Tracing) {
+  const value = [
+    tracing.task_description,
+    tracing.taskDescription,
+    tracing.task,
+  ].find((candidate) => typeof candidate === "string");
+  return typeof value === "string" ? value : null;
 }
 
 async function hashText(text: string) {
@@ -201,7 +223,14 @@ function useTracingData(source: TraceSource) {
           return;
         }
 
-        const parsed = prepareTracings(parseTracingPayload(text)).map(normalizeTracing);
+        let records = parseTracingPayload(text);
+        if (records.some((record: Record<string, unknown>) => record.token_log && record.config && record.steps)) {
+          const response = await fetch('/api/import-workflows', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ records, label: source.name }) });
+          if (!response.ok) throw new Error(await response.text());
+          records = (await response.json()).traces;
+        }
+        const parsed = prepareTracings(records).map(normalizeTracing);
         const nextCacheKey = await hashText(text);
         if (cancelled) {
           return;
@@ -264,7 +293,7 @@ function Card({
   children,
 }: {
   title: string;
-  description: string;
+  description: ReactNode;
   actions?: ReactNode;
   children: ReactNode;
 }) {
@@ -275,7 +304,7 @@ function Card({
           <h2 className="text-lg font-semibold tracking-tight text-zinc-950">
             {title}
           </h2>
-          <p className="mt-1 max-w-3xl text-sm text-zinc-600">{description}</p>
+          <div className="mt-1 max-w-3xl text-sm text-zinc-600">{description}</div>
         </div>
         {actions}
       </div>
@@ -288,85 +317,6 @@ function StatusMessage({ message }: { message: string }) {
   return (
     <div className="flex min-h-48 items-center justify-center rounded-xl border border-dashed border-zinc-200 bg-zinc-50 px-6 py-10 text-sm text-zinc-600">
       {message}
-    </div>
-  );
-}
-
-function GraphModeToggle({
-  mode,
-  onChange,
-}: {
-  mode: GraphMode;
-  onChange: (mode: GraphMode) => void;
-}) {
-  return (
-    <div className="inline-flex h-7 items-center border border-zinc-300 bg-zinc-50/95 backdrop-blur-sm">
-      {[
-        ["collapsed", "Collapsed"],
-        ["tree", "Tree"],
-      ].map(([value, label]) => {
-        const active = mode === value;
-
-        return (
-          <button
-            key={value}
-            type="button"
-            className={`h-full px-2 text-[11px] font-medium transition ${
-              active
-                ? "bg-white text-zinc-950 shadow-sm"
-                : "text-zinc-500 hover:text-zinc-950"
-            }`}
-            style={
-              value === "tree"
-                ? { borderLeft: "1px solid rgb(212 212 216)" }
-                : undefined
-            }
-            onClick={() => onChange(value as GraphMode)}
-          >
-            {label}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function BottomGraphViewToggle({
-  view,
-  agentDisabled,
-  agentLoading,
-  onChange,
-}: {
-  view: BottomGraphView;
-  agentDisabled: boolean;
-  agentLoading: boolean;
-  onChange: (view: BottomGraphView) => void;
-}) {
-  return (
-    <div className="inline-flex h-7 items-center border border-zinc-300 bg-zinc-50/95 backdrop-blur-sm">
-      <button
-        type="button"
-        className={`h-full px-2 text-[11px] font-medium transition ${
-          view === "trace"
-            ? "bg-white text-zinc-950 shadow-sm"
-            : "text-zinc-500 hover:text-zinc-950"
-        }`}
-        onClick={() => onChange("trace")}
-      >
-        Trace
-      </button>
-      <button
-        type="button"
-        className={`h-full border-l border-zinc-300 px-2 text-[11px] font-medium transition ${
-          view === "agent"
-            ? "bg-white text-zinc-950 shadow-sm"
-            : "text-zinc-500 hover:text-zinc-950"
-        } disabled:cursor-default disabled:bg-zinc-100 disabled:text-zinc-300`}
-        onClick={() => onChange("agent")}
-        disabled={agentDisabled}
-      >
-        {agentLoading ? "Building PROV" : "PROV graph"}
-      </button>
     </div>
   );
 }
@@ -520,52 +470,76 @@ export default function Home() {
   useEffect(() => {
     setFigureScale(parseFigureScale(window.location.search));
   }, []);
-  const [traceSource, setTraceSource] = useState<TraceSource>(DEFAULT_TRACE_SOURCE);
+  const [traceSource, setTraceSource] = useState<TraceSource>(DISCOVERA_SOURCE);
+  const sourceRevision = useRef(0);
   const [selectedTracingIds, setSelectedTracingIds] = useState<Array<Tracing["id"]>>([]);
   const [toolSets, setToolSets] = useState<ToolSets>({});
   const [topChartMode, setTopChartMode] = useState<TopChartMode>("impact");
   const [upsetGroupBy, setUpsetGroupBy] = useState("");
   const [upsetScoreBy, setUpsetScoreBy] = useState("score");
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
-  const [graphMode, setGraphMode] = useState<GraphMode>("tree");
-  const [bottomGraphView, setBottomGraphView] = useState<BottomGraphView>("trace");
+  const [comparisonDetail, setComparisonDetail] = useState<ComparisonDetail>("overview");
+  const [laneBy, setLaneBy] = useState<'agent' | 'role'>('agent');
+  const [workflowCorpora, setWorkflowCorpora] = useState<WorkflowCorpus[]>([]);
+  useEffect(() => { void fetch('/api/workflow-corpora').then((response) => response.ok ? response.json() : { corpora: [] })
+    .then((payload) => setWorkflowCorpora(payload.corpora)).catch(() => setWorkflowCorpora([])); }, []);
+  const [focusDraft, setFocusDraft] = useState("");
+  const [focus, setFocus] = useState("");
+  const [targetCallSelection, setTargetCallSelection] = useState("");
+  const [graphMode] = useState<GraphMode>("tree");
   const [agentDagStates, setAgentDagStates] = useState<
     Record<string, AgentDagState>
   >({});
   const [joinedGraphState, setJoinedGraphState] = useState<JoinedGraphState>({
     status: "idle",
   });
+  const [hoveredJoinedTraceId, setHoveredJoinedTraceId] = useState<string | null>(null);
+  const [pinnedJoinedTraceId, setPinnedJoinedTraceId] = useState<string | null>(null);
   const agentDagStatesRef = useRef<Record<string, AgentDagState>>({});
 
   const { data, cacheKey, loading, error } = useTracingData(traceSource);
+  const [graphViewState, setGraphViewState] = useState<GraphViewState | null>(null);
+  const [graphCommands, setGraphCommands] = useState<GraphCommand[]>([]);
+  const graphWorkspace = useMemo(() => createGraphWorkspace(cacheKey), [cacheKey]);
   const groupingOptions = getGroupingOptions(data);
   const groupingValues = getGroupingValues(data, upsetGroupBy);
   const scoringOptions = getScoringOptions(data);
   const selectedScoreBy = scoringOptions.includes(upsetScoreBy)
     ? upsetScoreBy
     : scoringOptions[0] ?? "score";
-  const selectedTracings = selectedTracingIds
-    .map((selectedTracingId) =>
-      data.find((tracing) => tracing.id === selectedTracingId) ?? null
-    )
-    .filter((tracing): tracing is Tracing => tracing !== null);
+  const selectedTracings = useMemo(
+    () => selectedTracingIds
+      .map((selectedTracingId) =>
+        (() => {
+          const tracing = data.find((tracing) => tracing.id === selectedTracingId);
+          const state = agentDagStates[String(selectedTracingId)];
+          return tracing ? { ...tracing, ...(state?.status === 'ready' ? state.tracing : undefined) } : null;
+        })()
+      )
+      .filter((tracing): tracing is Tracing => tracing !== null),
+    [data, selectedTracingIds, agentDagStates]
+  );
   const selectedTracing = selectedTracings[0] ?? null;
-  const selectedAgentDagState = selectedTracing
-    ? agentDagStates[String(selectedTracing.id)]
-    : undefined;
-  const agentDagReady = selectedAgentDagState?.status === "ready";
-  const agentDagLoading = selectedAgentDagState?.status === "loading";
-  const selectedJoinKey = selectedTracingIds.map(String).join(":");
+  const selectedJoinKey = `${selectedScoreBy}:${comparisonDetail}:${laneBy}:${focus}:${targetCallSelection}:${selectedTracingIds.map(String).join(":")}`;
+  const targetCallOptions = selectedTracings.flatMap((tracing) => tracing.toolCalls
+    .filter((call) => typeof call.id === "string" && call.id.length > 0 && (!tracing.eventSchemaVersion || tracing.outcomes?.some((outcome) => outcome.eventId === call.id)))
+    .map((call) => ({
+      id: call.id!,
+      traceId: String(tracing.id),
+      value: JSON.stringify([String(tracing.id), call.id]),
+      label: `Run #${tracing.id}${call.round === undefined ? '' : ` · Round ${call.round + 1}`} · ${call.name} · step ${tracing.toolCalls.indexOf(call) + 1}`,
+    })));
+  const selectedTarget = targetCallOptions.find((option) => option.value === targetCallSelection);
   const selectedDagStates = selectedTracings.map(
     (tracing) => agentDagStates[String(tracing.id)]
   );
   const selectedDagsReady =
-    selectedTracings.length >= 2 &&
+    selectedTracings.length >= 1 &&
     selectedDagStates.every((state) => state?.status === "ready");
   const selectedDagsError =
-    selectedTracings.length >= 2 &&
+    selectedTracings.length >= 1 &&
     selectedDagStates.some((state) => state?.status === "error");
-  const selectedTraceDags = selectedTracings.reduce<Record<string, AgentDag>>(
+  const selectedTraceDags = useMemo(() => selectedTracings.reduce<Record<string, AgentDag>>(
     (graphs, tracing) => {
       const state = agentDagStates[String(tracing.id)];
       if (state?.status === "ready") {
@@ -574,11 +548,13 @@ export default function Home() {
       return graphs;
     },
     {}
-  );
+  ), [selectedTracings, agentDagStates]);
   const activeJoinedGraph =
     joinedGraphState.status === "ready" && joinedGraphState.key === selectedJoinKey
       ? joinedGraphState.graph
       : null;
+  const activeGraphScope = useMemo(() => activeJoinedGraph ? graphScope(activeJoinedGraph, cacheKey) : null, [activeJoinedGraph, cacheKey]);
+  const highlightedJoinedTraceId = hoveredJoinedTraceId ?? pinnedJoinedTraceId;
   const selectedTracingColors = useMemo(
     () =>
       Object.fromEntries(
@@ -590,20 +566,33 @@ export default function Home() {
     [selectedTracingIds]
   );
 
-  const handleFileOpen = useCallback(async (file: File | undefined) => {
-    if (!file) {
-      return;
-    }
-
+  const openTraceSource = useCallback((source: TraceSource) => {
+    sourceRevision.current += 1;
     setSelectedTracingIds([]);
     setCollapsedGroups([]);
     agentDagStatesRef.current = {};
     setAgentDagStates({});
     setJoinedGraphState({ status: "idle" });
+    setHoveredJoinedTraceId(null);
+    setPinnedJoinedTraceId(null);
     setToolSets({});
     setUpsetScoreBy("score");
-    setTraceSource({ name: file.name, text: await file.text() });
+    setUpsetGroupBy("");
+    setFocus("");
+    setFocusDraft("");
+    setComparisonDetail("overview");
+    setGraphCommands([]);
+    setGraphViewState(null);
+    setTargetCallSelection('');
+    setTraceSource(source);
   }, []);
+
+  const handleFileOpen = useCallback(async (files: File[]) => {
+    if (!files.length) return;
+    const contents = await Promise.all(files.map((file) => file.text()));
+    openTraceSource({ name: files.length === 1 ? files[0].name : `${files.length} workflow files`,
+      text: contents.length === 1 ? contents[0] : JSON.stringify(contents.flatMap(parseTracingPayload)) });
+  }, [openTraceSource]);
 
   const setAgentDagState = useCallback((traceId: Tracing["id"], state: AgentDagState) => {
     agentDagStatesRef.current = {
@@ -614,6 +603,7 @@ export default function Home() {
   }, []);
 
   const loadAgentDag = useCallback(async (tracing: Tracing) => {
+    const revision = sourceRevision.current;
     const state = agentDagStatesRef.current[String(tracing.id)];
 
     if (state?.status === "loading" || state?.status === "ready") {
@@ -630,7 +620,13 @@ export default function Home() {
         },
         body: JSON.stringify({
           traceId: tracing.id,
-          toolCalls: tracing.toolCalls,
+          toolCalls: tracing.workflowRef ? undefined : tracing.toolCalls,
+          ...workflowRequest(tracing),
+          taskId: tracing.task_id ?? tracing.taskId ?? null,
+          taskDescription: resolveTaskDescription(tracing),
+          finalOutput: tracing.finalOutput ?? null,
+          focus,
+          targetCallIds: selectedTarget?.traceId === String(tracing.id) ? [selectedTarget.id] : [],
         }),
       });
 
@@ -640,19 +636,32 @@ export default function Home() {
 
       const payload = (await response.json()) as {
         dag: AgentDag;
+        analysis: {
+          traceId: string | number;
+          analysisKey: string;
+        };
+        tracing?: Tracing;
       };
 
+      if (revision !== sourceRevision.current) return;
       setAgentDagState(tracing.id, {
         status: "ready",
         dag: payload.dag,
+        analysisKey: payload.analysis.analysisKey,
+        tracing: payload.tracing,
       });
-      setBottomGraphView("agent");
-    } catch {
-      setAgentDagState(tracing.id, { status: "error" });
+    } catch (loadError) {
+      if (revision !== sourceRevision.current) return;
+      setAgentDagState(tracing.id, {
+        status: "error",
+        message: loadError instanceof Error ? loadError.message : "Unable to build PROV graph.",
+      });
     }
-  }, [setAgentDagState]);
+  }, [setAgentDagState, focus, selectedTarget?.id, selectedTarget?.traceId]);
 
   const handleTracingSelect = useCallback((tracingId: Tracing["id"]) => {
+    setHoveredJoinedTraceId(null);
+    setPinnedJoinedTraceId(null);
     const tracing = data.find((item) => item.id === tracingId);
 
     if (tracing && !selectedTracingIds.includes(tracingId)) {
@@ -672,6 +681,9 @@ export default function Home() {
     if (!upsetGroupBy) {
       return;
     }
+
+    setHoveredJoinedTraceId(null);
+    setPinnedJoinedTraceId(null);
 
     const groupTracingIds = data
       .filter((tracing) => {
@@ -763,16 +775,17 @@ export default function Home() {
   }, [cacheKey, data]);
 
   useEffect(() => {
-    if (selectedTracingIds.length < 2) {
+    if (selectedTracingIds.length < 1) {
       setJoinedGraphState({ status: "idle" });
       return;
     }
 
     if (selectedDagsError) {
+      const failedState = selectedTracingIds.map((id) => agentDagStates[String(id)]).find((state) => state?.status === "error");
       setJoinedGraphState({
         status: "error",
         key: selectedJoinKey,
-        message: "Unable to build one of the selected PROV graphs.",
+        message: failedState?.status === "error" ? failedState.message : "Unable to build one of the selected PROV graphs.",
       });
       return;
     }
@@ -795,18 +808,35 @@ export default function Home() {
           return tracing && state?.status === "ready"
             ? [{
                 traceId: tracing.id,
-                score: tracing.score,
-                dag: state.dag,
-                toolCalls: tracing.toolCalls,
+                taskId: tracing.task_id ?? tracing.taskId ?? null,
+                taskDescription: resolveTaskDescription(tracing),
+                finalOutput: tracing.finalOutput ?? null,
+                score: isScoringValue(tracing[selectedScoreBy]) ? Number(tracing[selectedScoreBy]) : null,
+                scoreMetric: selectedScoreBy === 'score' ? tracing.scoreMetric ?? 'score' : selectedScoreBy,
+                toolCalls: tracing.workflowRef ? undefined : tracing.toolCalls,
+                ...workflowRequest(tracing),
+                targetCallIds: selectedTarget?.traceId === String(tracing.id) ? [selectedTarget.id] : [],
               }]
             : [];
+        });
+        const referenceCohort = data.map((tracing) => {
+          const state = agentDagStates[String(tracing.id)];
+          return {
+            traceId: tracing.id,
+            taskId: tracing.task_id ?? tracing.taskId ?? null,
+            score: isScoringValue(tracing[selectedScoreBy]) ? Number(tracing[selectedScoreBy]) : null,
+            scoreMetric: selectedScoreBy === 'score' ? tracing.scoreMetric ?? 'score' : selectedScoreBy,
+            workflowSummary: tracing.workflowSummary,
+            tools: [...new Set(tracing.toolCalls.map((call) => call.name))].sort(),
+            analysisKey: state?.status === "ready" ? state.analysisKey : null,
+          };
         });
         const response = await fetch("/api/joined-provenance-graph", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ graphs }),
+          body: JSON.stringify({ graphs, referenceCohort, detail: comparisonDetail, focus, laneBy }),
         });
 
         if (!response.ok) {
@@ -849,7 +879,14 @@ export default function Home() {
     selectedDagsError,
     selectedDagsReady,
     selectedJoinKey,
+    selectedScoreBy,
+    comparisonDetail,
+    laneBy,
     selectedTracingIds,
+    focus,
+    targetCallSelection,
+    selectedTarget?.id,
+    selectedTarget?.traceId,
   ]);
 
   useEffect(() => {
@@ -928,6 +965,53 @@ export default function Home() {
           title="Traces overview"
           description="Visualize and explore the provenance of your agent runs, including the tools they used and their outcomes."
         >
+          <div className="mb-4 flex h-8 w-fit items-center rounded-md border border-zinc-300 bg-zinc-50">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept=".json,.jsonl,application/json"
+              className="hidden"
+              onChange={(event) => {
+                void handleFileOpen(Array.from(event.target.files ?? []));
+                event.target.value = "";
+              }}
+            />
+            <button
+              type="button"
+              className="h-full border-r border-zinc-300 px-2 text-[11px] font-medium text-zinc-500 transition hover:text-zinc-950"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              Open traces
+            </button>
+            <select
+              aria-label="Trace source"
+              title={traceSource.name}
+              className="h-full max-w-96 border-r border-zinc-300 bg-transparent px-2 text-[11px] text-zinc-700"
+              value={traceSource.path ?? "uploaded"}
+              onChange={(event) => {
+                if (event.target.value === DISCOVERA_SOURCE.path) openTraceSource(DISCOVERA_SOURCE);
+                else {
+                  const corpus = workflowCorpora.find((item) => corpusSource(item).path === event.target.value);
+                  if (corpus) openTraceSource(corpusSource(corpus));
+                }
+              }}
+            >
+              <option value={DISCOVERA_SOURCE.path}>{DISCOVERA_SOURCE.name}</option>
+              {workflowCorpora.filter((corpus) => corpus.currentVersion).map((corpus) => {
+                const source = corpusSource(corpus);
+                return <option key={source.path} value={source.path}>{source.name}</option>;
+              })}
+              {workflowCorpora.some((corpus) => !corpus.currentVersion) && <optgroup label="Earlier imports">
+                {workflowCorpora.filter((corpus) => !corpus.currentVersion).map((corpus) => {
+                  const source = corpusSource(corpus);
+                  return <option key={source.path} value={source.path}>{source.name}</option>;
+                })}
+              </optgroup>}
+              {!traceSource.path && <option value="uploaded">{traceSource.name}</option>}
+            </select>
+            <UpsetTopChartToggle mode={topChartMode} onChange={setTopChartMode} />
+          </div>
           {loading && <StatusMessage message="Loading traces…" />}
           {!loading && error && <StatusMessage message={error} />}
           {!loading && !error && data.length === 0 && (
@@ -935,34 +1019,7 @@ export default function Home() {
           )}
           {!loading && !error && data.length > 0 && (
             <div className="w-full overflow-x-auto">
-              <div className="relative min-w-[720px] pt-16">
-                  <div className="pointer-events-none absolute inset-x-0 top-0 z-10 grid w-full grid-cols-[3fr_1fr]">
-                    <div className="pointer-events-auto flex h-7 items-center border border-zinc-300 bg-zinc-50/95 backdrop-blur-sm">
-                      <input
-                        ref={fileInputRef}
-                        type="file"
-                        accept=".json,.jsonl,application/json"
-                        className="hidden"
-                        onChange={(event) => {
-                          void handleFileOpen(event.target.files?.[0]);
-                          event.target.value = "";
-                        }}
-                      />
-                      <button
-                        type="button"
-                        className="h-full border-r border-zinc-300 px-2 text-[11px] font-medium text-zinc-500 transition hover:text-zinc-950"
-                        title={traceSource.name}
-                        onClick={() => fileInputRef.current?.click()}
-                      >
-                        Open JSONL
-                      </button>
-                      <UpsetTopChartToggle
-                        mode={topChartMode}
-                        onChange={setTopChartMode}
-                      />
-                      <div className="h-full flex-1 border-l border-zinc-300" />
-                    </div>
-                  </div>
+              <div className="relative min-w-[720px] pt-4">
                   <div className="pointer-events-none absolute inset-x-0 top-63 z-10 grid w-full grid-cols-[minmax(0,1fr)_280px]">
                     <div />
                     <div className="pointer-events-auto flex h-14 flex-col border border-zinc-300 bg-zinc-50/95 backdrop-blur-sm">
@@ -996,29 +1053,95 @@ export default function Home() {
         <Card
           title="Provenance graph"
           description={
-            selectedTracings.length >= 2
-              ? `Joined graph for ${selectedTracings
-                  .map((tracing) => `run #${tracing.id}`)
-                  .join(", ")}.`
+            selectedTracings.length === 1
+              ? `Semantic overview for run #${selectedTracing?.id}.`
+              : selectedTracings.length >= 2
+              ? (
+                  <span className="inline-flex flex-wrap items-center gap-x-1 gap-y-1">
+                    <span>Joined graph for</span>
+                    {selectedTracings.map((tracing, index) => {
+                      const traceId = String(tracing.id);
+                      const active = highlightedJoinedTraceId === traceId;
+                      const pinned = pinnedJoinedTraceId === traceId;
+                      const accent = traceSelectionAccent(index);
+
+                      return (
+                        <span key={traceId} className="inline-flex items-center gap-1">
+                          <span>{index === 0 ? "" : ", "}</span>
+                          <button
+                            type="button"
+                            aria-label={`Highlight run ${traceId}`}
+                            aria-pressed={pinned}
+                            title="Hover to preview; click to pin"
+                            className="inline-flex items-center rounded-full border bg-white px-2 py-0.5 font-mono text-[11px] leading-none text-zinc-700 shadow-sm transition hover:text-zinc-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-1"
+                            style={{
+                              background: active
+                                ? traceSelectionColor(index)
+                                : undefined,
+                              borderColor: accent,
+                              boxShadow: pinned
+                                ? `0 0 0 1px ${accent}`
+                                : undefined,
+                            }}
+                            onMouseEnter={() => setHoveredJoinedTraceId(traceId)}
+                            onMouseLeave={() => setHoveredJoinedTraceId(null)}
+                            onFocus={() => setHoveredJoinedTraceId(traceId)}
+                            onBlur={() => setHoveredJoinedTraceId(null)}
+                            onClick={() =>
+                              setPinnedJoinedTraceId((current) =>
+                                current === traceId ? null : traceId
+                              )
+                            }
+                          >
+                            #{traceId}
+                          </button>
+                        </span>
+                      );
+                    })}
+                    <span>.</span>
+                  </span>
+                )
               : selectedTracing
                 ? `Run #${selectedTracing.id}`
                 : "Select runs from the plot."
           }
-          actions={
-            selectedTracings.length === 1 ? (
-              <div className="flex flex-wrap items-center gap-2">
-                <BottomGraphViewToggle
-                  view={agentDagReady ? bottomGraphView : "trace"}
-                  agentDisabled={!agentDagReady}
-                  agentLoading={agentDagLoading}
-                  onChange={setBottomGraphView}
-                />
-                {bottomGraphView === "trace" || !agentDagReady ? (
-                  <GraphModeToggle mode={graphMode} onChange={setGraphMode} />
-                ) : null}
+          actions={selectedTracings.length > 0 ? (
+            <div className="flex flex-wrap items-center justify-end gap-1.5">
+              {selectedTracings.some((trace) => trace.eventSchemaVersion || trace.toolCalls.some((call) => call.agentId || call.role)) ? <select aria-label="Group workflow lanes" className="h-7 rounded border border-zinc-300 px-2 text-[11px] text-zinc-700" value={laneBy} onChange={(event) => setLaneBy(event.target.value as 'agent' | 'role')}><option value="agent">Lanes by agent</option><option value="role">Lanes by role</option></select> : <details className="relative text-[11px] text-zinc-600"><summary className="cursor-pointer rounded border border-zinc-300 px-2 py-1.5">Regrouping options</summary><div className="absolute right-0 top-9 z-30 w-72 rounded-lg border border-zinc-300 bg-white p-3 shadow-lg"><p className="mb-2">Change semantic grouping. This may use AI; use search below to locate steps in the current graph.</p><div className="flex items-center gap-2">
+              <input
+                aria-label="Focus semantic analysis"
+                className="h-7 w-36 rounded border border-zinc-300 px-2 text-[11px]"
+                placeholder="Focus analysis…"
+                value={focusDraft}
+                onChange={(event) => setFocusDraft(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") setFocus(focusDraft.trim()); }}
+              />
+              <button type="button" className="h-7 rounded border border-zinc-300 px-2 text-[11px] text-zinc-700 hover:bg-zinc-100" onClick={() => setFocus(focusDraft.trim())}>Apply</button>
+              </div></div></details>}
+              <select aria-label="Target tool call" className="h-7 max-w-48 rounded border border-zinc-300 px-2 text-[11px] text-zinc-700" value={targetCallSelection} onChange={(event) => setTargetCallSelection(event.target.value)}>
+                <option value="">{selectedTracings.some((trace) => trace.eventSchemaVersion) ? 'Final result' : 'Any target'}</option>
+                {targetCallOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+              <div className="inline-flex h-7 items-center border border-zinc-300 bg-zinc-50/95">
+                {(["overview", "all"] as const).map((detail) => (
+                  <button
+                    key={detail}
+                    type="button"
+                    aria-pressed={comparisonDetail === detail}
+                    className={`h-full px-2 text-[11px] font-medium transition ${
+                      comparisonDetail === detail
+                        ? "bg-white text-zinc-950 shadow-sm"
+                        : "text-zinc-500 hover:text-zinc-950"
+                    }`}
+                    style={detail === "all" ? { borderLeft: "1px solid rgb(212 212 216)" } : undefined}
+                    onClick={() => setComparisonDetail(detail)}
+                  >
+                    {detail === "overview" ? "Overview" : selectedTracings.some((trace) => trace.eventSchemaVersion) ? "Full history" : "All groups"}
+                  </button>
+                ))}
               </div>
-            ) : undefined
-          }
+            </div>
+          ) : undefined}
         >
           {loading && <StatusMessage message="Loading traces…" />}
           {!loading && error && <StatusMessage message={error} />}
@@ -1026,32 +1149,19 @@ export default function Home() {
             <StatusMessage message="No traces available." />
           )}
           {!loading && !error && data.length > 0 && selectedTracings.length === 0 && (
-            <StatusMessage message="Select traces in the matrix to render a provenance graph, or two or more to build a joined comparison." />
+            <StatusMessage message="Select a trace to build its semantic overview, or select more traces to compare them." />
           )}
-          {!loading && !error && selectedTracings.length === 1 && selectedTracing && (
-            bottomGraphView === "agent" && agentDagReady ? (
-              <AgentDagGraphView
-                dag={selectedAgentDagState.dag}
-                toolSets={toolSets}
-                figureScale={figureScale}
-              />
-            ) : (
-              <ProvenanceGraphView
-                tracing={selectedTracing}
-                mode={graphMode}
-                toolSets={toolSets}
-                figureScale={figureScale}
-              />
-            )
-          )}
-          {!loading && !error && selectedTracings.length >= 2 && (
+          {!loading && !error && selectedTracings.length >= 1 && (
             joinedGraphState.status === "ready" &&
             joinedGraphState.key === selectedJoinKey ? (
-              <JoinedProvenanceGraphView
+              <SemanticGraphView
                 graph={joinedGraphState.graph}
-                traceIds={selectedTracingIds}
-                toolSets={toolSets}
-                figureScale={figureScale}
+                traces={selectedTracings}
+                traceDags={selectedTraceDags}
+                highlightTraceId={highlightedJoinedTraceId ?? undefined}
+                workspace={graphWorkspace}
+                commands={graphCommands}
+                onViewStateChange={setGraphViewState}
               />
             ) : (
               <StatusMessage
@@ -1059,7 +1169,9 @@ export default function Home() {
                   joinedGraphState.status === "error" &&
                   joinedGraphState.key === selectedJoinKey
                     ? joinedGraphState.message
-                    : "Building joined PROV graph…"
+                    : selectedTracings.length === 1
+                      ? "Building semantic overview…"
+                      : "Building semantic comparison…"
                 }
               />
             )
@@ -1071,6 +1183,8 @@ export default function Home() {
         selectedTraces={selectedTracings}
         selectedTraceDags={selectedTraceDags}
         joinedGraph={activeJoinedGraph}
+        graphState={activeJoinedGraph && graphViewState?.scope === activeGraphScope ? graphViewState : null}
+        onGraphAction={(action) => setGraphCommands((current) => [...current.slice(-31), { nonce: (current.at(-1)?.nonce ?? 0) + 1, action }])}
         graphMode={graphMode}
       />
     </div>

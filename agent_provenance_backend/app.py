@@ -1,830 +1,270 @@
-import json
-import math
-import os
+"""Fast recorded provenance with one cached batch of semantic pattern annotations."""
+
 import re
-from collections import Counter
-from hashlib import sha256
-from pathlib import Path
-from typing import Any
+import sys
+from time import perf_counter
 
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
-from portkey_ai import AsyncPortkey
 
+from abstraction import build_views, compatible_path
 from copilot import provenance_agent_response
-from joined_provenance import build_joined_provenance_graph
+from inference import capture_metrics, portkey_client, together
+from models import CACHE_DIR, FRAMEWORK_VERSION, ModelResponseError, digest, read_cache, write_json
+from models import ROOT
+from provenance import build_recorded_graph, call_flow, normalize_calls
+from reasoning_links import PROMPT_VERSION as REASONING_VERSION, infer_links
+from result_evidence import PROMPT_VERSION as RESULT_VERSION, associate_results
+from semantics import PROMPT_VERSION, annotate_types, instantiate, resolve_targets
+from score_attribution import VERSION as OUTCOME_VERSION
+from workflows import has_workflow, normalize_workflow, event_graph, build_workflow_view
+from workflow_store import resolve_entry, save_corpus, list_corpora, load_manifest
+from workflow_semantics import assess_workflow, VERSION as WORKFLOW_PROMPT_VERSION, MAX_ROUNDS as WORKFLOW_ROUND_LIMIT
 
-ROOT = Path(__file__).resolve().parents[1]
-REACT_DIR = ROOT / "agent_provenance_react"
-CACHE_DIR = REACT_DIR / ".cache"
-GRAPH_CACHE_DIR = CACHE_DIR / "generated-prov-graphs"
-TOOL_SET_CACHE_DIR = CACHE_DIR / "generated-tool-sets"
-
-DEFAULT_BASE_URL = "https://ai-gateway.apps.cloud.rt.nyu.edu/v1/"
-DEFAULT_MODEL = "@vertexai/gemini-3.1-flash-lite"
-MAX_SEMANTIC_EDGE_CANDIDATES = 2
-TOKEN_CHAMFER_THRESHOLD = 0.2
-MAX_LABEL_LENGTH = 96
-MAX_ARRAY_ITEMS = 12
-MAX_OBJECT_KEYS = 16
-MAX_STRING_LENGTH = 240
-MAX_SUMMARY_DEPTH = 4
-OUTPUT_METADATA_KEYS = (
-    "storage_entry",
-    "ora_result_metadata",
-    "gsea_result_metadata",
-    "gsea_plot_metadata",
-)
+sys.path.insert(0, str(ROOT))
+from agent_provenance.workflow_import import import_record
 
 app = FastAPI()
 
 
-def load_env() -> None:
-    env_path = REACT_DIR / ".env"
-    if not env_path.exists():
-        return
+def trace_inputs(entry):
+    trace_id = str(entry['traceId'])
+    raw_calls = entry.get('events', entry.get('toolCalls', []))
+    if entry.get('eventSchemaVersion'):
+        identifiers = [call.get('id') for call in raw_calls]
+        if any(not isinstance(identifier, str) or not identifier for identifier in identifiers) or len(set(identifiers)) != len(identifiers):
+            raise ValueError('Workflow events need unique nonempty string IDs.')
+    calls = normalize_calls(raw_calls, trace_id)
+    for field in ('taskDescription', 'finalOutput'):
+        if entry.get(field) is not None and not isinstance(entry[field], str):
+            raise ValueError(f'{field} must be text.')
+    return trace_id, calls
 
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+
+def analysis_key(entry):
+    trace_id, calls = trace_inputs(entry)
+    return digest([FRAMEWORK_VERSION, trace_id, calls, entry.get('taskDescription'), entry.get('finalOutput'),
+                   entry.get('participants'), entry.get('eventLinks'), entry.get('outcomes'), entry.get('importMetadata')])
+
+
+def with_context(analysis, entry):
+    return {**analysis, 'taskId': entry.get('taskId'), 'score': entry.get('score'),
+            'scoreMetric': entry.get('scoreMetric', 'score'),
+            'targetCallIds': entry.get('targetCallIds', []),
+            'finalOutput': entry.get('finalOutput', analysis.get('finalOutput'))}
+
+
+async def analyze_trace(entry):
+    entry = resolve_entry(entry)
+    key = analysis_key(entry)
+    path = CACHE_DIR / 'analyses' / f'{key}.json'
+    cached = read_cache(path)
+    if cached is not None:
+        return with_context(cached, entry), True
+    started = perf_counter()
+    trace_id, calls = trace_inputs(entry)
+    workflow = normalize_workflow(entry, calls) if has_workflow(entry) else None
+    graph = event_graph(calls, workflow) if workflow else build_recorded_graph(calls)
+    analysis = {'traceId': trace_id, 'calls': calls, 'graph': graph, 'flow': call_flow(graph),
+                'analysisKey': key, 'frameworkVersion': FRAMEWORK_VERSION,
+                'taskDescription': entry.get('taskDescription'), 'finalOutput': entry.get('finalOutput'),
+                'generationMetrics': [], 'buildSeconds': round(perf_counter() - started, 6)}
+    if workflow:
+        analysis['workflow'] = workflow
+    write_json(path, analysis)
+    return with_context(analysis, entry), False
+
+
+async def analyze_selection(entries):
+    ids = [str(entry['traceId']) for entry in entries]
+    if len(set(ids)) != len(ids):
+        raise ValueError('Selected trace IDs must be unique.')
+    results = [await analyze_trace(entry) for entry in sorted(entries, key=lambda e: str(e['traceId']))]
+    return [analysis for analysis, _ in results], all(cached for _, cached in results)
+
+
+def reference_analyses(entries):
+    found = {}
+    for entry in entries:
+        key = entry.get('analysisKey')
+        if key is None:
             continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-load_env()
-
-
-def clean_string(value: Any) -> str | None:
-    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def basename(value: str) -> str:
-    clean = value.split("?", 1)[0]
-    return Path(clean).name or clean
-
-
-def truncate(value: str, limit: int = MAX_LABEL_LENGTH) -> str:
-    return value if len(value) <= limit else f"{value[: limit - 3]}..."
-
-
-def safe_id(value: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9._:-]+", "_", value)[:120]
-
-
-def unique(values: list[str | None]) -> list[str]:
-    result: list[str] = []
-    for value in values:
-        if value and value not in result:
-            result.append(value)
-    return result
-
-
-def sanitize_value(value: Any, depth: int = 0) -> Any:
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    if isinstance(value, str):
-        return truncate(value, MAX_STRING_LENGTH)
-    if depth >= MAX_SUMMARY_DEPTH:
-        return "[truncated]"
-    if isinstance(value, list):
-        items = [sanitize_value(item, depth + 1) for item in value[:MAX_ARRAY_ITEMS]]
-        if len(value) > MAX_ARRAY_ITEMS:
-            items.append(f"[+{len(value) - MAX_ARRAY_ITEMS} more]")
-        return items
-    if isinstance(value, dict):
-        entries = list(value.items())
-        output = {
-            key: sanitize_value(item, depth + 1)
-            for key, item in entries[:MAX_OBJECT_KEYS]
-        }
-        if len(entries) > MAX_OBJECT_KEYS:
-            output["__truncated__"] = f"{len(entries) - MAX_OBJECT_KEYS} more keys"
-        return output
-    return str(value)
-
-
-def normalize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
-    calls: list[dict[str, Any]] = []
-    used_ids: set[str] = set()
-
-    for index, tool_call in enumerate(tool_calls if isinstance(tool_calls, list) else []):
-        if not isinstance(tool_call, dict) or not clean_string(tool_call.get("name")):
-            continue
-        raw_id = str(tool_call.get("id", index))
-        call_id = str(index) if raw_id in used_ids else raw_id
-        used_ids.add(call_id)
-        calls.append(
-            {
-                "id": call_id,
-                "tool": tool_call["name"],
-                "args": tool_call.get("args") or {},
-                "response": tool_call.get("response") or {},
-                "timeIndex": index,
-            }
-        )
-
-    return calls
-
-
-def get_cache_path(trace_id: Any, calls: list[dict[str, Any]]) -> tuple[Path, str]:
-    safe_trace_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(trace_id or "trace"))[:80]
-    cache_key = sha256(
-        json.dumps(
-            {
-                "schema": "prov-workflow-py-v8",
-                "calls": calls,
-                "semanticCandidates": MAX_SEMANTIC_EDGE_CANDIDATES,
-                "tokenChamferThreshold": TOKEN_CHAMFER_THRESHOLD,
-            },
-            sort_keys=True,
-            default=str,
-        ).encode()
-    ).hexdigest()[:12]
-    filename = f"{safe_trace_id or 'trace'}-{cache_key}.json"
-
-    return GRAPH_CACHE_DIR / filename, f"/.cache/generated-prov-graphs/{filename}"
-
-
-def output_metadata(response: Any) -> dict[str, str | None] | None:
-    if not isinstance(response, dict):
-        return None
-
-    for key in OUTPUT_METADATA_KEYS:
-        metadata = response.get(key)
-        if not isinstance(metadata, dict):
-            continue
-        output = {
-            "id": clean_string(metadata.get("id")),
-            "path": clean_string(metadata.get("path")),
-            "name": clean_string(metadata.get("name")),
-        }
-        if output["id"] or output["path"] or output["name"]:
-            return output
-
-    output = {
-        "id": clean_string(response.get("id")),
-        "path": clean_string(response.get("path")),
-        "name": clean_string(response.get("name")),
-    }
-    return output if output["id"] or output["path"] or output["name"] else None
-
-
-def output_entity(call: dict[str, Any]) -> dict[str, Any] | None:
-    metadata = output_metadata(call["response"])
-    key = metadata and (metadata["id"] or metadata["path"] or metadata["name"])
-
-    if not metadata or not key:
-        return None
-
-    return {
-        "id": f"ent:output:{safe_id(key)}",
-        "kind": "Entity",
-        "entityType": "tool_output",
-        "response": sanitize_value(call["response"]),
-    }
-
-
-def output_keys(call: dict[str, Any]) -> list[str]:
-    metadata = output_metadata(call["response"])
-    if not metadata:
-        return []
-    key = metadata["id"] or metadata["path"] or metadata["name"]
-    return unique([metadata["id"], metadata["path"], metadata["name"], basename(key)] if key else [])
-
-
-def referenced_refs(args: Any, known_refs: dict[str, set[str]]) -> set[str]:
-    args_text = json.dumps(args, default=str)
-    refs: set[str] = set()
-    for key, equivalents in known_refs.items():
-        if key and key in args_text:
-            refs.update(equivalents)
-    return refs
-
-
-def summarize(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    summaries = []
-    known_refs: dict[str, set[str]] = {}
-
-    for call in calls:
-        raw_output_keys = output_keys(call)
-        consumed_refs = referenced_refs(call["args"], known_refs)
-        reusable_output_keys = [key for key in raw_output_keys if key not in consumed_refs]
-
-        summaries.append(
-            {
-                "call": call,
-                "activity": {
-                    "id": f"act:{call['id']}",
-                    "kind": "Activity",
-                    "toolCallId": call["id"],
-                    "tool": call["tool"],
-                    "timeIndex": call["timeIndex"],
-                    "args": sanitize_value(call["args"]),
-                },
-                "output": output_entity(call),
-                "outputKeys": reusable_output_keys,
-            }
-        )
-
-        if reusable_output_keys:
-            equivalent_refs = set(raw_output_keys)
-            for key in raw_output_keys:
-                known_refs[key] = equivalent_refs
-
-    return summaries
-
-
-def edge_key(edge: dict[str, str]) -> str:
-    return f"{edge['source']}|{edge['target']}|{edge['relation']}"
-
-
-def args_use_output(next_summary: dict[str, Any], previous: dict[str, Any]) -> bool:
-    output_keys = previous.get("outputKeys") or []
-    if not output_keys:
-        return False
-    args_text = json.dumps(next_summary["call"]["args"], default=str)
-    return any(key and key in args_text for key in output_keys)
-
-
-def artifact_evidence(next_summary: dict[str, Any], previous: dict[str, Any]) -> list[dict[str, Any]]:
-    output_keys = previous.get("outputKeys") or []
-    args_text = json.dumps(next_summary["call"]["args"], default=str)
-    shared = unique([basename(key) for key in output_keys if key and key in args_text])
-    return [{"kind": "artifact", "shared": shared[:8]}] if shared else []
-
-
-def edge_from(previous: dict[str, Any], next_summary: dict[str, Any]) -> dict[str, str]:
-    output = previous.get("output")
-    return {
-        "source": output["id"] if output else previous["activity"]["id"],
-        "target": next_summary["activity"]["id"],
-        "relation": "usedBy" if output else "informedBy",
-    }
-
-
-def exact_artifact_edges(summaries: list[dict[str, Any]]) -> list[dict[str, str]]:
-    edges = []
-    for index, next_summary in enumerate(summaries):
-        for previous in summaries[:index]:
-            if args_use_output(next_summary, previous):
-                edge = edge_from(previous, next_summary)
-                edge["evidence"] = artifact_evidence(next_summary, previous)
-                edges.append(edge)
-    return edges
-
-
-def scalar_texts(value: Any) -> list[str]:
-    if isinstance(value, bool) or value is None:
-        return []
-    if isinstance(value, (int, float)):
-        return []
-    if isinstance(value, str):
-        return [str(value)]
-    if isinstance(value, list):
-        return [text for item in value for text in scalar_texts(item)]
-    if isinstance(value, dict):
-        return [text for item in value.values() for text in scalar_texts(item)]
-    return []
-
-
-def useful_token(value: str) -> bool:
-    token = value.strip("._:-")
-    return (
-        len(token) >= 4
-        or (len(token) >= 2 and any(char.isdigit() for char in token))
-        or (len(token) >= 2 and token.isupper())
-    )
-
-
-def tokens_from(value: Any) -> set[str]:
-    tokens: set[str] = set()
-    for text in scalar_texts(value):
-        for raw_token in re.findall(r"[A-Za-z0-9][A-Za-z0-9._:-]*", text):
-            token = raw_token.strip("._:-")
-            if useful_token(token):
-                tokens.add(token.lower())
-            base = basename(token)
-            if base != token and useful_token(base):
-                tokens.add(base.lower())
-    return tokens
-
-
-def token_weights(output_tokens: list[set[str]]) -> dict[str, float]:
-    output_count = max(len(output_tokens), 1)
-    output_frequency = Counter(token for tokens in output_tokens for token in tokens)
-
-    return {
-        token: math.log((output_count + 1) / (count + 1)) + 1
-        for token, count in output_frequency.items()
-    }
-
-
-def semantic_candidate_edges(
-    summaries: list[dict[str, Any]],
-    graph_edges: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    hard_targets = {edge["target"] for edge in graph_edges if edge["relation"] == "usedBy"}
-    input_token_sets = [tokens_from(summary["call"]["args"]) for summary in summaries]
-    output_token_sets = [tokens_from(summary["call"]["response"]) for summary in summaries]
-    weights = token_weights(output_token_sets)
-    output_index: dict[str, list[int]] = {}
-    threshold = TOKEN_CHAMFER_THRESHOLD
-    candidates = []
-
-    for index, next_summary in enumerate(summaries):
-        if next_summary["activity"]["id"] in hard_targets:
-            for token in output_token_sets[index]:
-                output_index.setdefault(token, []).append(index)
-            continue
-
-        input_tokens = input_token_sets[index]
-        total_weight = sum(weights.get(token, 1.0) for token in input_tokens)
-        matched_weight: dict[int, float] = {}
-        matched_tokens: dict[int, set[str]] = {}
-
-        if total_weight:
-            for token in input_tokens:
-                token_weight = weights.get(token, 1.0)
-                for previous_index in output_index.get(token, []):
-                    matched_weight[previous_index] = (
-                        matched_weight.get(previous_index, 0) + token_weight
-                    )
-                    matched_tokens.setdefault(previous_index, set()).add(token)
-
-            ranked = sorted(
-                (
-                    {
-                        "previous": summaries[previous_index],
-                        "score": score / total_weight,
-                        "shared": matched_tokens[previous_index],
-                    }
-                    for previous_index, score in matched_weight.items()
-                    if score / total_weight >= threshold
-                ),
-                key=lambda item: (
-                    -item["score"],
-                    -len(item["shared"]),
-                    index - item["previous"]["call"]["timeIndex"],
-                ),
-            )
-
-            for item in ranked[:MAX_SEMANTIC_EDGE_CANDIDATES]:
-                if not item["previous"].get("output"):
-                    continue
-                edge = edge_from(item["previous"], next_summary)
-                edge["relation"] = "informedBy"
-                edge["evidence"] = [
-                    {
-                        "kind": "shared_token",
-                        "score": round(item["score"], 3),
-                        "shared": sorted(item["shared"])[:16],
-                    }
-                ]
-                candidates.append(edge)
-
-        for token in output_token_sets[index]:
-            output_index.setdefault(token, []).append(index)
-
-    return candidates
-
-
-def build_graph(summaries: list[dict[str, Any]], selected: list[dict[str, Any]]) -> dict[str, Any]:
-    nodes: dict[str, dict[str, Any]] = {}
-    edges: dict[str, dict[str, Any]] = {}
-
-    def add_edge(edge: dict[str, Any]) -> None:
-        source = nodes.get(edge["source"])
-        target = nodes.get(edge["target"])
-        if source and target and source.get("kind") == target.get("kind"):
-            return
-        edges[edge_key(edge)] = edge
-
-    for summary in summaries:
-        nodes[summary["activity"]["id"]] = summary["activity"]
-        if summary["output"]:
-            nodes[summary["output"]["id"]] = summary["output"]
-            add_edge(
-                {
-                    "source": summary["activity"]["id"],
-                    "target": summary["output"]["id"],
-                    "relation": "generatedBy",
-                }
-            )
-
-    for edge in selected:
-        add_edge(edge)
-
-    return {"nodes": list(nodes.values()), "edges": list(edges.values())}
-
-
-def prompt(
-    draft_graph: dict[str, Any],
-    semantic_candidates: list[dict[str, Any]],
-) -> str:
-    return f"""Select direct provenance connections from ordered tool calls.
-
-Model each call as input Entity -> tool Activity -> output Entity.
-Use Activity node args, Entity node responses, and edge evidence to refine direct tool-call dependencies.
-Keep the graph strictly bipartite: Activity -> Entity for generated outputs, Entity -> Activity for consumed inputs. Do not connect Activity -> Activity or Entity -> Entity.
-The draft graph contains only structural generatedBy edges and exact artifact usedBy edges.
-Exact id/path/url/filename matches from Activity args to Entity response metadata are strong direct usedBy evidence.
-Optional semantic candidates are not graph edges. Add one only when the target Activity clearly uses information from the source Entity and no exact artifact edge already explains that Activity.
-Shared-token evidence is weak context. Schema words, column names, common labels, and generic domain words are insufficient for direct provenance.
-Use Activity args and Entity response JSON to reason about logical reuse of genes, pathways, ranked lists, candidate sets, files, and result artifacts.
-If a call has no direct predecessor, leave it as a root.
-Prune redundant nodes when they do not add a distinct artifact, transformation, decision, or analysis step.
-Do not use fixed tool-name assumptions. Decide from Activity args, Entity responses, edge evidence, and graph context.
-Return edits as graph patch operations.
-You may add semantic Entity nodes for meaningful intermediate data objects, but do not add Activity nodes.
-If pruning an Activity because its output only repeats an input artifact, remove both the Activity and its generated output Entity.
-
-ProvEdge:
-{{
-  "source": "node id",
-  "target": "node id",
-  "relation": "usedBy | generatedBy | informedBy",
-  "evidence": [{{"kind":"artifact | shared_token | llm","shared":["optional"],"score":0.5}}]
-}}
-
-Return JSON:
-{{"edits":[
-  {{"op":"addNode","node":{{"id":"ent:semantic:candidate_genes","kind":"Entity","entityType":"gene_list","response":["CTNNB1","LEF1"]}}}},
-  {{"op":"editNode","nodeId":"act:id","patch":{{"args":{{}}}}}},
-  {{"op":"editNode","nodeId":"ent:id","patch":{{"entityType":"gene_list","response":[]}}}},
-  {{"op":"removeNode","nodeId":"node id"}},
-  {{"op":"addEdge","edge":{{"source":"node id","target":"node id","relation":"usedBy","evidence":[{{"kind":"llm","shared":["optional"]}}]}}}},
-  {{"op":"removeEdge","edge":{{"source":"node id","target":"node id","relation":"usedBy"}}}},
-  {{"op":"editEdge","edge":{{"source":"node id","target":"node id","relation":"informedBy"}},"nextEdge":{{"source":"node id","target":"node id","relation":"usedBy"}}}}
-]}}
-
-draftGraph:
-{json.dumps(draft_graph, indent=2)}
-
-optionalSemanticCandidateEdges:
-{json.dumps(semantic_candidates, indent=2)}"""
-
-
-def completion_text(response: Any) -> str:
-    content = response.choices[0].message.content if response.choices else ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-    return ""
-
-
-def parse_edge(value: Any) -> dict[str, str] | None:
-    if not isinstance(value, dict):
-        return None
-    source = value.get("source") if isinstance(value.get("source"), str) else ""
-    target = value.get("target") if isinstance(value.get("target"), str) else ""
-    relation = value.get("relation")
-    if source and target and relation in {"usedBy", "generatedBy", "informedBy"}:
-        edge = {"source": source, "target": target, "relation": relation}
-        if isinstance(value.get("evidence"), list):
-            edge["evidence"] = value["evidence"][:8]
-        return edge
-    return None
-
-
-def parse_entity_node(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        return None
-    node_id = safe_id(value.get("id", "")) if isinstance(value.get("id"), str) else ""
-    entity_type = clean_string(value.get("entityType"))
-    if not node_id.startswith("ent:") or value.get("kind") != "Entity" or not entity_type:
-        return None
-    node = {
-        "id": node_id,
-        "kind": "Entity",
-        "entityType": entity_type,
-    }
-    if "response" in value:
-        node["response"] = sanitize_value(value["response"])
-    return node
-
-
-def parse_node_patch(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        return None
-    patch: dict[str, Any] = {}
-    for key in ("tool", "entityType"):
-        text = clean_string(value.get(key))
-        if text:
-            patch[key] = text
-    if "args" in value:
-        patch["args"] = sanitize_value(value["args"])
-    if "response" in value:
-        patch["response"] = sanitize_value(value["response"])
-    return patch or None
-
-
-def parse_llm_graph_patch(text: str) -> dict[str, Any]:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end < start:
-        return {"edits": []}
+        if not isinstance(key, str) or not re.fullmatch(r'[0-9a-f]{64}', key):
+            raise ValueError('Reference analysisKey must be a SHA-256 digest.')
+        cached = read_cache(CACHE_DIR / 'analyses' / f'{key}.json')
+        if cached is not None and cached['traceId'] == str(entry['traceId']) and cached['frameworkVersion'] == FRAMEWORK_VERSION:
+            found[str(entry['traceId'])] = with_context(cached, entry)
+    requested = {str(entry['traceId']) for entry in entries}
+    return list(found.values()), {'requestedCount': len(requested), 'cachedCount': len(found),
+                                 'missingCount': len(requested - found.keys()),
+                                 'source': 'Cached source traces only; missing traces are unknown.'}
+
+
+async def comparison_view(analyses, reference, cohort, focus='', detail='overview', tool_reference=(), lane_by='agent'):
+    started = perf_counter()
+    if any(analysis.get('workflow') for analysis in analyses):
+        for analysis in analyses:
+            if not analysis.get('workflow'):
+                analysis['workflow'] = normalize_workflow({}, analysis['calls'])
+        references = {analysis['traceId']: analysis for analysis in reference if analysis.get('workflow')}
+        for entry in tool_reference:
+            if entry.get('workflowSummary'):
+                references.setdefault(str(entry['traceId']), {**entry, 'traceId': str(entry['traceId']), 'workflow': entry['workflowSummary']})
+        text_runs = [analysis for analysis in analyses if analysis.get('finalOutput')]
+        with capture_metrics() as metrics:
+            if text_runs:
+                evidence, interpretation = await associate_results(text_runs)
+                analyses = [{**analysis, 'resultEvidence': evidence[analysis['traceId']],
+                             'resultAnchors': sorted({link['callId'] for claim in evidence[analysis['traceId']]['claims']
+                                                      for link in claim['links'] if link['relation'] in {'supports', 'contradicts'}})}
+                            if analysis['traceId'] in evidence else analysis for analysis in analyses]
+            assessments = await assess_workflow(analyses, focus=focus)
+        graph = build_workflow_view(analyses, list(references.values()), cohort, focus, detail, lane_by,
+                                    workflow_assessments=assessments)
+        graph['modelMetrics'] = {'requestCount': len(metrics),
+                                 'elapsedSeconds': round(sum(m['elapsedSeconds'] for m in metrics), 3),
+                                 'promptTokens': sum(m['promptTokens'] or 0 for m in metrics), 'requests': metrics}
+        if text_runs:
+            graph['resultInterpretation'] = interpretation
+        graph['processingSeconds'] = round(perf_counter() - started, 6)
+        return graph, assessments['cached'] and (not text_runs or interpretation['newTraces'] == 0)
+    universe = {a['traceId']: a for a in reference}
+    universe.update({a['traceId']: a for a in analyses})
+    sources = [resolve_targets(universe[key]) for key in sorted(universe)]
+
+    async def annotate_and_link():
+        policy, annotation = await annotate_types(sources, focus)
+        enriched = {a['traceId']: instantiate(a, policy) for a in sources}
+        links, reasoning = await infer_links([enriched[a['traceId']] for a in analyses])
+        enriched = {key: {**a, 'flow': a['flow'] + links[key]} if key in links else a
+                    for key, a in enriched.items()}
+        return enriched, annotation, reasoning
 
     try:
-        parsed = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return {"edits": []}
-
-    edits = []
-    for edit in parsed.get("edits", []):
-        if not isinstance(edit, dict):
-            continue
-        if edit.get("op") in {"addEdge", "removeEdge"}:
-            edge = parse_edge(edit.get("edge"))
-            if edge:
-                edits.append({"op": edit["op"], "edge": edge})
-        elif edit.get("op") == "editEdge":
-            edge = parse_edge(edit.get("edge"))
-            next_edge = parse_edge(edit.get("nextEdge"))
-            if edge and next_edge:
-                edits.append({"op": "editEdge", "edge": edge, "nextEdge": next_edge})
-        elif edit.get("op") == "addNode":
-            node = parse_entity_node(edit.get("node"))
-            if node:
-                edits.append({"op": "addNode", "node": node})
-        elif edit.get("op") == "removeNode" and isinstance(edit.get("nodeId"), str):
-            edits.append({"op": "removeNode", "nodeId": edit["nodeId"]})
-        elif edit.get("op") == "editNode" and isinstance(edit.get("nodeId"), str):
-            patch = parse_node_patch(edit.get("patch"))
-            if patch:
-                edits.append({"op": "editNode", "nodeId": edit["nodeId"], "patch": patch})
-
-    return {"edits": edits}
+        with capture_metrics() as metrics:
+            (enriched, annotation, reasoning), (results, result_metrics) = await together(
+                annotate_and_link(), associate_results(analyses))
+            enriched = {key: {**a, 'resultEvidence': results[key], 'resultAnchors': sorted({
+                link['callId'] for claim in results[key]['claims'] for link in claim['links']
+                if link['relation'] in {'supports', 'contradicts'}})} if key in results else a
+                for key, a in enriched.items()}
+    except (KeyError, TypeError, IndexError) as error:
+        raise ModelResponseError(f'Invalid pattern annotation: {error}') from error
+    selected = [enriched[a['traceId']] for a in analyses]
+    enriched_reference = [{**entry, 'instances': enriched[entry['traceId']]['instances']} for entry in reference]
+    graph = build_views(selected, enriched_reference, cohort, focus, detail, tool_reference)
+    graph['modelMetrics'] = {'requestCount': len(metrics),
+                             'elapsedSeconds': round(sum(m['elapsedSeconds'] for m in metrics), 3),
+                             'promptTokens': sum(m['promptTokens'] or 0 for m in metrics),
+                             'requests': metrics}
+    graph['annotation'] = annotation
+    graph['reasoning'] = reasoning
+    graph['resultInterpretation'] = result_metrics
+    graph['processingSeconds'] = round(perf_counter() - started, 6)
+    return graph, annotation['newTypes'] == 0 and reasoning['newTraces'] == 0 and result_metrics['newTraces'] == 0
 
 
-def portkey_client() -> tuple[AsyncPortkey, str]:
-    api_key = os.getenv("PORTKEY_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing PORTKEY_API_KEY.")
-
-    return (
-        AsyncPortkey(
-            api_key=api_key,
-            base_url=(os.getenv("PORTKEY_BASE_URL") or DEFAULT_BASE_URL).rstrip("/"),
-            provider=os.getenv("PORTKEY_PROVIDER"),
-            strict_open_ai_compliance=False,
-        ),
-        os.getenv("PORTKEY_MODEL") or DEFAULT_MODEL,
-    )
+@app.get('/health')
+def health():
+    return {'ok': True, 'framework': FRAMEWORK_VERSION, 'promptVersion': PROMPT_VERSION,
+            'workflowPromptVersion': WORKFLOW_PROMPT_VERSION, 'workflowReviewRoundLimit': WORKFLOW_ROUND_LIMIT}
 
 
-async def refine_graph(
-    draft_graph: dict[str, Any],
-    semantic_candidates: list[dict[str, Any]],
-) -> dict[str, Any]:
-    try:
-        client, model = portkey_client()
-    except RuntimeError:
-        return {"edits": []}
-
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt(draft_graph, semantic_candidates),
-                }
-            ],
-        )
-        print(f"[graph-refine] LLM raw response:\n{response.model_dump_json(indent=2)}", flush=True)
-    except Exception as error:
-        print(f"[graph-refine] LLM request failed: {type(error).__name__}: {error}", flush=True)
-        return {"edits": []}
-    finally:
-        await client.close()
-
-    return parse_llm_graph_patch(completion_text(response))
+@app.get('/api/pattern-policy')
+def pattern_policy():
+    return {'promptVersion': PROMPT_VERSION, 'reasoningVersion': REASONING_VERSION,
+            'resultVersion': RESULT_VERSION, 'outcomeVersion': OUTCOME_VERSION, 'framework': FRAMEWORK_VERSION}
 
 
-def tool_sets_prompt(tool_names: list[str]) -> str:
-    return f"""Group these exact tool names into semantic visualization sets.
-
-Return JSON only, with group names as keys and arrays of exact tool names as values.
-Every tool name must appear exactly once. Do not invent tool names.
-
-toolNames:
-{json.dumps(tool_names, indent=2)}"""
-
-
-def parse_tool_sets(text: str, tool_names: list[str]) -> dict[str, list[str]]:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end < start:
-        return {}
-
-    try:
-        parsed = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return {}
-
-    allowed = set(tool_names)
-    used: set[str] = set()
-    tool_sets: dict[str, list[str]] = {}
-
-    for group_name, tools in parsed.items():
-        if not isinstance(group_name, str) or not isinstance(tools, list):
-            continue
-        items = [tool for tool in tools if tool in allowed and tool not in used]
-        if items:
-            tool_sets[group_name] = items
-            used.update(items)
-
-    missing = [tool for tool in tool_names if tool not in used]
-    if missing and tool_sets:
-        tool_sets["other tools"] = missing
-
-    return tool_sets
-
-
-async def generate_tool_sets(tool_names: list[str]) -> dict[str, list[str]]:
-    try:
-        client, model = portkey_client()
-    except RuntimeError as error:
-        print(f"[tool-sets] config error: {error}", flush=True)
-        return {}
-
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": tool_sets_prompt(tool_names),
-                }
-            ],
-        )
-    except Exception as error:
-        print(f"[tool-sets] LLM request failed: {type(error).__name__}: {error}", flush=True)
-        return {}
-    finally:
-        await client.close()
-
-    print(f"[tool-sets] LLM raw response:\n{response.model_dump_json(indent=2)}", flush=True)
-    text = completion_text(response)
-    print(f"[tool-sets] LLM message content:\n{text}", flush=True)
-
-    generated = parse_tool_sets(text, tool_names)
-    if not generated:
-        print("[tool-sets] parsed no valid tool-set groups", flush=True)
-
-    return generated
-
-
-def patch_node(node: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
-    next_node = {**node}
-    if node.get("kind") == "Activity":
-        for key in ("tool", "args"):
-            if key in patch:
-                next_node[key] = patch[key]
-    else:
-        for key in ("entityType", "response"):
-            if key in patch:
-                next_node[key] = patch[key]
-    return next_node
-
-
-def apply_graph_patch(
-    graph: dict[str, Any],
-    patch: dict[str, Any],
-    suggested_edges: list[dict[str, Any]],
-) -> dict[str, Any]:
-    nodes = {node["id"]: node for node in graph["nodes"]}
-    edges = {edge_key(edge): edge for edge in graph["edges"]}
-    suggested = {edge_key(edge): edge for edge in suggested_edges}
-
-    def add_edge(edge: dict[str, Any]) -> None:
-        source = nodes.get(edge["source"])
-        target = nodes.get(edge["target"])
-        if not source or not target:
-            return
-        if source.get("kind") == target.get("kind"):
-            return
-        edges[edge_key(edge)] = edge
-
-    for edit in patch.get("edits", []):
-        if edit.get("op") == "addNode" and edit["node"]["id"] not in nodes:
-            nodes[edit["node"]["id"]] = edit["node"]
-
-    for edit in patch.get("edits", []):
-        if edit.get("op") == "editNode":
-            node = nodes.get(edit["nodeId"])
-            if node:
-                nodes[node["id"]] = patch_node(node, edit["patch"])
-        elif edit.get("op") == "removeNode":
-            nodes.pop(edit["nodeId"], None)
-            edges = {
-                key: edge
-                for key, edge in edges.items()
-                if edge["source"] != edit["nodeId"] and edge["target"] != edit["nodeId"]
-            }
-
-    for edit in patch.get("edits", []):
-        if edit.get("op") == "addEdge":
-            add_edge(suggested.get(edge_key(edit["edge"]), edit["edge"]))
-        elif edit.get("op") == "removeEdge":
-            edges.pop(edge_key(edit["edge"]), None)
-        elif edit.get("op") == "editEdge":
-            edges.pop(edge_key(edit["edge"]), None)
-            add_edge(suggested.get(edge_key(edit["nextEdge"]), edit["nextEdge"]))
-
-    return {
-        "nodes": list(nodes.values()),
-        "edges": [
-            edge
-            for edge in edges.values()
-            if edge["source"] in nodes and edge["target"] in nodes
-        ],
-    }
-
-
-@app.get("/health")
-def health() -> dict[str, bool]:
-    return {"ok": True}
-
-
-@app.post("/api/prov-graph")
+@app.post('/api/prov-graph')
 async def prov_graph(request: Request):
-    body = await request.json()
-    calls = normalize_tool_calls(body.get("toolCalls"))
-
-    if not calls:
-        return {"dag": {"nodes": [], "edges": []}, "cached": False}
-
-    cache_path, public_path = get_cache_path(body.get("traceId"), calls)
-    if cache_path.exists():
-        return {
-            "dag": json.loads(cache_path.read_text()),
-            "cached": True,
-            "cachePath": public_path,
-        }
-
-    summaries = summarize(calls)
-    graph_edges = exact_artifact_edges(summaries)
-    semantic_edges = semantic_candidate_edges(summaries, graph_edges)
-    draft_graph = build_graph(summaries, graph_edges)
-    patch = await refine_graph(draft_graph, semantic_edges)
-    dag = apply_graph_patch(draft_graph, patch, [*graph_edges, *semantic_edges])
-
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(dag, indent=2))
-
-    return {"dag": dag, "cached": False, "cachePath": public_path}
+    try:
+        analysis, cached = await analyze_trace(await request.json())
+        result = {'dag': analysis['graph'], 'analysis': {key: analysis[key] for key in ('traceId', 'analysisKey', 'frameworkVersion')}, 'cached': cached}
+        if analysis.get('workflow'):
+            result['tracing'] = {'id': analysis['traceId'], 'eventSchemaVersion': 'workflow-events-v1',
+                                 'toolCalls': [{'name': call['tool'], **{key: value for key, value in call.items()
+                                               if key not in {'tool', 'sourceId', 'traceId', 'timeIndex'}}} for call in analysis['calls']],
+                                 'participants': analysis['workflow']['participants'],
+                                 'outcomes': analysis['workflow']['outcomes']}
+        return result
+    except (ValueError, KeyError, TypeError, FileNotFoundError) as error:
+        return PlainTextResponse(f'Invalid trace: {error}', status_code=422)
 
 
-@app.post("/api/joined-provenance-graph")
+@app.get('/api/workflow-corpora')
+def workflow_corpora():
+    return {'corpora': list_corpora()}
+
+
+@app.get('/api/workflow-corpora/{corpus_id}')
+def workflow_corpus(corpus_id: str):
+    try:
+        return load_manifest(corpus_id)
+    except (ValueError, FileNotFoundError) as error:
+        return PlainTextResponse(str(error), status_code=404)
+
+
+@app.post('/api/import-workflows')
+async def import_workflows(request: Request):
+    try:
+        body = await request.json()
+        records = body['records']
+        traces = (record if record.get('eventSchemaVersion') else import_record(record, f'upload:{index}')
+                  for index, record in enumerate(records))
+        return save_corpus(traces, body.get('label', 'Imported workflows'))
+    except (ValueError, KeyError, TypeError) as error:
+        return PlainTextResponse(f'Invalid workflow import: {error}', status_code=422)
+
+
+@app.post('/api/joined-provenance-graph')
 async def joined_provenance_graph(request: Request):
-    body = await request.json()
-    graphs = body.get("graphs") if isinstance(body.get("graphs"), list) else []
-    threshold = body.get("threshold")
+    try:
+        body = await request.json()
+        detail = body.get('detail', 'overview')
+        if detail not in {'overview', 'all'}:
+            raise ValueError('detail must be overview or all.')
+        analyses, cached = await analyze_selection(body.get('graphs', []))
+        reference, cohort = reference_analyses(body.get('referenceCohort', []))
+        graph, annotated = await comparison_view(analyses, reference, cohort, body.get('focus', ''), detail,
+                                                body.get('referenceCohort', []), body.get('laneBy', 'agent'))
+        return {'joinedGraph': graph, 'cached': cached and annotated}
+    except ModelResponseError as error:
+        return PlainTextResponse(f'Invalid pattern annotation: {error}', status_code=502)
+    except (ValueError, KeyError, TypeError) as error:
+        return PlainTextResponse(f'Invalid comparison: {error}', status_code=422)
+    except Exception as error:
+        return PlainTextResponse(f'Pattern annotation failed: {type(error).__name__}: {error}', status_code=502)
 
-    return {
-        "joinedGraph": build_joined_provenance_graph(
-            graphs,
-            threshold if isinstance(threshold, (int, float)) else 0.75,
-        )
-    }
+
+@app.post('/api/validate-path')
+async def validate_path(request: Request):
+    try:
+        body = await request.json()
+        if not isinstance(body.get('familyPath'), list) or len(body['familyPath']) < 2:
+            raise ValueError('familyPath needs at least two stage IDs.')
+        analyses, _ = await analyze_selection(body.get('graphs', []))
+        reference, cohort = reference_analyses(body.get('referenceCohort', []))
+        graph, _ = await comparison_view(analyses, reference, cohort, body.get('focus', ''), body.get('detail', 'overview'),
+                                        body.get('referenceCohort', []), body.get('laneBy', 'agent'))
+        witnesses = compatible_path(graph, body['familyPath'], str(body['traceId']))
+        return {'valid': bool(witnesses), 'witnessChains': witnesses}
+    except ModelResponseError as error:
+        return PlainTextResponse(f'Invalid pattern annotation: {error}', status_code=502)
+    except (ValueError, KeyError, TypeError) as error:
+        return PlainTextResponse(f'Invalid path: {error}', status_code=422)
 
 
-@app.post("/api/tool-sets")
+@app.post('/api/tool-sets')
 async def tool_sets(request: Request):
-    body = await request.json()
-    tool_names = sorted({
-        item
-        for item in body.get("toolNames", [])
-        if isinstance(item, str) and item.strip()
-    })
-    cache_key = body.get("cacheKey") if isinstance(body.get("cacheKey"), str) else ""
-
-    if not tool_names:
-        return {"toolSets": {}, "cached": False}
-
-    if not re.fullmatch(r"[a-f0-9]{64}", cache_key):
-        cache_key = sha256(json.dumps(tool_names, sort_keys=True).encode()).hexdigest()
-
-    cache_path = TOOL_SET_CACHE_DIR / f"{cache_key}.json"
-    if cache_path.exists():
-        return {"toolSets": json.loads(cache_path.read_text()), "cached": True}
-
-    generated = await generate_tool_sets(tool_names)
-    if not generated:
-        return PlainTextResponse("Unable to generate tool sets.", status_code=502)
-
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(generated, indent=2))
-
-    return {"toolSets": generated, "cached": False}
+    names = sorted(set((await request.json()).get('toolNames', [])))
+    groups = {}
+    for name in names:
+        namespace = re.split(r'[_.:/]', name, maxsplit=1)[0] or 'Tools'
+        groups.setdefault(namespace, []).append(name)
+    return {'toolSets': groups, 'cached': True}
 
 
-@app.post("/api/provenance-agent")
+@app.post('/api/provenance-agent')
 async def provenance_agent(request: Request):
     return await provenance_agent_response(await request.json(), portkey_client)

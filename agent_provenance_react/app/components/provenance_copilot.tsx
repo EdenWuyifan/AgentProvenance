@@ -7,6 +7,7 @@ import {
   type CopilotHistoryMessage,
   type CopilotStreamEvent,
 } from "./provenance_copilot_agent";
+import type { GraphAction, GraphViewState } from "./graph_controls";
 import type { AgentDag, GraphMode, JoinedProvenanceGraph, Tracing } from "./types";
 
 type ProvenanceCopilotProps = {
@@ -14,6 +15,8 @@ type ProvenanceCopilotProps = {
   selectedTraceDags: Record<string, AgentDag>;
   joinedGraph: JoinedProvenanceGraph | null;
   graphMode: GraphMode;
+  graphState: GraphViewState | null;
+  onGraphAction: (action: GraphAction) => void;
 };
 
 type PanelPosition = {
@@ -60,11 +63,14 @@ type CopilotMessage = {
   thinking?: string;
   steps?: CopilotStep[];
   error?: string;
+  scope?: string;
+  actionSummary?: string;
+  metrics?: { modelRequests: number; toolCalls: number; elapsedSeconds: number };
 };
 
 const DEFAULT_PANEL_SIZE = {
   width: 540,
-  height: 320,
+  height: 440,
 } as const;
 const MIN_PANEL_WIDTH = 360;
 const MIN_PANEL_HEIGHT = 220;
@@ -97,6 +103,7 @@ function memoryMessages(messages: CopilotMessage[]): CopilotHistoryMessage[] {
     .slice(-MAX_MEMORY_MESSAGES)
     .map((message) => ({
       role: message.role,
+      scope: message.scope,
       content: message.content.trim(),
     }));
 }
@@ -115,7 +122,7 @@ function renderInlineMarkdown(text: string) {
     .filter(Boolean)
     .map((part, index) => {
       if (part.startsWith("**") && part.endsWith("**")) {
-        return <strong key={index}>{part.slice(2, -2)}</strong>;
+        return <strong key={index}>{part.slice(2, -2).replace(/`([^`]+)`/g, "$1")}</strong>;
       }
 
       if (part.startsWith("`") && part.endsWith("`")) {
@@ -236,7 +243,14 @@ export function ProvenanceCopilot({
   selectedTraceDags,
   joinedGraph,
   graphMode,
+  graphState,
+  onGraphAction,
 }: ProvenanceCopilotProps) {
+  const requestController = useRef<AbortController | null>(null);
+  const scope = graphState?.scope;
+  const currentScope = useRef(scope);
+  currentScope.current = scope;
+  useEffect(() => { requestController.current?.abort(); setLoading(false); return () => requestController.current?.abort(); }, [scope]);
   const agent = useMemo(() => new ProvenanceCopilotAgent(), []);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
@@ -273,6 +287,7 @@ export function ProvenanceCopilot({
         .map((message) => ({
           id: newId(message.role),
           role: message.role,
+          scope: message.scope,
           content: message.content,
         }))
     );
@@ -477,6 +492,18 @@ export function ProvenanceCopilot({
   }
 
   function applyStreamEvent(assistantId: string, streamEvent: CopilotStreamEvent) {
+    if (streamEvent.type === "graph_action") {
+      if (streamEvent.action.scope !== currentScope.current) return;
+      onGraphAction(streamEvent.action);
+      const action = streamEvent.action;
+      updateAssistantMessage(assistantId, (message) => ({ ...message, actionSummary: action.type === 'set_graph_view'
+        ? message.actionSummary ? `${message.actionSummary} · View updated` : 'Updated graph view' : `${action.type === 'filter_graph' ? 'Filtered to' : 'Highlighted'} ${action.nodeIds.length} stages · ${action.edgeIds.length} connections` }));
+      return;
+    }
+    if (streamEvent.type === "telemetry") {
+      updateAssistantMessage(assistantId, (message) => ({ ...message, metrics: streamEvent }));
+      return;
+    }
     updateAssistantMessage(assistantId, (message) => {
       if (streamEvent.type === "message_delta") {
         return { ...message, content: message.content + streamEvent.delta };
@@ -529,18 +556,20 @@ export function ProvenanceCopilot({
     event.preventDefault();
 
     const prompt = question.trim();
-    if (!prompt || selectedTraces.length === 0) {
+    if (!prompt || !graphState || !joinedGraph || loading) {
       return;
     }
 
+    const controller = new AbortController();
+    requestController.current = controller;
     const assistantId = newId("assistant");
-    const chatHistory = memoryMessages(messages);
+    const chatHistory = memoryMessages(messages.filter((message) => message.scope === scope));
     setLoading(true);
     setQuestion("");
     setMessages((current) => [
       ...current,
-      { id: newId("user"), role: "user", content: prompt },
-      { id: assistantId, role: "assistant", content: "", steps: [] },
+      { id: newId("user"), role: "user", content: prompt, scope },
+      { id: assistantId, role: "assistant", content: "", steps: [], scope },
     ]);
 
     try {
@@ -552,10 +581,13 @@ export function ProvenanceCopilot({
           selectedTraceDags,
           joinedGraph,
           graphMode,
+          graphState,
         },
-        (streamEvent) => applyStreamEvent(assistantId, streamEvent)
+        (streamEvent) => { if (!controller.signal.aborted) applyStreamEvent(assistantId, streamEvent); },
+        controller.signal
       );
     } catch (requestError) {
+      if (controller.signal.aborted) return;
       const message =
         requestError instanceof Error
           ? requestError.message
@@ -565,7 +597,7 @@ export function ProvenanceCopilot({
         error: message,
       }));
     } finally {
-      setLoading(false);
+      if (requestController.current === controller) setLoading(false);
     }
   }
 
@@ -673,7 +705,8 @@ export function ProvenanceCopilot({
                 <div className="text-sm text-slate-500">
                   {selectedTraces.length === 0
                     ? "Select traces first, then ask a grounded question."
-                    : "Ask about tool use, provenance patterns, or differences across the selected traces."}
+                    : "Ask Copilot to find, highlight or filter a workflow. It can compare evidence and score associations."}
+                  {graphState ? <div className="mt-3 flex flex-wrap gap-1.5">{['Highlight the shared key steps', 'Tools associated with higher scores', 'Find the evidence flow for the conclusion'].map((example) => <button key={example} type="button" className="rounded-full border border-blue-200 bg-blue-50/60 px-2 py-1 text-[11px] leading-4 text-blue-800 hover:bg-blue-100" onClick={() => setQuestion(example)}>{example}</button>)}</div> : null}
                 </div>
               ) : (
                 <div className="flex flex-col gap-3">
@@ -705,6 +738,8 @@ export function ProvenanceCopilot({
                                 </details>
                               )}
 
+                              {message.actionSummary ? <span className="rounded-lg bg-blue-50 px-2 py-1 font-medium text-blue-800">{message.actionSummary}</span> : null}
+                              {message.metrics ? <span className="px-1 text-[10px]">{message.metrics.modelRequests} model calls · {message.metrics.toolCalls} local tools · {message.metrics.elapsedSeconds.toFixed(1)}s</span> : null}
                               {message.steps?.map((step) => {
                                 const args = formatDetail(step.args);
                                 const result = formatDetail(step.result);
@@ -716,7 +751,7 @@ export function ProvenanceCopilot({
                                   >
                                     <summary className="cursor-pointer font-medium text-slate-600">
                                       {step.status === "done" ? "Called" : "Calling"}{" "}
-                                      {step.name}
+                                      {({ get_view_state: 'Read graph controls', search_graph: 'Find workflow', rank_score_associations: 'Compare score associations', highlight_graph: 'Highlight steps', filter_graph: 'Filter workflow', set_graph_view: 'Adjust graph view' } as Record<string, string>)[step.name] ?? step.name}
                                     </summary>
                                     {(args || result) && (
                                       <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-words text-[10px] leading-4 text-slate-500">
@@ -763,11 +798,12 @@ export function ProvenanceCopilot({
             >
               <input
                 id="provenance-copilot-question"
+                aria-label="Ask Copilot"
                 className="min-w-0 flex-1 bg-transparent text-sm text-slate-800 outline-none placeholder:text-slate-400"
                 placeholder={
                   selectedTraces.length === 0
                     ? "Select traces to begin"
-                    : "Ask Copilot..."
+                    : !graphState ? "Preparing graph…" : "Find, highlight or compare…"
                 }
                 value={question}
                 onChange={(event) => setQuestion(event.target.value)}
@@ -775,7 +811,7 @@ export function ProvenanceCopilot({
               <button
                 type="submit"
                 className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-slate-900 text-white transition hover:bg-slate-800 disabled:cursor-default disabled:bg-slate-300"
-                disabled={loading || !question.trim() || selectedTraces.length === 0}
+                disabled={loading || !question.trim() || !graphState}
                 aria-label="Send message to Copilot"
               >
                 <svg

@@ -31,6 +31,34 @@ def tool_call(name, *, id=None, args=None, response=None, status=None):
 class TestParseTraces:
     """Tests for parse_traces."""
 
+    def test_preserves_explicit_final_output(self):
+        assert parse_traces({"finalOutput": "  finished  ", "tool_calls": []})[0]["finalOutput"] == "finished"
+        assert parse_traces({"final_answer": "answer", "tool_calls": []})[0]["finalOutput"] == "answer"
+        assert parse_traces({"answer": "result", "tool_calls": []})[0]["finalOutput"] == "result"
+
+    def test_extracts_last_assistant_text_without_using_tool_output(self):
+        trace = {"outputs": {"messages": [
+            {"role": "assistant", "content": "First draft"},
+            {"role": "tool", "content": "not the answer"},
+            {"role": "assistant", "content": [{"type": "text", "text": "Final "}, {"type": "text", "text": "answer"}]},
+        ]}}
+        assert parse_traces(trace)[0]["finalOutput"] == "Final\nanswer"
+
+    def test_does_not_treat_non_text_assistant_content_as_final_output(self):
+        trace = {"outputs": {"messages": [
+            {"role": "assistant", "content": [{"type": "image", "url": "x"}]},
+            {"role": "tool", "content": "tool result"},
+        ]}}
+        assert "finalOutput" not in parse_traces(trace)[0]
+
+    def test_unfinished_tool_execution_does_not_promote_planning_to_final_answer(self):
+        trace = {'outputs': {'messages': [
+            {'role': 'assistant', 'content': 'I will investigate the result.',
+             'tool_calls': [{'name': 'search', 'id': 's'}]},
+            {'role': 'tool', 'tool_call_id': 's', 'content': 'Intermediate finding'},
+        ]}}
+        assert 'finalOutput' not in parse_traces(trace)[0]
+
     def test_parse_list_of_traces(self):
         traces = [
             {"id": "1", "tool_calls": [{"name": "search"}, {"name": "read"}]},

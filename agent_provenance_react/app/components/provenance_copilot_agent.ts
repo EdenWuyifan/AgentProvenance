@@ -1,3 +1,5 @@
+import type { GraphAction, GraphViewState } from "./graph_controls";
+import { buildFocusCatalog } from "./graph_search";
 import type {
   AgentDag,
   GraphMode,
@@ -13,9 +15,11 @@ type CopilotRunInput = {
   selectedTraceDags: Record<string, AgentDag>;
   joinedGraph: JoinedProvenanceGraph | null;
   graphMode: GraphMode;
+  graphState: GraphViewState;
 };
 
 export type CopilotHistoryMessage = {
+  scope?: string;
   role: "user" | "assistant";
   content: string;
 };
@@ -25,6 +29,8 @@ export type CopilotStreamEvent =
   | { type: "thinking_delta"; delta: string }
   | { type: "tool_call"; id: string; name: string; args?: unknown }
   | { type: "tool_result"; id: string; name?: string; result?: unknown }
+  | { type: "graph_action"; action: GraphAction }
+  | { type: "telemetry"; modelRequests: number; toolCalls: number; elapsedSeconds: number }
   | { type: "final"; output?: string }
   | { type: "error"; message: string };
 
@@ -35,9 +41,11 @@ export class ProvenanceCopilotAgent {
     this.endpoint = endpoint;
   }
 
-  async run(input: CopilotRunInput, onEvent: (event: CopilotStreamEvent) => void) {
+  async run(input: CopilotRunInput, onEvent: (event: CopilotStreamEvent) => void, signal: AbortSignal) {
+    const packed = buildFocusCatalog(input.joinedGraph!, input.question);
     const response = await fetch(this.endpoint, {
       method: "POST",
+      signal,
       headers: {
         "Content-Type": "application/json",
       },
@@ -48,6 +56,10 @@ export class ProvenanceCopilotAgent {
         selectedTraceDags: input.selectedTraceDags,
         joinedGraph: input.joinedGraph,
         graphMode: this.getGraphMode(input),
+        graphCatalog: packed.catalog,
+        graphIds: { nodes: packed.nodeIds, edges: packed.edgeIds },
+        graphState: { scope: input.graphState.scope, filters: input.graphState.filters, axis: input.graphState.axis,
+          expandedNodeIds: input.graphState.expandedNodeIds, inspectedNodeIds: input.graphState.inspectedNodeIds ?? [], inspectedEdgeIds: input.graphState.inspectedEdgeIds ?? [], highlightedNodeIds: input.graphState.nodeIds, highlightedEdgeIds: input.graphState.edgeIds },
       }),
     });
 
@@ -98,11 +110,7 @@ export class ProvenanceCopilotAgent {
         continue;
       }
 
-      try {
-        onEvent(JSON.parse(line) as CopilotStreamEvent);
-      } catch {
-        onEvent({ type: "message_delta", delta: line });
-      }
+      onEvent(JSON.parse(line) as CopilotStreamEvent);
     }
 
     return rest;

@@ -1,6 +1,7 @@
 "use client";
 
 import * as d3 from "d3";
+import { calculatePresenceImpacts } from "./impact";
 import {
     createGlyphSystem,
     extractToolCallRecords,
@@ -32,131 +33,26 @@ function buildToolCoverageData(tools, tracingToolCalls) {
     });
 }
 
-function solveLinearSystem(matrix, vector) {
-    const size = vector.length;
-    const augmented = matrix.map((row, index) => [...row, vector[index]]);
-
-    for (let pivotIndex = 0; pivotIndex < size; pivotIndex += 1) {
-        let pivotRow = pivotIndex;
-
-        for (let rowIndex = pivotIndex + 1; rowIndex < size; rowIndex += 1) {
-            if (
-                Math.abs(augmented[rowIndex][pivotIndex]) >
-                Math.abs(augmented[pivotRow][pivotIndex])
-            ) {
-                pivotRow = rowIndex;
-            }
-        }
-
-        if (pivotRow !== pivotIndex) {
-            [augmented[pivotIndex], augmented[pivotRow]] = [
-                augmented[pivotRow],
-                augmented[pivotIndex],
-            ];
-        }
-
-        const pivot = augmented[pivotIndex][pivotIndex];
-        if (Math.abs(pivot) < 1e-9) {
-            return Array(size).fill(0);
-        }
-
-        for (let columnIndex = pivotIndex; columnIndex <= size; columnIndex += 1) {
-            augmented[pivotIndex][columnIndex] /= pivot;
-        }
-
-        for (let rowIndex = 0; rowIndex < size; rowIndex += 1) {
-            if (rowIndex === pivotIndex) {
-                continue;
-            }
-
-            const factor = augmented[rowIndex][pivotIndex];
-            for (let columnIndex = pivotIndex; columnIndex <= size; columnIndex += 1) {
-                augmented[rowIndex][columnIndex] -=
-                    factor * augmented[pivotIndex][columnIndex];
-            }
-        }
-    }
-
-    return augmented.map((row) => row[size]);
-}
-
 function buildToolImpactData(tools, tracings, tracingToolCalls, scoreKey) {
-    if (tools.length === 0 || tracings.length === 0) {
-        return [];
-    }
-
-    const rows = tracings.map((tracing) => {
-        const toolCallsByName = tracingToolCalls.get(tracing.id)?.toolCallsByName;
-        return tools.map((tool) => (toolCallsByName?.has(tool) ? 1 : 0));
-    });
-    const scores = tracings.map((tracing) => getTracingScore(tracing, scoreKey));
-    const featureMeans = tools.map(
-        (_, toolIndex) => d3.mean(rows, (row) => row[toolIndex]) ?? 0
+    const impacts = calculatePresenceImpacts(
+        tools.map((tool) => ({
+            id: tool,
+            supportIds: tracings
+                .filter((tracing) =>
+                    tracingToolCalls.get(tracing.id)?.toolCallsByName.has(tool)
+                )
+                .map((tracing) => String(tracing.id)),
+        })),
+        tracings.map((tracing) => ({
+            id: String(tracing.id),
+            score: getTracingScore(tracing, scoreKey),
+        }))
     );
-    const scoreMean = d3.mean(scores) ?? 0;
-    const gram = Array.from({ length: tools.length }, () =>
-        Array(tools.length).fill(0)
-    );
-    const rhs = Array(tools.length).fill(0);
 
-    rows.forEach((row, rowIndex) => {
-        const centeredScore = scores[rowIndex] - scoreMean;
-        const centeredRow = row.map((value, toolIndex) => value - featureMeans[toolIndex]);
-
-        centeredRow.forEach((value, leftIndex) => {
-            rhs[leftIndex] += value * centeredScore;
-
-            for (let rightIndex = leftIndex; rightIndex < tools.length; rightIndex += 1) {
-                gram[leftIndex][rightIndex] += value * centeredRow[rightIndex];
-            }
-        });
-    });
-
-    gram.forEach((row, leftIndex) => {
-        for (let rightIndex = leftIndex + 1; rightIndex < tools.length; rightIndex += 1) {
-            gram[rightIndex][leftIndex] = row[rightIndex];
-        }
-        row[leftIndex] += 1;
-    });
-
-    const coefficients = solveLinearSystem(gram, rhs);
-
-    return tools.map((tool, toolIndex) => {
-        const presentScores = [];
-        const absentScores = [];
-        let usageCount = 0;
-        let absoluteContributionSum = 0;
-
-        rows.forEach((row, rowIndex) => {
-            const present = row[toolIndex] === 1;
-            const contribution =
-                coefficients[toolIndex] * (row[toolIndex] - featureMeans[toolIndex]);
-
-            absoluteContributionSum += Math.abs(contribution);
-
-            if (present) {
-                usageCount += 1;
-                presentScores.push(scores[rowIndex]);
-                return;
-            }
-
-            absentScores.push(scores[rowIndex]);
-        });
-
-        const impactAbs = absoluteContributionSum / rows.length;
-        const direction = Math.sign(coefficients[toolIndex] || 0);
-
-        return {
-            toolName: tool,
-            usageCount,
-            impact: direction * impactAbs,
-            impactAbs,
-            meanPresentScore:
-                presentScores.length > 0 ? d3.mean(presentScores) : null,
-            meanAbsentScore:
-                absentScores.length > 0 ? d3.mean(absentScores) : null,
-        };
-    });
+    return impacts.map(({ id, ...impact }) => ({
+        toolName: id,
+        ...impact,
+    }));
 }
 
 function buildTraceScoreData(tracings, tracingToolCalls, scoreKey) {
@@ -332,6 +228,13 @@ function buildTracingToolIndex(tracings, scoreKey) {
         tools: Array.from(tools).sort(),
         tracingToolCalls,
     };
+}
+
+export function calculateToolImpactData(data, scoreKey = "score") {
+    const tracings = prepareTracings(data);
+    const { tools, tracingToolCalls } = buildTracingToolIndex(tracings, scoreKey);
+
+    return buildToolImpactData(tools, tracings, tracingToolCalls, scoreKey);
 }
 
 function formatToolCallList(calls, formatArgs) {
@@ -513,7 +416,8 @@ function renderToolCoverageBars({
             return [
                 `<strong>Tool:</strong> ${datum.toolName}`,
                 `<strong>Group:</strong> ${glyphSystem.getGroup(datum.toolName)}`,
-                `<strong>Approx. Shapley impact:</strong> ${formatSigned(datum.impact)}`,
+                `<strong>Linear model attribution:</strong> ${formatSigned(datum.impact)}`,
+                "Exploratory association across displayed traces; not a causal contribution.",
                 `<strong>|Impact|:</strong> ${formatScore(datum.impactAbs)}`,
                 `<strong>Runs with tool:</strong> ${datum.usageCount}/${traceCount}`,
                 `<strong>Mean ${scoreLabel} when present:</strong> ${formatScore(datum.meanPresentScore)}`,

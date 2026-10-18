@@ -2,7 +2,7 @@
 
 import * as d3 from "d3";
 
-const TOOL_CALL_KEYS = ["tool_calls", "toolCalls", "calls", "steps"];
+const TOOL_CALL_KEYS = ["events", "tool_calls", "toolCalls", "calls", "steps"];
 const GLYPH_TYPES = [
   "circle",
   "cross",
@@ -25,10 +25,38 @@ function parseJsonLines(text) {
     .map((line) => JSON.parse(line));
 }
 
+function messageText(content) {
+  if (typeof content === "string") return content.trim() || null;
+  if (!Array.isArray(content)) return null;
+  const text = content
+    .filter((block) => block && block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text.trim())
+    .filter(Boolean)
+    .join("\n");
+  return text || null;
+}
+
+function extractFinalOutput(tracing) {
+  for (const key of ["finalOutput", "final_answer", "answer"]) {
+    const value = tracing?.[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  const messages = tracing?.outputs?.messages;
+  if (!Array.isArray(messages)) return null;
+  for (const message of [...messages].reverse()) {
+    if (["tool", "user"].includes(message?.role) || ["tool", "user"].includes(message?.type)) return null;
+    if (message?.role !== "assistant" && message?.type !== "assistant") continue;
+    if (message.tool_calls?.length || message.toolCalls?.length) return null;
+    return messageText(message.content);
+  }
+  return null;
+}
+
 export function prepareTracings(tracings = []) {
   return tracings.map((tracing, index) => ({
     ...tracing,
     id: tracing?.id ?? tracing?.trace_id ?? index,
+    finalOutput: extractFinalOutput(tracing),
   }));
 }
 
@@ -40,6 +68,7 @@ export function parseTracingPayload(text) {
 
   try {
     const parsed = JSON.parse(trimmed);
+    if (parsed?.kind === "workflow-corpus") return parsed.traces;
     return Array.isArray(parsed) ? parsed : [parsed];
   } catch {
     return parseJsonLines(trimmed);
@@ -132,6 +161,10 @@ function normalizeToolCall(call, fallbackId) {
     args: normalizeToolArgs(call),
     response: call.response ?? null,
     status: typeof call.status === "string" ? call.status : null,
+    ...Object.fromEntries(["eventType", "agentId", "role", "round", "phase", "source", "diagnostics", "patterns"]
+      .filter((key) => key in call).map((key) => [key, call[key]])),
+    parentCallIds: [call.parent_call_id, call.parentCallId, ...(call.parent_call_ids ?? []), ...(call.parentCallIds ?? [])]
+      .filter((id) => id !== null && id !== undefined),
   };
 }
 
