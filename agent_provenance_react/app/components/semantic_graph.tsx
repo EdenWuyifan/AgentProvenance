@@ -14,6 +14,7 @@ import {
   useNodesInitialized,
   useNodesState,
   useReactFlow,
+  useViewport,
   type Edge,
   type EdgeProps,
   type Node,
@@ -21,7 +22,7 @@ import {
 } from '@xyflow/react';
 import { createGraphWorkspace, layoutGroups, layoutWorkflowLanes, workflowGeometry, workflowSizeSignature, routeOrthogonal, routePath, curvedRoutePath, workflowLayoutLinks, type Box, type GraphWorkspace, type Point, type WorkflowLayout, type WorkflowNodeContext } from './graph_layout';
 import { importanceBackground, importanceMaximum, importanceValue, type ImportanceAxis } from './graph_importance';
-import { DEFAULT_GRAPH_FILTERS, focusSelection, matchFamilies, workflowOverview, type GraphFilters } from './graph_search';
+import { DEFAULT_GRAPH_FILTERS, focusSelection, matchFamilies, workflowOverview, resultFlowNodes, type GraphFilters } from './graph_search';
 import { GraphLegend } from './graph_legend';
 import { actionBelongsToGraph, graphScope, type GraphCommand, type GraphHighlight, type GraphViewState } from './graph_controls';
 import { JsonField } from './tool_call_tooltip';
@@ -64,6 +65,7 @@ type SemanticNodeData =
       resultStatus: JoinedProvenanceNode['importance']['result']['status'];
       scoreSignal: boolean;
       failure: boolean;
+      recordedOutcome: boolean;
       supportCount: number;
       totalTraceCount: number;
       resultBackbone: boolean;
@@ -100,7 +102,7 @@ type SemanticNodeData =
       totalTraceCount: number;
       supportTraces: string[];
       callCount: number;
-      semanticLevel: 'key' | 'supporting';
+      semanticLevel: 'key' | 'supporting' | 'unknown';
       background: string;
       failure: boolean;
       workflowMode?: boolean;
@@ -142,6 +144,7 @@ const COLLAPSED_SIZE = { width: 256, height: 112 };
 const WORKFLOW_CARD_SIZE = { width: 256, height: 136 };
 const SUPPORTING_DOT_SIZE = { width: 28, height: 28 };
 const ARROW = { type: MarkerType.ArrowClosed, width: 11, height: 11, markerUnits: 'userSpaceOnUse', strokeWidth: 1 };
+const CONTEXT_ARROW = { ...ARROW, width: 5, height: 5 };
 
 function traceColor(index: number): TraceColor {
   const color = TRACE_COLORS[index];
@@ -377,7 +380,7 @@ function operationLane(
       data: {
         kind: 'operation', label: operation.tool,
         sublabel: operation.parameterVariants.length ? `${operation.parameterVariants.length} parameter variant${operation.parameterVariants.length === 1 ? '' : 's'}` : `Steps ${Math.min(...operation.members.map((member) => member.step))}–${Math.max(...operation.members.map((member) => member.step))}`,
-        supportCount: memberRuns.length, totalTraceCount: traces.length, callCount: operation.members.length, semanticLevel: family.importance.semantic.level,
+        supportCount: memberRuns.length, totalTraceCount: traces.length, callCount: operation.members.length, semanticLevel: workflowMode ? family.assessment!.level : family.importance.semantic.level,
         supportTraces: memberRuns,
         background: importanceBackground(importanceValue(family, axis, operation.tool), maximum),
         failure: failed, workflowMode, inspectable: operationInspectable,
@@ -432,10 +435,25 @@ function semanticGraph(
     return assessment ? [[node.id, assessment] as const] : [];
   }));
   const graphEdges = graph.edges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
+  const finalOutcomeCalls = new Set((graph.structuredOutcomes ?? []).flatMap(({ run, outcomes }) => outcomes
+    .filter((outcome) => outcome.scope !== 'participant' && (outcome.terminal || outcome.kind === 'final'))
+    .map((outcome) => `${run}\0${outcome.eventId}`)));
+  const eventCount = (family: JoinedProvenanceNode) => Math.max(family.eventSummary?.eventCount ?? 0,
+    family.instances.reduce((count, instance) => count + instance.calls.length, 0), family.instances.length);
+  const hasRecordedOutcome = (family: JoinedProvenanceNode) => family.instances.some((instance) =>
+    instance.resultTargets.length > 0 || instance.calls.some((call) => finalOutcomeCalls.has(`${instance.run}\0${call.id}`)))
+    || Boolean(family.eventSummary?.outcomes.length);
+  const hasDirectResult = (family: JoinedProvenanceNode) => hasRecordedOutcome(family)
+    || family.importance.result.status === 'supported' || family.importance.result.status === 'contradicted';
+  const hasFailure = (family: JoinedProvenanceNode) => family.importance.tier === 'failure'
+    || family.operationGroups.some((operation) => operation.failure);
+  const hasReviewedFlow = (family: JoinedProvenanceNode) => family.importance.facets.some((facet) => facet.id === 'reviewed-flow');
   const firstStep = (family: JoinedProvenanceNode) => Math.min(...family.instances.flatMap((instance) => instance.calls.map((call) => call.step)), Infinity);
   const orderedFamilies = [...graph.nodes].sort((a, b) => firstStep(a) - firstStep(b) || a.label.localeCompare(b.label));
   const maximum = importanceMaximum(graph, axis);
-  const expandedGroups = new Set(graph.nodes.filter((family) => family.operationGroups.length > 1 && expandedFamilies.has(family.id)).map((family) => family.id));
+  const expandedGroups = new Set(graph.nodes.filter((family) => (family.operationGroups.length > 1
+    || workflow && eventCount(family) > 1)
+    && expandedFamilies.has(family.id)).map((family) => family.id));
   const expandedContents = new Map<string, ReturnType<typeof operationLane>>();
   const groupSizes = new Map<string, { width: number; height: number }>();
   graph.nodes.forEach((family) => {
@@ -443,7 +461,10 @@ function semanticGraph(
     const assessmentLevel = assessment?.level === 'key' || assessment?.level === 'supporting' || assessment?.level === 'unknown'
       ? assessment.level : workflow ? 'unknown' : family.importance.semantic.level;
     if (!expandedGroups.has(family.id)) {
-      groupSizes.set(family.id, workflow ? family.importance.tier === 'failure' ? WORKFLOW_CARD_SIZE : assessmentLevel === 'supporting' ? SUPPORTING_DOT_SIZE : assessmentLevel === 'unknown' ? { width: 34, height: 34 } : WORKFLOW_CARD_SIZE : family.operationGroups.length > 1 && family.importance.decision === 'collapse' && !focusedFamilies?.has(family.id) ? SUPPORTING_DOT_SIZE : COLLAPSED_SIZE);
+      const readableWorkflowNode = hasDirectResult(family) || hasFailure(family) || hasReviewedFlow(family);
+      groupSizes.set(family.id, workflow
+        ? readableWorkflowNode || assessmentLevel === 'key' ? WORKFLOW_CARD_SIZE : SUPPORTING_DOT_SIZE
+        : family.operationGroups.length > 1 && family.importance.decision === 'collapse' && !focusedFamilies?.has(family.id) ? SUPPORTING_DOT_SIZE : COLLAPSED_SIZE);
       return;
     }
     const lane = operationLane(family, traceDags, traces, axis, maximum, Boolean(workflow));
@@ -459,8 +480,13 @@ function semanticGraph(
       ? assessment.level : workflow ? 'unknown' : family.importance.semantic.level;
     const size = groupSizes.get(family.id)!;
     const sourceLabel = family.source?.label ?? family.instances.find((instance) => instance.source)?.source?.label;
-    const expandable = family.operationGroups.length > 1;
-    const supportingDot = workflow ? assessmentLevel !== 'key' && family.importance.tier !== 'failure' : expandable && family.importance.decision === 'collapse' && !expandedGroups.has(family.id) && !focusedFamilies?.has(family.id);
+    const groupEventCount = eventCount(family);
+    const directResult = hasDirectResult(family);
+    const failure = hasFailure(family);
+    const expandable = family.operationGroups.length > 1 || Boolean(workflow && groupEventCount > 1);
+    const supportingDot = workflow ? assessmentLevel !== 'key' && !failure && !directResult && !hasReviewedFlow(family)
+      && !expandedGroups.has(family.id) && !focusedFamilies?.has(family.id)
+      : expandable && family.importance.decision === 'collapse' && !expandedGroups.has(family.id) && !focusedFamilies?.has(family.id);
     const supportCount = new Set(family.supportTraces).size;
     const operation = family.operationGroups.length === 1 ? family.operationGroups[0] : undefined;
     return {
@@ -486,11 +512,12 @@ function semanticGraph(
         semanticLevel: workflow ? (assessment?.level === 'key' || assessment?.level === 'supporting' || assessment?.level === 'unknown' ? assessment.level : 'unknown') : family.importance.semantic.level,
         resultStatus: family.importance.result.status,
         scoreSignal: family.importance.facets.some((facet) => facet.id === 'predictive-focus'),
-        failure: family.importance.tier === 'failure',
+        failure,
+        recordedOutcome: hasRecordedOutcome(family),
         supportCount,
         totalTraceCount: traces.length,
-        resultBackbone: family.resultBackbone,
-        directResult: family.instances.some((instance) => instance.resultTargets.length > 0),
+        resultBackbone: workflow ? hasReviewedFlow(family) : family.resultBackbone,
+        directResult,
         supportTraces: family.supportTraces,
         callCount: family.instances.reduce((count, instance) => count + instance.calls.length, 0),
         toolNames: [...new Set(family.instances.flatMap((instance) => instance.calls.map((call) => call.tool)))],
@@ -519,7 +546,7 @@ function semanticGraph(
         assessmentReason: assessment?.reason,
         assessedSupportCount: assessment?.assessedSupportCount,
         keySupportCount: assessment?.keySupportCount,
-        eventCount: summaries.get(family.id)?.eventCount,
+        eventCount: groupEventCount,
         workflowLabel: workflow?.lanes.find((lane) => lane.id === contexts.get(family.id)?.laneId)?.label,
         workflowSummary: (() => { const summary = summaries.get(family.id); if (!summary) return ''; return [summary.diagnostics.slice(0, 1).join(', '), summary.outcomes.slice(0, 2).map((outcome) => `${outcome.name} ${outcome.value}`).join(' · ')].filter(Boolean).join(' · '); })(),
       },
@@ -614,17 +641,18 @@ function semanticGraph(
     const jointGroupIds = [...new Set(witnesses.flatMap((witness) => witness.jointGroupIds ?? []))];
     const relevance: SemanticEdgeData['relevance'] = witnesses.some((witness) => witness.relevance === 'relevant') ? 'relevant'
       : witnesses.some((witness) => witness.relevance === 'context') ? 'context' : 'unknown';
-    const critical = selectedResultPath || !workflow && (jointGroupIds.length > 0 || relevance === 'relevant'
+    const critical = selectedResultPath || workflow && relevance === 'relevant' || !workflow && (jointGroupIds.length > 0 || relevance === 'relevant'
       || supportTraces.length > 1 && families.some((family) => family.importance.semantic.level === 'key'));
     const color = critical ? RESULT_PATH_COLOR : '#94a3b8';
     return {
       ...edge,
+      markerEnd: workflow && !critical ? CONTEXT_ARROW : ARROW,
       data: { ...edge.data!, critical, relevance, jointGroupIds },
       style: {
         ...edge.style,
-        stroke: selectedTraceId && !selectedSupport ? '#cbd5e1' : critical ? color : relevance === 'unknown' ? '#cbd5e1' : '#94a3b8',
+        stroke: selectedTraceId && !selectedSupport ? '#cbd5e1' : critical ? color : workflow ? relevance === 'unknown' ? '#cbd5e1' : '#94a3b8' : '#64748b',
         strokeWidth: supportEdgeWidth(supportTraces.length, selectedResultPath),
-        opacity: selectedTraceId && !selectedSupport ? 0.1 : critical ? 0.95 : relevance === 'unknown' ? 0.3 : edge.data?.inferenceKind === 'inferred' ? 0.4 : 0.52,
+        opacity: selectedTraceId && !selectedSupport ? 0.1 : critical ? 0.95 : workflow ? relevance === 'unknown' ? 0.18 : 0.4 : edge.data?.inferenceKind === 'inferred' ? 0.65 : 0.8,
         strokeDasharray: relevance === 'unknown' ? '2 4' : edge.data?.inferenceKind === 'inferred' ? '6 4' : edge.data?.inferenceKind === 'mixed' ? '2 3' : undefined,
       },
       label: undefined,
@@ -637,13 +665,16 @@ function semanticGraph(
 function FamilyNode({ data }: NodeProps<SemanticNode>) {
   const [hovered, setHovered] = useState(false);
   if (data.kind !== 'family') return null;
-  const supportingDot = data.workflowMode ? data.semanticLevel !== 'key' && !data.failure : data.expandable && data.decision === 'collapse' && !data.expanded && !data.promoted;
+  const supportingDot = data.workflowMode
+    ? data.semanticLevel !== 'key' && !data.failure && !data.directResult && !data.resultBackbone && !data.expanded && !data.promoted
+    : data.expandable && data.decision === 'collapse' && !data.expanded && !data.promoted;
   if (supportingDot) {
     return (
       <div className="relative flex h-full w-full items-center justify-center" onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}>
-        <span aria-label={data.workflowMode ? `${data.semanticLevel === 'unknown' ? 'Unreviewed / uncertain' : 'Supporting event'}: ${data.label}` : data.sourceLabel ? `Input ${data.sourceLabel}` : `Supporting stage: ${data.label}`} title={data.sourceLabel ?? data.label} className="flex h-6 w-6 items-center justify-center rounded-full border text-[8px] font-semibold text-zinc-700" style={{ borderColor: data.failure ? FAILURE_BORDER : data.semanticLevel === 'unknown' && data.workflowMode ? '#64748b' : data.resultBackbone ? RESULT_PATH_COLOR : '#64748b', borderStyle: data.semanticLevel === 'unknown' && data.workflowMode ? 'dashed' : 'solid', borderWidth: data.semanticLevel === 'unknown' && data.workflowMode ? 2 : Math.min(4, 1 + Math.max(0, data.supportCount - 1) * 0.75), background: data.failure ? FAILURE_BACKGROUND : data.semanticLevel === 'unknown' && data.workflowMode ? '#fff' : data.workflowMode ? '#bfdbfe' : data.background, boxShadow: data.resultBackbone && !data.failure ? '0 0 0 2px #e2e8f0' : undefined }}>
+        <span aria-label={data.workflowMode ? `${data.semanticLevel === 'unknown' ? 'Unreviewed / uncertain' : 'Supporting event'}: ${data.label}` : data.sourceLabel ? `Input ${data.sourceLabel}` : `Supporting stage: ${data.label}`} title={data.sourceLabel ?? data.label} className={`flex items-center justify-center rounded-full border text-[8px] font-semibold text-zinc-700 ${data.workflowMode ? 'h-3.5 w-3.5 text-[6px]' : 'h-6 w-6'}`} style={{ borderColor: data.failure ? FAILURE_BORDER : data.semanticLevel === 'unknown' && data.workflowMode ? '#64748b' : data.resultBackbone ? RESULT_PATH_COLOR : '#64748b', borderStyle: data.semanticLevel === 'unknown' && data.workflowMode ? 'dashed' : 'solid', borderWidth: data.semanticLevel === 'unknown' && data.workflowMode ? 1 : Math.min(4, 1 + Math.max(0, data.supportCount - 1) * 0.75), background: data.failure ? FAILURE_BACKGROUND : data.semanticLevel === 'unknown' && data.workflowMode ? '#fff' : data.workflowMode ? '#bfdbfe' : data.background, boxShadow: data.resultBackbone && !data.failure ? '0 0 0 2px #e2e8f0' : undefined }}>
           {data.workflowMode ? '·' : data.sourceLabel ? sourceMarker(data.sourceLabel) : '·'}
         </span>
+        {data.workflowMode && (data.eventCount ?? 0) > 1 ? <span className="absolute right-0 top-0 min-w-3 rounded-full bg-slate-700 px-0.5 text-center text-[7px] leading-3 text-white">{data.eventCount! > 99 ? '99+' : data.eventCount}</span> : null}
         <Handle type="target" position={Position.Left} />
         <Handle type="source" position={Position.Right} />
         {hovered ? <div role="tooltip" className="nodrag nopan absolute left-7 top-1/2 z-50 w-64 -translate-y-1/2 rounded-lg border border-zinc-300 bg-white p-3 text-left shadow-xl" onClick={(event) => event.stopPropagation()}>
@@ -670,7 +701,7 @@ function FamilyNode({ data }: NodeProps<SemanticNode>) {
     );
   }
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden rounded-[11px]" style={{ border: `1px solid ${data.failure ? FAILURE_BORDER : data.workflowMode && data.semanticLevel === 'key' ? '#2563eb' : data.resultBackbone ? RESULT_PATH_COLOR : '#64748b'}`, borderLeftWidth: supportLeftBorder(data.supportCount), background: data.failure ? FAILURE_BACKGROUND : data.background }}>
+    <div className="flex h-full w-full flex-col overflow-hidden rounded-[11px]" style={{ border: `1px solid ${data.failure ? FAILURE_BORDER : data.workflowMode && (data.recordedOutcome || data.semanticLevel === 'key') ? '#2563eb' : data.resultBackbone ? RESULT_PATH_COLOR : '#64748b'}`, borderLeftWidth: supportLeftBorder(data.supportCount), background: data.failure ? FAILURE_BACKGROUND : data.workflowMode && (data.recordedOutcome || data.resultBackbone) ? '#eff6ff' : data.background }}>
       <div className="flex h-16 shrink-0 items-start gap-2 border-b border-zinc-200/40 px-3 py-2">
         <span aria-hidden="true" className="mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded bg-slate-100 text-[9px] font-medium text-slate-600">{data.sourceLabel ? '↳' : data.expandable ? 'Σ' : 'A'}</span>
         <div className="min-w-0 flex-1">
@@ -689,7 +720,7 @@ function FamilyNode({ data }: NodeProps<SemanticNode>) {
       {data.expanded ? <div className="min-h-0 flex-1" /> : data.workflowMode && data.assessmentReason ? <p className="line-clamp-2 px-3 pt-1 text-[9px] leading-3 text-slate-600">{data.assessmentReason}</p> : null}
       <div data-graph-footer className="mt-auto flex h-12 shrink-0 flex-wrap content-center items-center gap-x-1.5 gap-y-0.5 overflow-hidden border-t border-zinc-200/40 px-3 py-1 text-[9px] text-zinc-600">
         {data.workflowSummary ? <span className="w-full truncate" title={data.workflowSummary}>{data.workflowSummary}</span> : null}
-        <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700">{data.workflowMode && data.semanticLevel === 'key' ? 'Key activity' : semanticLevelLabel(data.semanticLevel)}</span>
+        <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${data.workflowMode && data.recordedOutcome ? 'bg-blue-100 text-blue-900' : 'bg-slate-100 text-slate-700'}`}>{data.workflowMode && data.recordedOutcome ? 'Recorded outcome' : data.workflowMode && data.directResult ? 'Result evidence' : data.workflowMode && data.semanticLevel === 'key' ? 'Key activity' : data.workflowMode && data.resultBackbone ? 'Evidence context' : semanticLevelLabel(data.semanticLevel)}</span>
         {data.scoreSignal ? <span className="shrink-0 rounded-full bg-violet-100 px-1.5 py-0.5 text-[9px] font-semibold text-violet-800">Score signal</span> : null}
         {data.failure ? <span className="shrink-0 rounded-full bg-red-100 px-1.5 py-0.5 font-semibold text-red-800">Failure</span> : null}
         {!data.workflowMode && data.resultBackbone && !data.directResult && !data.failure ? <span className="shrink-0 rounded-full bg-slate-200 px-1.5 py-0.5 font-semibold text-slate-900">Result path</span> : null}
@@ -713,7 +744,7 @@ function OperationNodeView({ data }: NodeProps<SemanticNode>) {
       <span className="min-w-0 flex-1">
         <span className="block truncate text-xs font-semibold text-zinc-900" title={data.label}>{data.label}</span>
         <span className="block truncate text-[10px] text-zinc-500">{data.sublabel}</span>
-        <span className="block truncate text-[9px] text-zinc-500">{data.semanticLevel === 'key' ? 'Key analysis' : 'Supporting'} · {data.supportCount}/{data.totalTraceCount} runs · {data.workflowMode ? `${data.callCount} events` : `${data.callCount} calls`}{data.failure ? ' · Failure' : ''}</span>
+        <span className="block truncate text-[9px] text-zinc-500">{semanticLevelLabel(data.semanticLevel)} · {data.supportCount}/{data.totalTraceCount} runs · {data.workflowMode ? `${data.callCount} events` : `${data.callCount} calls`}{data.failure ? ' · Failure' : ''}</span>
       </span>
       <Handle type="source" position={Position.Right} />
     </div>
@@ -759,6 +790,7 @@ function routedEdges(nodes: SemanticNode[], edges: SemanticEdge[]): SemanticEdge
   });
   const roots = nodes.filter((node) => !node.parentId && !node.hidden);
   const laneBounds = new Map<string, { top: number; bottom: number }>();
+  const roundBounds = new Map<number, { left: number; right: number }>();
   roots.forEach((node) => {
     if (node.data.kind !== 'family' || !node.data.workflowContext) return;
     const box = boxes.get(node.id)!;
@@ -766,14 +798,23 @@ function routedEdges(nodes: SemanticNode[], edges: SemanticEdge[]): SemanticEdge
     const bounds = laneBounds.get(laneId) ?? { top: Infinity, bottom: -Infinity };
     bounds.top = Math.min(bounds.top, box.y); bounds.bottom = Math.max(bounds.bottom, box.y + box.height);
     laneBounds.set(laneId, bounds);
+    const round = node.data.workflowContext.roundStart;
+    const roundBox = roundBounds.get(round) ?? { left: Infinity, right: -Infinity };
+    roundBox.left = Math.min(roundBox.left, box.x); roundBox.right = Math.max(roundBox.right, box.x + box.width);
+    roundBounds.set(round, roundBox);
   });
   const workflowTop = Math.min(0, ...roots.map((node) => boxes.get(node.id)!.y)) - 40;
-  const workflowRight = Math.max(0, ...roots.map((node) => boxes.get(node.id)!.x + boxes.get(node.id)!.width)) + 32;
   const lanesByTop = [...laneBounds.entries()].sort((a, b) => a[1].top - b[1].top);
   const laneCorridors = new Map(lanesByTop.map(([laneId, bounds], index) => {
     const nextTop = lanesByTop[index + 1]?.[1].top ?? Infinity;
     return [laneId, bounds.bottom + 16 < nextTop ? bounds.bottom + 16 : Math.min(workflowTop, bounds.top - 16)] as const;
   }));
+  const rounds = [...roundBounds.keys()].sort((a, b) => a - b);
+  const roundGaps = rounds.slice(1).map((round, index) => {
+    const previous = rounds[index];
+    return { after: previous, before: round, x: (roundBounds.get(previous)!.right + roundBounds.get(round)!.left) / 2 };
+  });
+  const roundIndex = new Map(rounds.map((round, index) => [round, index]));
   return edges.map((edge, index) => {
     if (edge.hidden) return edge;
     const source = boxes.get(edge.source)!, target = boxes.get(edge.target)!;
@@ -786,16 +827,31 @@ function routedEdges(nodes: SemanticNode[], edges: SemanticEdge[]): SemanticEdge
       if (!critical) return { ...edge, data: { ...edge.data!, route: [start, end] } };
       const sourceLane = sourceNode.data.workflowContext?.laneId;
       const targetLane = targetNode.data.workflowContext?.laneId;
-      const sourceBounds = sourceLane ? laneBounds.get(sourceLane) : undefined;
-      const laneCorridor = sourceLane && sourceLane === targetLane && sourceBounds
-        ? laneCorridors.get(sourceLane) ?? workflowTop : workflowTop;
       const exitX = start.x + 12;
       const approachX = end.x - 12;
-      const route = sourceLane && sourceLane === targetLane
-        ? [start, { x: exitX, y: start.y }, { x: exitX, y: laneCorridor }, { x: approachX, y: laneCorridor }, { x: approachX, y: end.y }, end]
-        : [start, { x: exitX, y: start.y }, { x: exitX, y: laneCorridors.get(sourceLane ?? '') ?? workflowTop },
-          { x: workflowRight, y: laneCorridors.get(sourceLane ?? '') ?? workflowTop }, { x: workflowRight, y: laneCorridors.get(targetLane ?? '') ?? workflowTop },
-          { x: approachX, y: laneCorridors.get(targetLane ?? '') ?? workflowTop }, { x: approachX, y: end.y }, end];
+      const sourceCorridor = laneCorridors.get(sourceLane ?? '') ?? workflowTop;
+      const targetCorridor = laneCorridors.get(targetLane ?? '') ?? workflowTop;
+      if (sourceLane && sourceLane === targetLane) {
+        return { ...edge, data: { ...edge.data!, route: [start, { x: exitX, y: start.y }, { x: exitX, y: sourceCorridor },
+          { x: approachX, y: sourceCorridor }, { x: approachX, y: end.y }, end] } };
+      }
+      const sourceRound = sourceNode.data.kind === 'family' ? sourceNode.data.workflowContext?.roundStart : undefined;
+      const targetRound = targetNode.data.kind === 'family' ? targetNode.data.workflowContext?.roundStart : undefined;
+      const sourceRoundIndex = sourceRound === undefined ? undefined : roundIndex.get(sourceRound);
+      const targetRoundIndex = targetRound === undefined ? undefined : roundIndex.get(targetRound);
+      const adjacentGaps = targetRoundIndex === undefined ? [] : sourceRoundIndex === undefined ? []
+        : sourceRoundIndex < targetRoundIndex ? [roundGaps[targetRoundIndex - 1]]
+          : sourceRoundIndex > targetRoundIndex ? [roundGaps[targetRoundIndex]]
+            : [roundGaps[targetRoundIndex - 1], roundGaps[targetRoundIndex]];
+      const gapX = adjacentGaps.filter((gap): gap is NonNullable<typeof gap> => Boolean(gap))
+        .sort((a, b) => Math.abs(a.x - end.x) - Math.abs(b.x - end.x))[0]?.x
+        ?? (targetRound === undefined ? undefined : (() => {
+          const bounds = roundBounds.get(targetRound);
+          return bounds ? [bounds.left - 12, bounds.right + 12].sort((a, b) => Math.abs(a - end.x) - Math.abs(b - end.x))[0] : undefined;
+        })()) ?? (start.x + end.x) / 2;
+      const route = [start, { x: exitX, y: start.y }, { x: exitX, y: sourceCorridor },
+        { x: gapX, y: sourceCorridor }, { x: gapX, y: targetCorridor }, { x: approachX, y: targetCorridor },
+        { x: approachX, y: end.y }, end];
       return { ...edge, data: { ...edge.data!, route } };
     }
     const sourceParent = source.parentId ?? source.id, targetParent = target.parentId ?? target.id;
@@ -1016,7 +1072,7 @@ function ConnectionsTab({ item, graph }: { item: Inspectable; graph: JoinedProve
   return <div className="space-y-2 text-xs"><div className="font-semibold">Witness path</div>{item.witness ? <ol className="list-decimal pl-5">{item.witness.callPath.map((callId, index) => <li key={`${index}:${callId}`}>{witnessCallLabel(graph, item.witness!.run, callId, index)}</li>)}</ol> : <p>No individual witness selected.</p>}<RawDetails label="All connection witnesses" value={item.edge.witnesses} /></div>;
 }
 
-function Inspector({ item, graph, traces, onClose }: { item: Inspectable | null; graph: JoinedProvenanceGraph; traces: Tracing[]; onClose: () => void }) {
+function Inspector({ item, graph, traces, nodeData, onClose }: { item: Inspectable | null; graph: JoinedProvenanceGraph; traces: Tracing[]; nodeData?: SemanticNodeData; onClose: () => void }) {
   const [collapsedItem, setCollapsedItem] = useState<Inspectable | null>(null);
   const [tab, setTab] = useState<InspectorTab>('overview');
   if (!item) return null;
@@ -1025,6 +1081,7 @@ function Inspector({ item, graph, traces, onClose }: { item: Inspectable | null;
   return <aside className={`nodrag nopan absolute bottom-2 right-2 z-20 flex max-h-[58%] ${collapsed ? 'w-40' : 'w-[min(27rem,calc(100%-1rem))]'} resize flex-col overflow-auto rounded-lg border border-zinc-300 bg-white/95 shadow-xl backdrop-blur`} onMouseDown={(event) => event.stopPropagation()}>
     <div className="flex h-9 shrink-0 items-center gap-2 border-b border-zinc-200 px-2">
       <span className="flex-1 truncate text-xs font-semibold text-zinc-800">Details</span>
+      {nodeData?.kind === 'family' && nodeData.expandable ? <button type="button" className="text-xs font-medium text-blue-700 hover:text-blue-900" onClick={nodeData.onToggle}>{nodeData.expanded ? 'Fold group' : 'Expand group'}</button> : null}
       <button type="button" className="text-xs text-zinc-500 hover:text-zinc-900" onClick={() => setCollapsedItem(collapsed ? null : item)}>{collapsed ? 'Expand' : 'Collapse'}</button>
       <button type="button" aria-label="Clear selection" className="text-xs text-zinc-500 hover:text-zinc-900" onClick={onClose}>×</button>
     </div>
@@ -1044,12 +1101,19 @@ type FocusState = { direct: Set<string>; nodes: Set<string>; edges: Set<string>;
 
 function workspaceNodes(items: SemanticNode[], workspace: GraphWorkspace): SemanticNode[] {
   return items.map((node) => {
+    const width = Number(node.style!.width), height = Number(node.style!.height);
+    // Sizes and ports are fixed by the projection. Supplying them avoids mounting
+    // the complete history just to measure offscreen nodes before virtualization.
+    const geometry = { measured: { width, height }, handles: [
+      { type: 'target' as const, position: Position.Left, x: 0, y: height / 2, width: 0, height: 0 },
+      { type: 'source' as const, position: Position.Right, x: width, y: height / 2, width: 0, height: 0 },
+    ] };
     let position = !node.parentId || workspace.pinned.has(node.id) ? workspace.positions.get(node.id) ?? node.position : node.position;
-    if (!node.parentId) return { ...node, position };
+    if (!node.parentId) return { ...node, ...geometry, position };
     const parent = items.find((candidate) => candidate.id === node.parentId)!;
     position = { x: Math.max(16, Math.min(position.x, Number(parent.style!.width) - Number(node.style!.width) - 16)),
       y: Math.max(80, Math.min(position.y, Number(parent.style!.height) - Number(node.style!.height) - 56)) };
-    return { ...node, position, extent: [[16, 80], [Number(parent.style!.width) - 16, Number(parent.style!.height) - 56]] };
+    return { ...node, ...geometry, position, extent: [[16, 80], [Number(parent.style!.width) - 16, Number(parent.style!.height) - 56]] };
   });
 }
 
@@ -1059,6 +1123,18 @@ function LocateStep({ target }: { target: { id: string; ids?: string[]; nonce: n
     if (target) void fitView({ nodes: (target.ids ?? [target.id]).map((id) => ({ id })), padding: 0.35, maxZoom: 1.2, duration: 180 });
   }, [target, fitView]);
   return null;
+}
+
+function WorkflowAxes({ workflow, geometry }: { workflow: WorkflowLayout; geometry: ReturnType<typeof workflowGeometry> }) {
+  const { x, y, zoom } = useViewport();
+  return <div className="pointer-events-none absolute inset-0 z-10 overflow-hidden" aria-hidden="true">
+    {workflow.lanes.map((lane, index) => <div key={lane.id}
+      className="absolute left-3 max-w-44 truncate rounded bg-white/90 px-1.5 py-0.5 text-[10px] font-medium text-slate-600"
+      style={{ top: y + (38 + index * geometry.laneHeight) * zoom }}>{lane.label}</div>)}
+    {geometry.roundStarts.map((round) => <div key={round}
+      className="absolute top-2 whitespace-nowrap rounded bg-white/80 px-1 text-[10px] text-slate-500"
+      style={{ left: x + (48 + (geometry.roundOffsets.get(round) ?? 0)) * zoom }}>{workflow.roundLabel || 'Round'} {round + 1}</div>)}
+  </div>;
 }
 
 function SemanticCanvas({ graph, traces, traceDags, selectedTraceId, workspace, axis, focus, locate, expandedFamilies, onToggle, onAxisChange, onInspectionChange, onWitnessLocate }: {
@@ -1147,9 +1223,13 @@ function SemanticCanvas({ graph, traces, traceDags, selectedTraceId, workspace, 
   const ready = layoutKey === geometryKey;
   const workflowBoxes = rendered.nodes.filter((node) => !node.parentId).map((node) => ({ id: node.id, x: 0, y: 0, width: Number(node.style!.width), height: Number(node.style!.height) }));
   const laneGeometry = rendered.workflow ? workflowGeometry(workflowBoxes, rendered.workflow, rendered.contexts) : undefined;
-  const initialRounds = new Set(laneGeometry?.roundStarts.slice(0, 3) ?? []);
+  const primaryOutcome = graph.structuredOutcomes?.flatMap((run) => run.outcomes)
+    .find((outcome) => outcome.scope !== 'participant' && (outcome.terminal || outcome.kind === 'final'));
+  const initialRounds = new Set(primaryOutcome
+    ? laneGeometry?.roundStarts.filter((round) => Math.abs(round - primaryOutcome.round) <= 1) ?? []
+    : laneGeometry?.roundStarts.slice(0, 3) ?? []);
   const initialNodeIds = rendered.workflow ? rendered.nodes.filter((node) => !node.parentId && node.data.kind === 'family'
-    && (graph.detail === 'overview' || initialRounds.has(node.data.workflowContext?.roundStart ?? -1))).map((node) => node.id) : undefined;
+    && initialRounds.has(node.data.workflowContext?.roundStart ?? -1)).map((node) => node.id) : undefined;
   const routes = useMemo(() => ready ? routedEdges(decorateNodes(routingNodes), styledEdges) : [],
     // Node geometry is snapshotted on layout and drag-end; avoid rerouting the entire graph each drag frame.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1182,19 +1262,15 @@ function SemanticCanvas({ graph, traces, traceDags, selectedTraceId, workspace, 
     >
       {rendered.workflow && laneGeometry ? <ViewportPortal><div className="pointer-events-none absolute left-0 top-0 -z-10" aria-hidden="true">
         {rendered.workflow.lanes.map((lane, index) => <div key={lane.id} className="absolute rounded-lg border border-slate-200/80 bg-white/45" style={{ left: 16, top: 38 + index * laneGeometry.laneHeight, width: laneGeometry.totalWidth + 32, height: laneGeometry.laneHeight - 4 }}>
-          <div className="absolute left-3 top-2 text-[11px] font-semibold text-slate-500">{lane.label}</div>
         </div>)}
-        {laneGeometry.roundStarts.filter((_, index, rounds) => rounds.length <= 12 || index === 0 || index === rounds.length - 1 || index % 10 === 0).map((round) => {
-          const last = Math.max(round, ...[...rendered.contexts.values()].filter((context) => context.roundStart === round).map((context) => context.roundEnd));
-          return <div key={round} className="absolute top-2 text-[10px] font-medium text-slate-400" style={{ left: 48 + (laneGeometry.roundOffsets.get(round) ?? 0) }}>{rendered.workflow!.roundLabel || 'Round'} {round + 1}{last > round ? `–${last + 1}` : ''}</div>;
-        })}
       </div></ViewportPortal> : null}
+      {rendered.workflow && laneGeometry ? <WorkflowAxes workflow={rendered.workflow} geometry={laneGeometry} /> : null}
       <Background color="#cbd5e1" gap={20} size={1} />
       <Controls position="bottom-left" showInteractive={false} fitViewOptions={{ padding: 0.14, minZoom: 0.1 }} />
       <InitialFit workspace={workspace} ready={ready} revision={revision} initialNodeIds={initialNodeIds} />
       <LocateStep target={ready ? locate : null} />
     </ReactFlow>
-    <Inspector item={selected} graph={graph} traces={traces} onClose={() => setSelected(null)} />
+    <Inspector item={selected} graph={graph} traces={traces} nodeData={selected?.kind === 'family' ? rendered.nodes.find((node) => node.id === selected.family.id)?.data : undefined} onClose={() => setSelected(null)} />
     </div>
   </div>;
 }
@@ -1297,14 +1373,22 @@ export function SemanticGraphView({ graph, traces, traceDags, highlightTraceId, 
   const reviewed = typeof review?.assessedEvents === 'number' ? review.assessedEvents : null;
   const cachedRounds = typeof review?.cachedRounds === 'number' ? review.cachedRounds : 0;
   const roundCount = (typeof review?.requestCount === 'number' ? review.requestCount : 0) + cachedRounds;
+  const locateOutcome = (run: string, eventId: string) => {
+    const ids = resultFlowNodes(graph, run, eventId);
+    if (ids.size) {
+      setHighlight(null);
+      setFilters({ ...DEFAULT_GRAPH_FILTERS });
+      locateNodes([...ids]);
+    }
+  };
   return <section className="space-y-2">
     <div className="flex flex-wrap items-center gap-2 text-[11px] text-zinc-500">
-      <span className="font-medium text-zinc-700">{graph.workflow ? `${canvasGraph.nodes.length} activities shown · ${graph.compression.sourceCalls.toLocaleString()} in full history${reviewed !== null ? ` · ${reviewed} reviewed` : ''} · ${graph.compression.expandedActivities ?? 0} key` : `${graph.compression.sourceCalls} calls → ${graph.nodes.length} stages`}</span>
+      <span className="font-medium text-zinc-700">{graph.workflow ? `${graph.nodes.length.toLocaleString()} logical groups · ${graph.compression.visibleCalls.toLocaleString()} activities represented · ${graph.compression.sourceCalls.toLocaleString()} total${reviewed !== null ? ` · ${reviewed} reviewed` : ''} · ${graph.compression.expandedActivities ?? 0} key groups` : `${graph.compression.sourceCalls} calls → ${graph.nodes.length} stages`}</span>
       {!graph.workflow ? <span>· {graph.compression.multiCallGroups} multi-call groups</span> : null}<span>· {graph.alignment.sharedPatterns} shared {graph.workflow ? 'activities' : 'patterns'}</span>
       <span className="ml-auto">{graph.workflow ? `${roundCount} review rounds · ${cachedRounds} cached · ` : ''}{graph.modelMetrics.requestCount} new model calls · {graph.modelMetrics.elapsedSeconds.toFixed(1)}s</span>
     </div>
-    {workflowSummary ? <p className="text-[11px] text-slate-500">Result and evidence flow · unrelated or unreviewed history is hidden here, not judged unimportant. Open Full history to inspect every activity.</p> : null}
-    {graph.workflow ? overview.results.slice(0, 4).map((result) => <p key={`${result.run}:${result.id}`} className="rounded-lg border border-blue-100 bg-blue-50/60 px-3 py-2 text-xs text-blue-950">{traces.length > 1 ? `${result.run} · ` : ''}{result.name}: <strong>{result.value}</strong> · first recorded at round <strong>{result.round + 1}</strong>{result.observedThroughRound !== undefined && result.observedThroughRound > result.round ? ` · run continues through round ${result.observedThroughRound + 1}` : ''}{result.round === 0 ? '. This result already exists in the first round; later activities are not its predecessors.' : ''}</p>) : null}
+    {workflowSummary ? <p className="text-[11px] text-slate-500">All activities and recorded or inferred connections are represented. Unknown means unreviewed or evidence-insufficient.</p> : null}
+    {graph.workflow ? overview.results.slice(0, 4).map((result) => <div key={`${result.run}:${result.id}`} className="flex flex-wrap items-center gap-2 rounded-lg border border-blue-100 bg-blue-50/60 px-3 py-2 text-xs text-blue-950"><span className="min-w-0 flex-1">{traces.length > 1 ? `${result.run} · ` : ''}{result.name}: <strong>{result.value}</strong> · first recorded at round <strong>{result.round + 1}</strong>{result.observedThroughRound !== undefined && result.observedThroughRound > result.round ? ` · run continues through round ${result.observedThroughRound + 1}` : ''}{result.round === 0 ? '. This result already exists in the first round; later activities are not its predecessors.' : ''}</span><button type="button" className="shrink-0 rounded border border-blue-200 bg-white/80 px-2 py-1 font-medium text-blue-800 hover:bg-white" onClick={() => locateOutcome(result.run, result.eventId)}>Locate result</button></div>) : null}
     {graph.workflowAssessment?.runs?.length ? <details className="text-[11px] text-slate-500"><summary className="cursor-pointer">Review coverage and stopping reason</summary><div className="mt-1 space-y-1">{graph.workflowAssessment.runs.map(({ run, retrieval }) => <p key={run}>{traces.length > 1 ? `${run} · ` : ''}{retrieval.assessedEvents} reviewed · {retrieval.unassessedEvents} outside review · {retrieval.stopReason === 'result_has_no_predecessors' ? 'Result has no earlier recorded inputs' : retrieval.stopReason === 'round_limit' ? 'Review budget reached' : retrieval.stopReason === 'link_judgments_incomplete' ? 'Some input links remain uncertain' : retrieval.stopReason?.replaceAll('_', ' ')}{retrieval.remainingFrontier ? ` · ${retrieval.remainingFrontier} upstream activities pending` : ''}</p>)}</div></details> : null}
     <div className="rounded-xl border border-slate-200 bg-white p-2 text-xs">
       <div className="flex flex-wrap items-center gap-1.5">

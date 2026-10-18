@@ -54,7 +54,7 @@ export function workflowGeometry(boxes: Box[], workflow: WorkflowLayout, context
 }
 
 export function workflowSizeSignature(box: Box) {
-  return `workflow:${box.width}:${box.height}:events-v3-compact`;
+  return `workflow:${box.width}:${box.height}:events-v4-focused`;
 }
 
 /** Slot workflow events horizontally within each actor/round cell. */

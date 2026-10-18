@@ -32,6 +32,32 @@ export function workflowOverview(graph: JoinedProvenanceGraph) {
   return { nodeIds, results };
 }
 
+/** Follow reviewed witnesses within one execution, retaining occurrence ports. */
+export function resultFlowNodes(graph: JoinedProvenanceGraph, run: string, eventId: string) {
+  const target = graph.nodes.find((node) => node.instances.some((instance) => instance.run === run
+    && instance.calls.some((call) => call.id === eventId)));
+  const nodes = new Set<string>();
+  if (!target) return nodes;
+  nodes.add(target.id);
+  const queue = target.instances.filter((instance) => instance.run === run
+    && instance.calls.some((call) => call.id === eventId)).map((instance) => instance.id);
+  const visited = new Set(queue);
+  const incoming = new Map<string, Array<{ source: string; instance: string }>>();
+  graph.edges.forEach((edge) => edge.witnesses.forEach((witness) => {
+    if (witness.run !== run || !witness.highlighted) return;
+    const parents = incoming.get(witness.targetInstance) ?? [];
+    parents.push({ source: edge.source, instance: witness.sourceInstance });
+    incoming.set(witness.targetInstance, parents);
+  }));
+  for (let index = 0; index < queue.length; index++) {
+    for (const parent of incoming.get(queue[index]) ?? []) {
+      nodes.add(parent.source);
+      if (!visited.has(parent.instance)) { visited.add(parent.instance); queue.push(parent.instance); }
+    }
+  }
+  return nodes;
+}
+
 function nodeSearchText(node: JoinedProvenanceNode) {
   return [node.methods.join(' '), node.label, node.source?.label ?? '', node.semanticRole,
     node.assessment?.semanticLabel ?? '', node.assessment?.reason ?? '',

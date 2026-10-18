@@ -80,6 +80,8 @@ async def infer_json(prompt, tier='semantic', schema=None):
             messages=[{'role': 'user', 'content': prompt}], response_format=(
                 {'type': 'json_schema', 'json_schema': {'name': 'result_evidence', 'strict': True, 'schema': schema}}
                 if schema is not None else {'type': 'json_object'}))
+        if not response.choices:
+            raise ModelResponseError('Gateway returned no completion choices.')
         if str(response.choices[0].finish_reason).lower() in {'length', 'max_tokens'}:
             raise ModelResponseError('Pattern annotation exhausted its output token budget.')
         content = response.choices[0].message.content
@@ -106,7 +108,7 @@ async def infer_json(prompt, tier='semantic', schema=None):
                             'promptTokens': usage.prompt_tokens if usage else None,
                             'completionTokens': usage.completion_tokens if usage else None,
                             'reasoningTokens': getattr(details, 'reasoning_tokens', None),
-                            'finishReason': response.choices[0].finish_reason if response is not None else None,
+                            'finishReason': response.choices[0].finish_reason if response is not None and response.choices else None,
                             'settings': ANNOTATION_SETTINGS,
                             'succeeded': succeeded})
         await client.close()

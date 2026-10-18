@@ -126,6 +126,35 @@ def test_support_counts_runs_and_role_grouping_is_generic(local_cache):
         assert len({call['round'] for call in calls}) == 1
 
 
+def test_context_siblings_fold_without_losing_activities_or_connections(local_cache):
+    entry = joint_context_trace()
+    # Three independent receipts have the same downstream decision, type and actor.
+    for event in entry['events']:
+        if event['eventType'] == 'information_reception':
+            event['round'] = 2
+    analysis = analyze(entry)
+    graph = build_workflow_view([analysis])
+    receipts = [node for node in graph['nodes'] if node['semanticRole'] == 'information_reception']
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert len(receipt['instances']) == len(receipt['operationGroups']) == 3
+    assert receipt['supportCount'] == 1  # Three messages are not three independent traces.
+    assert graph['compression']['sourceCalls'] == graph['compression']['visibleCalls'] == len(entry['events'])
+    represented = {(w['run'], *w['callPath']) for edge in graph['edges'] for w in edge['witnesses']}
+    assert represented == {(analysis['traceId'], edge['source'], edge['target']) for edge in entry['eventLinks']}
+    assert all(edge['source'] != edge['target'] for edge in graph['edges'])
+    assert graph['projection']['contextFolds'] == 2
+
+
+def test_workflow_failure_uses_actual_tool_output_without_status_flag(local_cache):
+    entry = trace()
+    entry['events'][0]['response'] = {'error': 'The requested resource was unavailable.'}
+    graph = build_workflow_view([analyze(entry)])
+    failed = _node_for_call(graph, entry['events'][0]['id'])
+    assert failed['importance']['tier'] == 'failure'
+    assert failed['operationGroups'][0]['failure'] is True
+
+
 def _node_for_call(graph, call_id):
     return next(node for node in graph['nodes']
                 if any(call['id'] == call_id for instance in node['instances'] for call in instance['calls']))

@@ -1,0 +1,372 @@
+{
+  "source": "Saved graph JSON; actual semantic builder, workflow lane layout and current edge router; local-only, zero model/network/server calls.",
+  "cases": [
+    {
+      "file": "experiments/results/context-iteration-3/discovera-other.graph.json",
+      "workflow": false,
+      "sourceGroups": 12,
+      "sourceOperationGroups": 37,
+      "renderedOperationGroups": 37,
+      "sourceEdges": 17,
+      "representedActivities": 41,
+      "renderedRoots": 12,
+      "renderedNodes": 12,
+      "compactDots": 0,
+      "readableBlueCards": 0,
+      "expandableGroups": 9,
+      "expansion": {
+        "family": "pattern:02dcf1312a3a20be0720",
+        "childNodes": 7,
+        "childAssessmentLevels": [
+          "key"
+        ],
+        "rootShowsCard": true
+      },
+      "builtEdges": 17,
+      "routedEdges": 17,
+      "keyOrRelevantRoutes": 4,
+      "contextRoutes": 0,
+      "ordinaryLinkMinOpacity": 0.65,
+      "virtualization": null,
+      "missingNodes": [],
+      "missingEdges": [],
+      "rootOverlaps": 0,
+      "keyRouteCardInteriorCrossings": 0,
+      "reviewedFlowChain": null,
+      "buildMs": 17.5,
+      "layoutMs": 1344.6,
+      "routeMs": 19.8,
+      "modelNetworkServerCalls": 0
+    },
+    {
+      "file": "experiments/results/context-iteration-3/discovera-single.graph.json",
+      "workflow": false,
+      "sourceGroups": 12,
+      "sourceOperationGroups": 24,
+      "renderedOperationGroups": 24,
+      "sourceEdges": 18,
+      "representedActivities": 25,
+      "renderedRoots": 12,
+      "renderedNodes": 12,
+      "compactDots": 0,
+      "readableBlueCards": 0,
+      "expandableGroups": 8,
+      "expansion": {
+        "family": "pattern:02dcf1312a3a20be0720",
+        "childNodes": 4,
+        "childAssessmentLevels": [
+          "key"
+        ],
+        "rootShowsCard": true
+      },
+      "builtEdges": 18,
+      "routedEdges": 18,
+      "keyOrRelevantRoutes": 4,
+      "contextRoutes": 0,
+      "ordinaryLinkMinOpacity": 0.65,
+      "virtualization": null,
+      "missingNodes": [],
+      "missingEdges": [],
+      "rootOverlaps": 0,
+      "keyRouteCardInteriorCrossings": 0,
+      "reviewedFlowChain": null,
+      "buildMs": 1.4,
+      "layoutMs": 82.7,
+      "routeMs": 2.4,
+      "modelNetworkServerCalls": 0
+    },
+    {
+      "file": "experiments/results/context-iteration-3/discovera-two.graph.json",
+      "workflow": false,
+      "sourceGroups": 12,
+      "sourceOperationGroups": 41,
+      "renderedOperationGroups": 41,
+      "sourceEdges": 25,
+      "representedActivities": 47,
+      "renderedRoots": 12,
+      "renderedNodes": 12,
+      "compactDots": 0,
+      "readableBlueCards": 0,
+      "expandableGroups": 11,
+      "expansion": {
+        "family": "pattern:02dcf1312a3a20be0720",
+        "childNodes": 9,
+        "childAssessmentLevels": [
+          "key"
+        ],
+        "rootShowsCard": true
+      },
+      "builtEdges": 25,
+      "routedEdges": 25,
+      "keyOrRelevantRoutes": 7,
+      "contextRoutes": 0,
+      "ordinaryLinkMinOpacity": 0.65,
+      "virtualization": null,
+      "missingNodes": [],
+      "missingEdges": [],
+      "rootOverlaps": 0,
+      "keyRouteCardInteriorCrossings": 0,
+      "reviewedFlowChain": null,
+      "buildMs": 1.1,
+      "layoutMs": 43.8,
+      "routeMs": 2.6,
+      "modelNetworkServerCalls": 0
+    },
+    {
+      "file": "experiments/results/context-iteration-3-suzuki-retry/suzuki-65.graph.json",
+      "workflow": true,
+      "sourceGroups": 2733,
+      "sourceOperationGroups": 4000,
+      "renderedOperationGroups": 4000,
+      "sourceEdges": 9463,
+      "representedActivities": 4000,
+      "renderedRoots": 2733,
+      "renderedNodes": 2733,
+      "compactDots": 2691,
+      "readableBlueCards": 35,
+      "expandableGroups": 749,
+      "expansion": {
+        "family": "context:f6f28717e00b154542d6",
+        "childNodes": 2,
+        "childAssessmentLevels": [
+          "unknown"
+        ],
+        "rootShowsCard": true
+      },
+      "builtEdges": 9463,
+      "routedEdges": 9463,
+      "keyOrRelevantRoutes": 10,
+      "contextRoutes": 9453,
+      "ordinaryLinkMinOpacity": null,
+      "virtualization": {
+        "viewport": {
+          "width": 1200,
+          "height": 800
+        },
+        "projectedNodes": 2733,
+        "visibleNodes": 49,
+        "unmountedNodes": 2684,
+        "strictSubset": true,
+        "nodesInitialized": true,
+        "geometryMissingUnmounted": []
+      },
+      "missingNodes": [],
+      "missingEdges": [],
+      "rootOverlaps": 0,
+      "keyRouteCardInteriorCrossings": 0,
+      "reviewedFlowChain": {
+        "events": [
+          {
+            "eventId": "suzuki_edbo:het:65:r64:a0:experiment",
+            "familyId": "activity:12c0ccd83b66d430c8c0",
+            "assessmentLevel": "unknown",
+            "renderedLevel": "unknown",
+            "inspected": true,
+            "readableCard": true,
+            "width": 256
+          },
+          {
+            "eventId": "suzuki_edbo:het:65:r64:a0:publication",
+            "familyId": "activity:89c2e14cda8ac1c30725",
+            "assessmentLevel": "unknown",
+            "renderedLevel": "unknown",
+            "inspected": true,
+            "readableCard": true,
+            "width": 256
+          },
+          {
+            "eventId": "suzuki_edbo:het:65:r64:a3:reception-from-0",
+            "familyId": "activity:1715c86b052e05a5e105",
+            "assessmentLevel": "supporting",
+            "renderedLevel": "supporting",
+            "inspected": true,
+            "readableCard": true,
+            "width": 256
+          },
+          {
+            "eventId": "suzuki_edbo:het:65:r65:a3:experiment",
+            "familyId": "activity:64539c76c00ef9ff5087",
+            "assessmentLevel": "key",
+            "renderedLevel": "key",
+            "inspected": true,
+            "readableCard": true,
+            "width": 256
+          }
+        ],
+        "links": [
+          {
+            "edgeId": "event-edge:5ff2b32263589493dd3f",
+            "highlighted": true,
+            "routed": true,
+            "critical": true
+          },
+          {
+            "edgeId": "event-edge:3d00ac7393f34d3dfdec",
+            "highlighted": true,
+            "routed": true,
+            "critical": true
+          },
+          {
+            "edgeId": "event-edge:18a1a7e9f24948ebe9e9",
+            "highlighted": true,
+            "routed": true,
+            "critical": true
+          }
+        ],
+        "exists": true,
+        "highlightedAndRouted": true,
+        "endpointsInspected": true,
+        "endpointsReadable": true,
+        "assessmentLevelsPreserved": true
+      },
+      "buildMs": 192.8,
+      "layoutMs": 15.6,
+      "routeMs": 15.1,
+      "modelNetworkServerCalls": 0
+    },
+    {
+      "file": "experiments/results/context-iteration-3-more/suzuki-42.graph.json",
+      "workflow": true,
+      "sourceGroups": 2725,
+      "sourceOperationGroups": 4000,
+      "renderedOperationGroups": 4000,
+      "sourceEdges": 8680,
+      "representedActivities": 4000,
+      "renderedRoots": 2725,
+      "renderedNodes": 2725,
+      "compactDots": 2694,
+      "readableBlueCards": 29,
+      "expandableGroups": 747,
+      "expansion": {
+        "family": "context:cf0bedb515cfe2472392",
+        "childNodes": 2,
+        "childAssessmentLevels": [
+          "unknown"
+        ],
+        "rootShowsCard": true
+      },
+      "builtEdges": 8680,
+      "routedEdges": 8680,
+      "keyOrRelevantRoutes": 3,
+      "contextRoutes": 8677,
+      "ordinaryLinkMinOpacity": null,
+      "virtualization": {
+        "viewport": {
+          "width": 1200,
+          "height": 800
+        },
+        "projectedNodes": 2725,
+        "visibleNodes": 49,
+        "unmountedNodes": 2676,
+        "strictSubset": true,
+        "nodesInitialized": true,
+        "geometryMissingUnmounted": []
+      },
+      "missingNodes": [],
+      "missingEdges": [],
+      "rootOverlaps": 0,
+      "keyRouteCardInteriorCrossings": 0,
+      "reviewedFlowChain": null,
+      "buildMs": 127.2,
+      "layoutMs": 13,
+      "routeMs": 33.2,
+      "modelNetworkServerCalls": 0
+    },
+    {
+      "file": "experiments/results/context-iteration-3-early-result/suzuki-78.graph.json",
+      "workflow": true,
+      "sourceGroups": 2711,
+      "sourceOperationGroups": 4000,
+      "renderedOperationGroups": 4000,
+      "sourceEdges": 9122,
+      "representedActivities": 4000,
+      "renderedRoots": 2711,
+      "renderedNodes": 2711,
+      "compactDots": 2692,
+      "readableBlueCards": 14,
+      "expandableGroups": 755,
+      "expansion": {
+        "family": "context:379025e8e8f5ae656348",
+        "childNodes": 3,
+        "childAssessmentLevels": [
+          "unknown"
+        ],
+        "rootShowsCard": true
+      },
+      "builtEdges": 9122,
+      "routedEdges": 9122,
+      "keyOrRelevantRoutes": 5,
+      "contextRoutes": 9117,
+      "ordinaryLinkMinOpacity": null,
+      "virtualization": {
+        "viewport": {
+          "width": 1200,
+          "height": 800
+        },
+        "projectedNodes": 2711,
+        "visibleNodes": 61,
+        "unmountedNodes": 2650,
+        "strictSubset": true,
+        "nodesInitialized": true,
+        "geometryMissingUnmounted": []
+      },
+      "missingNodes": [],
+      "missingEdges": [],
+      "rootOverlaps": 0,
+      "keyRouteCardInteriorCrossings": 0,
+      "reviewedFlowChain": null,
+      "buildMs": 91.3,
+      "layoutMs": 8.5,
+      "routeMs": 7.8,
+      "modelNetworkServerCalls": 0
+    },
+    {
+      "file": "experiments/results/context-iteration-3-joined/suzuki-42+65.graph.json",
+      "workflow": true,
+      "sourceGroups": 4681,
+      "sourceOperationGroups": 8000,
+      "renderedOperationGroups": 8000,
+      "sourceEdges": 18143,
+      "representedActivities": 8000,
+      "renderedRoots": 4681,
+      "renderedNodes": 4681,
+      "compactDots": 4608,
+      "readableBlueCards": 64,
+      "expandableGroups": 814,
+      "expansion": {
+        "family": "context:b370c1ab63c3c4b9837f",
+        "childNodes": 5,
+        "childAssessmentLevels": [
+          "unknown"
+        ],
+        "rootShowsCard": true
+      },
+      "builtEdges": 18143,
+      "routedEdges": 18143,
+      "keyOrRelevantRoutes": 13,
+      "contextRoutes": 18130,
+      "ordinaryLinkMinOpacity": null,
+      "virtualization": {
+        "viewport": {
+          "width": 1200,
+          "height": 800
+        },
+        "projectedNodes": 4681,
+        "visibleNodes": 42,
+        "unmountedNodes": 4639,
+        "strictSubset": true,
+        "nodesInitialized": true,
+        "geometryMissingUnmounted": []
+      },
+      "missingNodes": [],
+      "missingEdges": [],
+      "rootOverlaps": 0,
+      "keyRouteCardInteriorCrossings": 0,
+      "reviewedFlowChain": null,
+      "buildMs": 195.6,
+      "layoutMs": 20.3,
+      "routeMs": 15.8,
+      "modelNetworkServerCalls": 0
+    }
+  ]
+}

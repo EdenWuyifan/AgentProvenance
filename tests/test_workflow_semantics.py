@@ -85,6 +85,41 @@ def test_result_seed_and_explicit_parents_are_assessed_with_citations(cache, mon
     assert result['retrievalMetrics']['requestCount'] == 2
 
 
+def test_long_workflow_reviews_independent_outcomes_and_trajectory():
+    source = make_analysis()
+    source['calls'] = [{'id': f'activity-{i}', 'tool': 'arbitrary operation', 'eventType': 'generic',
+                        'agentId': f'actor-{i % 4}', 'round': i, 'args': {}, 'response': {'value': i}}
+                       for i in range(80)]
+    source['resultAnchors'] = []
+    source['workflow'] = {'eventLinks': [], 'outcomes': [
+        {'eventId': 'activity-0', 'name': 'First milestone', 'metric': 'quality', 'value': 10, 'scope': 'system'},
+        {'eventId': 'activity-40', 'name': 'Middle milestone', 'metric': 'quality', 'value': 50, 'scope': 'system'},
+        *[{'eventId': f'activity-{i}', 'name': 'Local result', 'metric': 'quality', 'value': i,
+           'scope': 'participant'} for i in (76, 77, 78, 79)],
+        {'eventId': 'activity-79', 'name': 'Final result', 'metric': 'quality', 'value': 79,
+         'scope': 'system', 'kind': 'final', 'terminal': True}]}
+    prepared = ws._prepare_uncached(source)
+    assert {'activity-0', 'activity-40', 'activity-76', 'activity-77', 'activity-78', 'activity-79'} <= set(prepared['seeds'])
+    assert prepared['seeds'][0] == 'activity-79'
+
+
+def test_retrieval_uses_selected_rationale_and_balances_direct_input_relations():
+    source = make_analysis()
+    source['calls'][0]['response'] = 'Peer discovered alkoxide activation.'
+    source['calls'][1]['args'] = {'rationale': 'Test peer alkoxide activation.',
+                                'candidates': [{'rationale': 'Rejected phosphate idea.'} for _ in range(20)]}
+    source['calls'][2]['response'] = 'Rejected phosphate idea.'
+    source['calls'][3]['response'] = 'Earlier local alkoxide experiment.'
+    target = source['calls'][1]['id']
+    source['workflow']['eventLinks'] = [
+        {'source': source['calls'][2]['id'], 'target': target, 'relation': 'shared_context'},
+        {'source': source['calls'][0]['id'], 'target': target, 'relation': 'shared_context'},
+        {'source': source['calls'][3]['id'], 'target': target, 'relation': 'local_context'}]
+    prepared = ws._prepare_uncached(source)
+    ranked = ws._rank_inputs(prepared, [target], [call['id'] for call in source['calls'] if call['id'] != target])
+    assert ranked[:2] == [source['calls'][0]['id'], source['calls'][3]['id']]
+
+
 def test_source_output_plaintext_and_actual_paths_are_in_prompt(cache, monkeypatch):
     prompts = []
 
@@ -168,7 +203,7 @@ def test_task_and_result_terms_do_not_trigger_generic_retrieval(cache, monkeypat
     original = ws.BM25Retriever.search
 
     def track(self, query, limit=5, allowed_call_ids=None):
-        calls.append(query)
+        calls.append(allowed_call_ids)
         return original(self, query, limit, allowed_call_ids)
 
     monkeypatch.setattr(ws.BM25Retriever, 'search', track)
@@ -178,7 +213,10 @@ def test_task_and_result_terms_do_not_trigger_generic_retrieval(cache, monkeypat
 
     monkeypatch.setattr(ws, 'infer_json', infer)
     asyncio.run(ws.assess_workflow([source], focus='rare task words'))
-    assert calls == []
+    # Ranking explicit inputs may use retrieval; arbitrary task/result terms may
+    # not trigger an unconstrained corpus search without an LLM search query.
+    assert all(allow is not None for allow in calls)
+    assert all(source['calls'][3]['id'] not in allow for allow in calls)
 
 
 def test_round_label_uses_rounds_not_adapter_order_for_inferred_context():
@@ -219,6 +257,7 @@ def test_milestone_fallback_uses_latest_system_outcome_only():
 
 
 def test_key_parent_is_expanded_backwards_across_multiple_rounds(cache, monkeypatch):
+    monkeypatch.setattr(ws, 'MAX_ROUNDS', 3)
     calls = [
         {'id': 'chain:early', 'tool': 'early source', 'agentId': 'a', 'round': 0,
          'args': {'note': 'distinctive earlier observation'}, 'response': 'observation recorded'},
@@ -275,6 +314,7 @@ def test_assessment_stops_after_one_call_without_model_expansion(cache, monkeypa
 
 
 def test_relevant_supporting_input_is_followed_to_its_recorded_input(cache, monkeypatch):
+    monkeypatch.setattr(ws, 'MAX_ROUNDS', 3)
     calls = [
         {'id': 'chain:early', 'tool': 'early source', 'args': {'note': 'earlier observation'},
          'response': 'observation recorded'},
@@ -329,6 +369,7 @@ def test_high_fan_in_stays_within_three_bounded_requests(cache, monkeypatch):
 
 
 def test_oversized_target_batch_is_split_across_bounded_rounds(cache, monkeypatch):
+    monkeypatch.setattr(ws, 'MAX_ROUNDS', 3)
     parents = [{'id': f'large:input:{index}', 'tool': 'recorded input',
                 'args': {'a': f'parent-{index}-' + 'x' * 380}, 'response': f'parent-result-{index}-' + 'y' * 380}
                for index in range(24)]
@@ -430,14 +471,14 @@ def test_missing_default_is_saved_as_invalid_and_fake_citation_raises(cache, mon
 def test_any_explicit_link_can_select_a_key_parent_but_parent_must_be_key():
     source = make_analysis()
     prepared = ws._prepare_uncached(source)
-    parent, target = source['calls'][2]['id'], source['calls'][1]['id']
+    parent, target = source['calls'][1]['id'], source['calls'][2]['id']
     link_rows = ws._context_links(prepared, [target], [parent, target])
     assert any(row['relation'] == 'publishes' for row in link_rows)
     payload = ws._prompt_payload(prepared, '', [target], [parent, target], link_rows)
     parent_ref, target_ref = prepared['idToRef'][parent], prepared['idToRef'][target]
     parent_quote = next(iter(payload['events'][0]['evidence']))
     raw = {'defaultLevel': 'unknown', 'assessments': [
-        {'event': parent_ref, 'level': 'key', 'label': 'Published input', 'reason': 'Recorded input.',
+        {'event': parent_ref, 'level': 'key', 'label': 'Produced finding', 'reason': 'Recorded input.',
          'evidence': [parent_quote]},
         {'event': target_ref, 'level': 'supporting', 'label': 'Work', 'reason': 'Context.', 'evidence': []}],
         'keyParents': [parent_ref]}

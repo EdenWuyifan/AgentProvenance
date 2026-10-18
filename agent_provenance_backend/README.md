@@ -295,8 +295,12 @@ zero new LLM requests. The first semantic workflow view uses cached, bounded Gem
 3.8 Flash calls after local BM25 retrieval from source-anchored final results.
 Only retrieved occurrences are assessed from actual arguments, output and recorded
 relationships; unvisited occurrences remain explicitly unreviewed. Each selected
-run has at most three backward retrieval rounds, with 48 occurrence cards and
-40,000 prompt characters per round. The model may request further local searches
+run has at most two retrieval rounds, with 48 occurrence cards and
+24,000 prompt characters per round. Independent participant outcomes and earlier
+result milestones supplement the final result as review targets. Direct inputs
+are ranked using the selected action's rationale and balanced across target and
+relation, so similar local experiments cannot crowd out relevant peer messages.
+The model may request further local searches
 and expand key predecessors; unchanged rounds reuse their cache. Neither event type nor tool name
 sets importance. Subsequent joins reuse unchanged context assessments. Malformed
 model output fails validation. The sparse response explicitly defaults omitted
@@ -314,21 +318,34 @@ Source evidence is sent under opaque references with its actual source path.
 Explicit parents and semantic retrieval candidates remain distinguishable. Retrieval
 limits are reported as partial coverage, without deleting unreviewed parents or
 silently judging them unimportant. The source graph keeps
-one card or point per activity and aligns only equivalent observed parameters
-across runs. Publication → reception → consuming activity retains literal endpoints;
+every activity and aligns equivalent observed parameters across runs. Routine
+parallel siblings in the same lane and round can share a compact point only when
+they have identical downstream ports; original occurrences and link witnesses
+remain individually inspectable. Publication → reception → consuming activity retains literal endpoints;
 no maximum-parent pruning or time-window grouping is applied. Pinned canvas
 positions survive selection changes; new automatic slots reflow without overlap.
 Isolated workflow filters use a separate compact layout over the retained rounds;
 the complete canvas retains its manual positions and viewport.
-The default overview renders result anchors, key activities and endpoints of the
-reviewed flow. Unreviewed history stays available to search and Full history,
-without thousands of question-mark nodes. The header separates review rounds,
+The default overview retains all activities and connections. Result anchors,
+key activities and reviewed evidence chains use readable cards; other context
+uses compact dots. Literal transport into reviewed evidence is highlighted
+without changing the model's semantic importance judgment of its sender.
+Locate result frames the run-scoped reviewed chain locally, without a model
+request. Known node dimensions and handles let the canvas mount only the visible
+area while preserving offscreen history. The header separates review rounds,
 cache reuse and new model requests. Terminal results retain their original round;
 an initial-round result is not attributed to later communication. Per-run coverage,
 remaining frontier and stop reasons distinguish a completed backward path from a
 bounded or incomplete review. Relevant links between supporting activities remain
 in the overview so they do not break a key result path.
 Gemini Copilot retrieves bounded assessments and joint contexts on demand.
+
+`experiments/iterate_provenance.py` checks real Discovera and Suzuki selections,
+call and dependency coverage, abstraction, cache reuse and timings. It is
+cache-only by default; `--live` explicitly enables new gateway requests.
+`experiments/verify_context_projection.mjs` checks the actual canvas projection,
+expansion, routing and viewport geometry against saved graphs. The measured
+iteration comparison is in `experiments/results/provenance-iteration-comparison.json`.
 
 ## Verification
 

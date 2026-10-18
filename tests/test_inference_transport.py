@@ -95,6 +95,18 @@ def test_evidence_schema_is_sent_as_structured_output(monkeypatch):
     assert client.request['response_format']['json_schema']['schema'] == schema
 
 
+def test_empty_gateway_completion_preserves_error_metrics(monkeypatch):
+    client = FakeClient(SimpleNamespace(choices=[], usage=None))
+    monkeypatch.setattr(inference, 'portkey_client', lambda: (client, 'model'))
+    with pytest.raises(ModelResponseError, match='no completion choices'):
+        with inference.capture_metrics() as metrics:
+            asyncio.run(inference.infer_json('compact prompt'))
+    assert client.closed
+    assert len(metrics) == 1
+    assert metrics[0]['succeeded'] is False
+    assert metrics[0]['finishReason'] is None
+
+
 def test_failed_batch_cancels_and_joins_its_other_owned_requests():
     finished = []
 

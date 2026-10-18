@@ -11,7 +11,7 @@ from importance import numeric_score, score_summary
 from models import digest
 from workflow_attribution import fit_workflow_attribution
 from workflow_insights import build_workflow_insights
-from abstraction import _entity_ports
+from abstraction import _entity_ports, _recorded_failure
 
 VERSION = 'workflow-activities-v2'
 EVENT_FIELDS = ('eventType', 'agentId', 'role', 'round', 'phase', 'source', 'diagnostics', 'patterns')
@@ -152,6 +152,66 @@ def _activity_signature(call, by_id):
             normalize(call.get('args')), call.get('status')]
 
 
+def compact_context(graph):
+    """Fold parallel context with identical downstream ports, preserving every witness.
+
+    Identical successors make these safe sibling contractions: a fold cannot
+    introduce a new dependency path. Important/result/failed activities stay separate.
+    """
+    outgoing = defaultdict(set)
+    for edge in graph['edges']:
+        outgoing[edge['source']].add((edge['target'], edge['relation']))
+    buckets = defaultdict(list)
+    for node in graph['nodes']:
+        context = node['executionContext']
+        protected = (node['assessment']['level'] == 'key' or node['importance']['tier'] == 'failure'
+                     or any(facet['id'] == 'reviewed-flow' for facet in node['importance']['facets'])
+                     or any(instance['resultTargets'] for instance in node['instances']))
+        signature = (node['id'],) if protected else (
+            context['laneId'], context['roundStart'], node['semanticRole'], tuple(node['methods']),
+            tuple(sorted({variant['roleBindings']['participant'] for variant in node['variants']})),
+            node['assessment']['level'], tuple(sorted(outgoing[node['id']])))
+        buckets[signature].append(node)
+    remap, nodes = {}, []
+    for members in buckets.values():
+        node = members[0]
+        if len(members) > 1:
+            instances = [instance for member in members for instance in member['instances']]
+            per_run = Counter(instance['run'] for instance in instances)
+            count = max(per_run.values())
+            node = {**node, 'id': 'context:' + digest(sorted(member['id'] for member in members))[:20],
+                    'label': f"{node['methods'][0]} · {count} activities", 'instances': instances,
+                    'variants': [variant for member in members for variant in member['variants']],
+                    'operationGroups': [operation for member in members for operation in member['operationGroups']],
+                    'resultBackbone': any(member['resultBackbone'] for member in members),
+                    'eventSummary': {**node['eventSummary'], 'eventCount': len(instances)},
+                    'assessment': {**node['assessment'], 'semanticLabel': f"{node['methods'][0]} · {count} activities",
+                        'reason': 'Parallel activities with the same downstream connections; inspect each original occurrence.',
+                        'perTrace': [assessment for member in members for assessment in member['assessment']['perTrace']]}}
+            support = sorted(per_run)
+            node['supportTraces'], node['supportCount'] = support, len(support)
+            node['assessment']['assessedSupportCount'] = len({assessment['run'] for assessment in node['assessment']['perTrace']
+                                                            if assessment['status'] == 'assessed'})
+        nodes.append(node)
+        remap.update((member['id'], node['id']) for member in members)
+    bundles = {}
+    for edge in graph['edges']:
+        source, target = remap[edge['source']], remap[edge['target']]
+        key = source, target, edge['relation']
+        bundle = bundles.setdefault(key, {**edge, 'id': 'event-edge:' + digest(key)[:20],
+                                         'source': source, 'target': target, 'witnesses': []})
+        bundle['witnesses'].extend(edge['witnesses'])
+    for edge in bundles.values():
+        edge['supportTraces'] = sorted({w['run'] for w in edge['witnesses']})
+        edge['supportCount'] = len(edge['supportTraces'])
+    return {**graph, 'nodes': nodes, 'edges': list(bundles.values()),
+            'compression': {**graph['compression'], 'visibleNodes': len(nodes),
+                            'multiCallGroups': sum(count > 1 for node in nodes
+                                for count in Counter(instance['run'] for instance in node['instances']).values())},
+            'projection': {**graph['projection'], 'shownEdges': len(bundles),
+                           'unfoldedNodes': len(graph['nodes']), 'contextFolds': len(graph['nodes']) - len(nodes)}}
+
+
 def build_workflow_view(analyses, references=(), cohort=None, focus='', detail='overview', lane_by='agent',
                         workflow_assessments=None):
     """Project individually assessed activities; never collapse a temporal window."""
@@ -247,7 +307,7 @@ def build_workflow_view(analyses, references=(), cohort=None, focus='', detail='
         support = sorted({m['run'] for m in members})
         outcomes = [o for m in members for o in outcome_by_event[m['run'], m['calls'][0]['id']]]
         diagnostics = [d for call in calls for d in call.get('diagnostics', [])]
-        failures = any(str(call.get('status')).lower() in {'error', 'failed', 'failure'} for call in calls)
+        failures = any(_recorded_failure(call) for call in calls)
         levels = [m['assessment']['level'] for m in members]
         level = 'key' if 'key' in levels else 'unknown' if 'unknown' in levels else 'supporting'
         key = level == 'key'
@@ -335,11 +395,34 @@ def build_workflow_view(analyses, references=(), cohort=None, focus='', detail='
         all_edges.append({'id': 'event-edge:' + digest([source, target, relation])[:20], 'source': source, 'target': target,
                           'supportTraces': support, 'supportCount': len(support), 'relation': relation,
                           'inferred': any(w['inferred'] for w in witnesses), 'witnesses': witnesses})
+    reviewed = {(w['run'], instance) for edge in all_edges for w in edge['witnesses'] if w['highlighted']
+                for instance in (w['sourceInstance'], w['targetInstance'])}
+    # Follow literal transport back from reviewed evidence. This changes display
+    # prominence, not the model's assessment of each sender's semantic importance.
+    changed = True
+    while changed:
+        changed = False
+        for edge in all_edges:
+            if edge['relation'] not in {'publishes', 'delivered_to', 'recorded_parent'}:
+                continue
+            for witness in edge['witnesses']:
+                source = witness['run'], witness['sourceInstance']
+                if not witness['inferred'] and (witness['run'], witness['targetInstance']) in reviewed:
+                    if not witness['highlighted']:
+                        witness['highlighted'] = True
+                        witness['reason'] = 'Recorded transport into reviewed evidence; semantic importance is separately assessed.'
+                    if source not in reviewed:
+                        reviewed.add(source)
+                        changed = True
+    for node in nodes:
+        if any((instance['run'], instance['id']) in reviewed for instance in node['instances']):
+            node['importance']['facets'].append({'id': 'reviewed-flow', 'label': 'Reviewed evidence flow'})
+            node['importance']['decision'] = 'expand'
     edges = all_edges
     source_calls = sum(len(a['calls']) for a in analyses)
     counts = Counter(m['assessment']['level'] for members in families.values() for m in members)
     round_count = max((a['workflow']['roundCount'] for a in analyses), default=1)
-    return {'nodes': nodes, 'edges': edges, 'omittedCalls': [], 'generation': 'mechanical',
+    graph = {'nodes': nodes, 'edges': edges, 'omittedCalls': [], 'generation': 'mechanical',
             'templateVersion': VERSION, 'detail': detail, 'cohort': cohort or {},
             'workflow': {'lanes': [{**lane, 'participantIds': sorted(lane['participantIds'])} for lane in lanes.values()],
                          'roundRange': [0, round_count - 1], 'roundLabel': analyses[0]['workflow']['roundLabel'],
@@ -365,3 +448,4 @@ def build_workflow_view(analyses, references=(), cohort=None, focus='', detail='
                          'Semantic importance and recorded evidence use do not prove causal influence.',
                          'Unknown means unreviewed or insufficient evidence, not that the activity is unimportant.',
                          'Support counts independent executions, not agents or message recipients.']}
+    return compact_context(graph) if detail == 'overview' else graph

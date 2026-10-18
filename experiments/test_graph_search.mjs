@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { buildFocusCatalog, edgeAllowed, focusSelection, matchFamilies, workflowOverview, DEFAULT_GRAPH_FILTERS } from '../agent_provenance_react/app/components/graph_search.ts';
+import { buildFocusCatalog, edgeAllowed, focusSelection, matchFamilies, workflowOverview, resultFlowNodes, DEFAULT_GRAPH_FILTERS } from '../agent_provenance_react/app/components/graph_search.ts';
 
 const makeNode = (id, label, method, run = `private-${id}`) => ({
   id, kind: 'JoinedActivity', label, semanticRole: 'operation', supportTraces: [run], supportCount: 2,
@@ -30,6 +30,21 @@ assert.equal(overview.nodeIds.size, 4000);
 assert.equal(overview.results[0].round, 0);
 assert.equal(overview.results[0].observedThroughRound, 199);
 assert.equal(history.nodes.length, 4000); // Unreviewed history remains represented on the canvas.
+
+const resultFlow = {
+  nodes: [makeNode('source', '', '', 'run'), makeNode('receipt', '', '', 'run'), makeNode('result', '', '', 'run'),
+    makeNode('other', '', '', 'other-run')],
+  edges: [
+    { source: 'source', target: 'receipt', witnesses: [{ run: 'run', sourceInstance: 'instance-source', targetInstance: 'instance-receipt', highlighted: true }] },
+    { source: 'receipt', target: 'result', witnesses: [{ run: 'run', sourceInstance: 'instance-receipt', targetInstance: 'instance-result', highlighted: true }] },
+    { source: 'other', target: 'result', witnesses: [{ run: 'other-run', sourceInstance: 'instance-other', targetInstance: 'instance-result', highlighted: true }] },
+  ],
+};
+resultFlow.nodes[0].instances[0].calls[0].id = 'source';
+resultFlow.nodes[1].instances[0].calls[0].id = 'receipt';
+resultFlow.nodes[2].instances[0].calls[0].id = 'final';
+assert.deepEqual([...resultFlowNodes(resultFlow, 'run', 'final')].sort(), ['receipt', 'result', 'source']);
+assert.equal(resultFlowNodes(resultFlow, 'run', 'missing').size, 0);
 
 assert.deepEqual([...matchFamilies(graph, { ...DEFAULT_GRAPH_FILTERS, text: 'target data' })], ['family-a']);
 assert.deepEqual([...matchFamilies(graph, { ...DEFAULT_GRAPH_FILTERS, text: 'target missing' })], []);
