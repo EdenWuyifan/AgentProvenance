@@ -13,8 +13,9 @@ import {
 import { SemanticGraphView } from "./components/semantic_graph";
 import { createGraphWorkspace } from "./components/graph_layout";
 import { graphScope, type GraphCommand, type GraphViewState } from "./components/graph_controls";
+import { DEFAULT_GRAPH_FILTERS } from "./components/graph_search";
 import { ProvenanceCopilot } from "./components/provenance_copilot";
-import { corpusSource, DISCOVERA_SOURCE, type TraceSource, type WorkflowCorpus } from "./components/trace_sources";
+import { DEFAULT_TRACE_SOURCE, EXAMPLES, parseTraceView, traceViewUrl, type TraceSource } from "./components/trace_sources";
 import type {
   AgentDag,
   GraphMode,
@@ -35,6 +36,7 @@ const GROUPING_EXCLUDED_KEYS = new Set([
   "toolCalls",
   "tool_calls",
   "finalOutput",
+  "snapshotRef",
   "final_answer",
   "answer",
 ]);
@@ -167,13 +169,14 @@ function normalizeTracing(
           : undefined,
     toolCalls: extractToolCallRecords(tracing),
     finalOutput: typeof tracing.finalOutput === "string" ? tracing.finalOutput : null,
+    snapshotRef: typeof tracing.snapshotRef === "string" ? tracing.snapshotRef : undefined,
   };
 }
 
 function workflowRequest(tracing: Tracing) {
   return { eventSchemaVersion: tracing.eventSchemaVersion, participants: tracing.participants,
     eventLinks: tracing.eventLinks, outcomes: tracing.outcomes, importMetadata: tracing.importMetadata,
-    workflowRef: tracing.workflowRef };
+    workflowRef: tracing.workflowRef, snapshotRef: tracing.snapshotRef };
 }
 
 function resolveTaskDescription(tracing: Tracing) {
@@ -280,7 +283,9 @@ async function fetchTraceText(source: TraceSource) {
 
   const response = await fetch(source.path);
   if (!response.ok) {
-    throw new Error(`Request failed with status ${response.status}`);
+    throw new Error(response.status === 404
+      ? 'No trace file is available for this source. Use Open traces to load a JSON or JSONL file.'
+      : `Unable to load this source (HTTP ${response.status}).`);
   }
 
   return response.text();
@@ -467,22 +472,20 @@ export default function Home() {
   // Figure mode (?figure or ?figure=1.6): larger fonts for paper screenshots.
   const [figureScale, setFigureScale] = useState(1);
 
-  useEffect(() => {
-    setFigureScale(parseFigureScale(window.location.search));
-  }, []);
-  const [traceSource, setTraceSource] = useState<TraceSource>(DISCOVERA_SOURCE);
+  const [traceSource, setTraceSource] = useState<TraceSource>(DEFAULT_TRACE_SOURCE);
+  const initialRunIds = useRef<string[] | null>(null);
+  const [requestedView, setRequestedView] = useState<ReturnType<typeof parseTraceView> | null>(null);
   const sourceRevision = useRef(0);
   const [selectedTracingIds, setSelectedTracingIds] = useState<Array<Tracing["id"]>>([]);
   const [toolSets, setToolSets] = useState<ToolSets>({});
   const [topChartMode, setTopChartMode] = useState<TopChartMode>("impact");
   const [upsetGroupBy, setUpsetGroupBy] = useState("");
   const [upsetScoreBy, setUpsetScoreBy] = useState("score");
+  const [toolMatrixOpen, setToolMatrixOpen] = useState(false);
+  const [toolMatrixEpoch, setToolMatrixEpoch] = useState(0);
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
   const [comparisonDetail, setComparisonDetail] = useState<ComparisonDetail>("overview");
   const [laneBy, setLaneBy] = useState<'agent' | 'role'>('agent');
-  const [workflowCorpora, setWorkflowCorpora] = useState<WorkflowCorpus[]>([]);
-  useEffect(() => { void fetch('/api/workflow-corpora').then((response) => response.ok ? response.json() : { corpora: [] })
-    .then((payload) => setWorkflowCorpora(payload.corpora)).catch(() => setWorkflowCorpora([])); }, []);
   const [focusDraft, setFocusDraft] = useState("");
   const [focus, setFocus] = useState("");
   const [targetCallSelection, setTargetCallSelection] = useState("");
@@ -498,9 +501,15 @@ export default function Home() {
   const agentDagStatesRef = useRef<Record<string, AgentDagState>>({});
 
   const { data, cacheKey, loading, error } = useTracingData(traceSource);
+  const activeExample = EXAMPLES.find((example) => example.sources.some((source) => source.path === traceSource.path));
   const [graphViewState, setGraphViewState] = useState<GraphViewState | null>(null);
   const [graphCommands, setGraphCommands] = useState<GraphCommand[]>([]);
-  const graphWorkspace = useMemo(() => createGraphWorkspace(cacheKey), [cacheKey]);
+  const graphWorkspace = useMemo(() => {
+    const workspace = createGraphWorkspace(cacheKey);
+    workspace.axis = requestedView?.axis;
+    workspace.filters = {...DEFAULT_GRAPH_FILTERS, ...requestedView?.filters};
+    return workspace;
+  }, [cacheKey, requestedView]);
   const groupingOptions = getGroupingOptions(data);
   const groupingValues = getGroupingValues(data, upsetGroupBy);
   const scoringOptions = getScoringOptions(data);
@@ -584,6 +593,7 @@ export default function Home() {
     setGraphCommands([]);
     setGraphViewState(null);
     setTargetCallSelection('');
+    setRequestedView(null);
     setTraceSource(source);
   }, []);
 
@@ -620,7 +630,7 @@ export default function Home() {
         },
         body: JSON.stringify({
           traceId: tracing.id,
-          toolCalls: tracing.workflowRef ? undefined : tracing.toolCalls,
+          toolCalls: tracing.workflowRef || tracing.snapshotRef ? undefined : tracing.toolCalls,
           ...workflowRequest(tracing),
           taskId: tracing.task_id ?? tracing.taskId ?? null,
           taskDescription: resolveTaskDescription(tracing),
@@ -658,6 +668,23 @@ export default function Home() {
       });
     }
   }, [setAgentDagState, focus, selectedTarget?.id, selectedTarget?.traceId]);
+
+  useEffect(() => {
+    const view = parseTraceView(window.location.search);
+    openTraceSource(view.source);
+    initialRunIds.current = view.runs;
+    setRequestedView(view);
+    setFigureScale(parseFigureScale(window.location.search));
+  }, [openTraceSource]);
+
+  useEffect(() => {
+    if (loading || initialRunIds.current === null) return;
+    const ids = new Set(initialRunIds.current);
+    initialRunIds.current = null;
+    const traces = data.filter((tracing) => ids.has(String(tracing.id)));
+    setSelectedTracingIds(traces.map((tracing) => tracing.id));
+    traces.forEach((tracing) => { void loadAgentDag(tracing); });
+  }, [loading, data, loadAgentDag]);
 
   const handleTracingSelect = useCallback((tracingId: Tracing["id"]) => {
     setHoveredJoinedTraceId(null);
@@ -813,7 +840,7 @@ export default function Home() {
                 finalOutput: tracing.finalOutput ?? null,
                 score: isScoringValue(tracing[selectedScoreBy]) ? Number(tracing[selectedScoreBy]) : null,
                 scoreMetric: selectedScoreBy === 'score' ? tracing.scoreMetric ?? 'score' : selectedScoreBy,
-                toolCalls: tracing.workflowRef ? undefined : tracing.toolCalls,
+                toolCalls: tracing.workflowRef || tracing.snapshotRef ? undefined : tracing.toolCalls,
                 ...workflowRequest(tracing),
                 targetCallIds: selectedTarget?.traceId === String(tracing.id) ? [selectedTarget.id] : [],
               }]
@@ -828,7 +855,7 @@ export default function Home() {
             scoreMetric: selectedScoreBy === 'score' ? tracing.scoreMetric ?? 'score' : selectedScoreBy,
             workflowSummary: tracing.workflowSummary,
             tools: [...new Set(tracing.toolCalls.map((call) => call.name))].sort(),
-            analysisKey: state?.status === "ready" ? state.analysisKey : null,
+            analysisKey: state?.status === "ready" ? state.analysisKey : tracing.snapshotRef ?? null,
           };
         });
         const response = await fetch("/api/joined-provenance-graph", {
@@ -891,7 +918,7 @@ export default function Home() {
 
   useEffect(() => {
     const element = upsetRef.current;
-    if (!element || loading || error || data.length === 0) {
+    if (!element || loading || error || data.length === 0 || (!toolMatrixOpen && data.length <= 12)) {
       return;
     }
 
@@ -945,6 +972,8 @@ export default function Home() {
     selectedScoreBy,
     toolSets,
     topChartMode,
+    toolMatrixOpen,
+    toolMatrixEpoch,
     upsetGroupBy,
   ]);
 
@@ -988,36 +1017,55 @@ export default function Home() {
               aria-label="Trace source"
               title={traceSource.name}
               className="h-full max-w-96 border-r border-zinc-300 bg-transparent px-2 text-[11px] text-zinc-700"
-              value={traceSource.path ?? "uploaded"}
+              value={activeExample?.name ?? ""}
               onChange={(event) => {
-                if (event.target.value === DISCOVERA_SOURCE.path) openTraceSource(DISCOVERA_SOURCE);
-                else {
-                  const corpus = workflowCorpora.find((item) => corpusSource(item).path === event.target.value);
-                  if (corpus) openTraceSource(corpusSource(corpus));
-                }
+                const example = EXAMPLES.find((item) => item.name === event.target.value);
+                if (example) openTraceSource(example.sources[0]);
               }}
             >
-              <option value={DISCOVERA_SOURCE.path}>{DISCOVERA_SOURCE.name}</option>
-              {workflowCorpora.filter((corpus) => corpus.currentVersion).map((corpus) => {
-                const source = corpusSource(corpus);
-                return <option key={source.path} value={source.path}>{source.name}</option>;
-              })}
-              {workflowCorpora.some((corpus) => !corpus.currentVersion) && <optgroup label="Earlier imports">
-                {workflowCorpora.filter((corpus) => !corpus.currentVersion).map((corpus) => {
-                  const source = corpusSource(corpus);
-                  return <option key={source.path} value={source.path}>{source.name}</option>;
-                })}
-              </optgroup>}
-              {!traceSource.path && <option value="uploaded">{traceSource.name}</option>}
+              {!activeExample && <option value="">{traceSource.name}</option>}
+              {EXAMPLES.map((example) => <option key={example.name} value={example.name}>{example.name}</option>)}
             </select>
-            <UpsetTopChartToggle mode={topChartMode} onChange={setTopChartMode} />
+            {activeExample && activeExample.sources.length > 1 && <select aria-label="Example task" title={traceSource.name} className="h-full border-r border-zinc-300 bg-transparent px-2 text-[11px] text-zinc-700" value={traceSource.path ?? ""} onChange={(event) => { const source = activeExample.sources.find((item) => item.path === event.target.value); if (source) openTraceSource(source); }}>
+              {activeExample.sources.map((source) => <option key={source.path} value={source.path}>{source.name}</option>)}
+            </select>}
+            {!loading && data.length > 0 && data.length <= 12 && <button type="button" className="h-full px-2 text-[11px] text-zinc-600 hover:text-zinc-950" onClick={() => { data.forEach((tracing) => { void loadAgentDag(tracing); }); setSelectedTracingIds(data.map((tracing) => tracing.id)); }}>Compare all {data.length} runs</button>}
           </div>
+          {!loading && !error && data.length > 0 && (() => {
+            const statuses = data.map((tracing) => (tracing.trainingOutcome as { status?: unknown } | undefined)?.status);
+            const success = statuses.filter((status) => status === 'success').length;
+            const failure = statuses.filter((status) => status === 'failure').length;
+            return success + failure > 0 ? <p className="mb-3 text-xs text-zinc-500">{success} successful · {failure} failed · {data.length - success - failure} unknown outcomes</p> : null;
+          })()}
+          {!loading && data.some((tracing) => tracing.snapshotRef) && (
+            <p className="mb-3 text-xs text-zinc-500">Saved analysis replay · selection, joining and filters run locally without new model calls.</p>
+          )}
+          <div className="mb-3 flex gap-4 text-xs text-zinc-600">
+            {traceSource.path && selectedTracingIds.length > 0 && <a className="underline underline-offset-2" href={traceViewUrl(traceSource, selectedTracingIds, graphViewState?.axis ?? 'semantic', figureScale, graphViewState?.filters)}>Reopen this source and filters</a>}
+          </div>
+          {!loading && !error && data.length > 0 && data.length <= 12 && <div className="mb-4 flex flex-wrap gap-2" aria-label="Choose runs to compare">
+            {data.map((tracing) => {
+              const traceId = String(tracing.id);
+              const outcome = (tracing.trainingOutcome as { status?: unknown } | undefined)?.status;
+              const status = outcome === 'success' ? 'Successful' : outcome === 'failure' ? 'Failed' : null;
+              const score = isScoringValue(tracing.score) ? `Score ${Number(tracing.score).toFixed(3)}` : 'Outcome unknown';
+              const selected = selectedTracingIds.includes(tracing.id);
+              return <button key={traceId} type="button" aria-pressed={selected} title={traceId} onClick={() => handleTracingSelect(tracing.id)} className={`rounded-lg border px-3 py-2 text-left text-xs transition ${selected ? 'border-sky-500 bg-sky-50' : 'border-zinc-300 bg-white hover:border-zinc-400'}`}>
+                <span className="block font-medium">Run {data.indexOf(tracing) + 1}</span>
+                <span className="text-zinc-500">{status ?? score}</span>
+              </button>;
+            })}
+          </div>}
           {loading && <StatusMessage message="Loading traces…" />}
           {!loading && error && <StatusMessage message={error} />}
           {!loading && !error && data.length === 0 && (
             <StatusMessage message="No traces available." />
           )}
           {!loading && !error && data.length > 0 && (
+            <details className="mb-4 rounded-lg border border-zinc-200 bg-white" open={data.length > 12 || toolMatrixOpen} onToggle={(event) => { const isOpen = event.currentTarget.open; setToolMatrixOpen(isOpen); if (isOpen) setToolMatrixEpoch((epoch) => epoch + 1); }}>
+              <summary className="flex cursor-pointer list-none items-center justify-between px-3 py-2 text-xs font-medium text-zinc-700">Tool usage and scores <span className="font-normal text-zinc-500">{data.length} runs</span></summary>
+              <div className="border-t border-zinc-200 p-2">
+            <div className="mb-2"><UpsetTopChartToggle mode={topChartMode} onChange={setTopChartMode} /></div>
             <div className="w-full overflow-x-auto">
               <div className="relative min-w-[720px] pt-4">
                   <div className="pointer-events-none absolute inset-x-0 top-63 z-10 grid w-full grid-cols-[minmax(0,1fr)_280px]">
@@ -1047,6 +1095,8 @@ export default function Home() {
                 <div ref={upsetRef} className="w-full" />
               </div>
             </div>
+              </div>
+            </details>
           )}
         </Card>
 
@@ -1072,7 +1122,7 @@ export default function Home() {
                             type="button"
                             aria-label={`Highlight run ${traceId}`}
                             aria-pressed={pinned}
-                            title="Hover to preview; click to pin"
+                            title={`Run ${traceId} · hover to preview; click to pin`}
                             className="inline-flex items-center rounded-full border bg-white px-2 py-0.5 font-mono text-[11px] leading-none text-zinc-700 shadow-sm transition hover:text-zinc-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-1"
                             style={{
                               background: active
@@ -1093,7 +1143,7 @@ export default function Home() {
                               )
                             }
                           >
-                            #{traceId}
+                            {`Run ${selectedTracings.indexOf(tracing) + 1}`}{((tracing.trainingOutcome as { status?: unknown } | undefined)?.status === 'success' || (tracing.trainingOutcome as { status?: unknown } | undefined)?.status === 'failure') ? ` · ${(tracing.trainingOutcome as { status: string }).status === 'success' ? 'Successful' : 'Failed'}` : ''}
                           </button>
                         </span>
                       );
@@ -1103,7 +1153,7 @@ export default function Home() {
                 )
               : selectedTracing
                 ? `Run #${selectedTracing.id}`
-                : "Select runs from the plot."
+                : "Choose runs above to compare their workflows."
           }
           actions={selectedTracings.length > 0 ? (
             <div className="flex flex-wrap items-center justify-end gap-1.5">
@@ -1155,6 +1205,7 @@ export default function Home() {
             joinedGraphState.status === "ready" &&
             joinedGraphState.key === selectedJoinKey ? (
               <SemanticGraphView
+                publication={figureScale > 1}
                 graph={joinedGraphState.graph}
                 traces={selectedTracings}
                 traceDags={selectedTraceDags}

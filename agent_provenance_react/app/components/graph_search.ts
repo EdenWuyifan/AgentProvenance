@@ -3,23 +3,33 @@ import type { JoinedProvenanceGraph, JoinedProvenanceNode, JoinedProvenanceEdge 
 export type GraphFilters = {
   text: string;
   role: 'all' | 'key' | 'supporting' | 'unknown';
-  evidence: 'all' | 'direct' | 'path' | 'failure';
+  evidence: 'all' | 'direct' | 'supported' | 'main' | 'path' | 'failure';
   minSupport: number;
   minOutcome: number;
   links: 'all' | 'recorded' | 'inferred';
   view: 'highlight' | 'isolate';
-  context: 'none' | 'workflow';
+  context: 'none' | 'parents' | 'inputs' | 'neighbors' | 'workflow';
 };
 
 export const DEFAULT_GRAPH_FILTERS: GraphFilters = {
   text: '', role: 'all', evidence: 'all', minSupport: 0, minOutcome: 0, links: 'all', view: 'highlight', context: 'none',
 };
 
+export const GRAPH_VIEW_PRESETS = {
+  all: { ...DEFAULT_GRAPH_FILTERS },
+  main: { ...DEFAULT_GRAPH_FILTERS, evidence: 'main', context: 'parents', view: 'isolate' },
+  shared: { ...DEFAULT_GRAPH_FILTERS, minSupport: 2, context: 'inputs', view: 'isolate' },
+  failures: { ...DEFAULT_GRAPH_FILTERS, evidence: 'failure', context: 'inputs', view: 'isolate' },
+} satisfies Record<string, GraphFilters>;
+
 const words = (text: string) => text.toLocaleLowerCase().split(/\s+/).filter(Boolean);
 const claimText = (node: JoinedProvenanceNode) => node.instances.flatMap((instance) => instance.resultEvidence?.map((evidence) => evidence.claimText) ?? []).join(' ');
 const isFailure = (node: JoinedProvenanceNode) => node.operationGroups.some((operation) => operation.failure);
 const hasDirectEvidence = (node: JoinedProvenanceNode) => ['supported', 'contradicted', 'referenced'].includes(node.importance.result.status) || node.instances.some((instance) => instance.resultTargets.length > 0);
 const hasPathEvidence = (node: JoinedProvenanceNode) => node.resultBackbone || node.importance.result.onRecordedPath || node.instances.some((instance) => instance.resultBackbone);
+const supportsConclusion = (node: JoinedProvenanceNode, outcomes: Set<string>) => node.instances.some((instance) =>
+  instance.resultEvidence?.some((link) => link.relation === 'supports') ||
+  [...instance.calls.map((call) => call.id), ...instance.internalCalls].some((id) => outcomes.has(`${instance.run}\0${id}`)));
 
 /** Importance changes prominence, never whether an activity exists in the overview. */
 export function workflowOverview(graph: JoinedProvenanceGraph) {
@@ -33,29 +43,31 @@ export function workflowOverview(graph: JoinedProvenanceGraph) {
 }
 
 /** Follow reviewed witnesses within one execution, retaining occurrence ports. */
-export function resultFlowNodes(graph: JoinedProvenanceGraph, run: string, eventId: string) {
-  const target = graph.nodes.find((node) => node.instances.some((instance) => instance.run === run
-    && instance.calls.some((call) => call.id === eventId)));
+export function resultFlowSelection(graph: JoinedProvenanceGraph, run: string, eventId: string) {
+  const containsEvent = (instance: JoinedProvenanceNode['instances'][number]) => instance.run === run
+    && (instance.calls.some((call) => call.id === eventId) || instance.internalCalls.includes(eventId));
+  const target = graph.nodes.find((node) => node.instances.some(containsEvent));
   const nodes = new Set<string>();
-  if (!target) return nodes;
+  const edges = new Set<string>();
+  if (!target) return { nodes, edges };
   nodes.add(target.id);
-  const queue = target.instances.filter((instance) => instance.run === run
-    && instance.calls.some((call) => call.id === eventId)).map((instance) => instance.id);
+  const queue = target.instances.filter(containsEvent).map((instance) => instance.id);
   const visited = new Set(queue);
-  const incoming = new Map<string, Array<{ source: string; instance: string }>>();
+  const incoming = new Map<string, Array<{ source: string; instance: string; edge: string }>>();
   graph.edges.forEach((edge) => edge.witnesses.forEach((witness) => {
     if (witness.run !== run || !witness.highlighted) return;
     const parents = incoming.get(witness.targetInstance) ?? [];
-    parents.push({ source: edge.source, instance: witness.sourceInstance });
+    parents.push({ source: edge.source, instance: witness.sourceInstance, edge: edge.id });
     incoming.set(witness.targetInstance, parents);
   }));
   for (let index = 0; index < queue.length; index++) {
     for (const parent of incoming.get(queue[index]) ?? []) {
       nodes.add(parent.source);
+      edges.add(parent.edge);
       if (!visited.has(parent.instance)) { visited.add(parent.instance); queue.push(parent.instance); }
     }
   }
-  return nodes;
+  return { nodes, edges };
 }
 
 function nodeSearchText(node: JoinedProvenanceNode) {
@@ -67,12 +79,17 @@ function nodeSearchText(node: JoinedProvenanceNode) {
 
 export function matchFamilies(graph: JoinedProvenanceGraph, filters: GraphFilters): Set<string> {
   const terms = words(filters.text);
+  const outcomes = new Set(workflowOverview(graph).results.map((result) => `${result.run}\0${result.eventId}`));
+  // Seed result-path endpoints per occurrence, so long reviewed paths do not become hundreds of focus matches.
+  const pathStates = new Set(graph.nodes.flatMap((node) => node.instances.filter((instance) => instance.resultBackbone).map((instance) => `${instance.run}\0${instance.id}`)));
+  const continued = new Set(graph.edges.flatMap((edge) => edge.witnesses.filter((witness) => pathStates.has(`${witness.run}\0${witness.sourceInstance}`) && pathStates.has(`${witness.run}\0${witness.targetInstance}`)).map((witness) => `${witness.run}\0${witness.sourceInstance}`)));
+  const resultEndpoints = new Set(graph.nodes.filter((node) => node.instances.some((instance) => instance.resultBackbone && !continued.has(`${instance.run}\0${instance.id}`))).map((node) => node.id));
   const searchText = new Map(graph.nodes.map((node) => [node.id, nodeSearchText(node)]));
   return new Set(graph.nodes.filter((node) =>
     (!terms.length || terms.every((term) => searchText.get(node.id)!.includes(term))) &&
     (filters.role === 'all' || (node.assessment?.level ?? node.attention) === filters.role) && node.supportCount >= filters.minSupport &&
     (filters.minOutcome <= 0 || [...node.importance.outcome.globalTools, ...(node.importance.outcome.patterns ?? [])].some((tool) => typeof tool.importance === 'number' && tool.importance >= filters.minOutcome)) &&
-    (filters.evidence === 'all' || (filters.evidence === 'direct' ? hasDirectEvidence(node) : filters.evidence === 'path' ? hasPathEvidence(node) : isFailure(node)))
+    (filters.evidence === 'all' || (filters.evidence === 'direct' ? hasDirectEvidence(node) : filters.evidence === 'supported' ? supportsConclusion(node, outcomes) : filters.evidence === 'main' ? supportsConclusion(node, outcomes) || resultEndpoints.has(node.id) : filters.evidence === 'path' ? hasPathEvidence(node) : isFailure(node)))
   ).map((node) => node.id));
 }
 
@@ -86,7 +103,7 @@ export function focusSelection(
   matches: Set<string>,
   edgeMatches: Set<string>,
   filters: GraphFilters,
-): { nodes: Set<string>; edges: Set<string> } {
+): { nodes: Set<string>; edges: Set<string>; boundaryEdges: Set<string> } {
   const nodeIds = new Set(graph.nodes.map((node) => node.id));
   const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
   const edgeById = new Map(graph.edges.map((edge) => [edge.id, edge]));
@@ -101,6 +118,7 @@ export function focusSelection(
     if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) return false;
     const witnesses = validWitnesses(edge);
     if (!witnesses.length) return false;
+    if (new Set(witnesses.map((witness) => witness.run)).size < filters.minSupport) return false;
     witnessByEdge.set(edge.id, witnesses);
     return true;
   });
@@ -111,7 +129,7 @@ export function focusSelection(
     selectedNodes.add(edge.source);
     selectedNodes.add(edge.target);
   });
-  edges.filter((edge) => matches.has(edge.source) && matches.has(edge.target)).forEach((edge) => selectedEdges.add(edge.id));
+  if (!edgeMatches.size) edges.filter((edge) => matches.has(edge.source) && matches.has(edge.target)).forEach((edge) => selectedEdges.add(edge.id));
   const stateKey = (state: { run: string; instanceId: string }) => `${state.run}\0${state.instanceId}`;
   const seeds = [...matches].flatMap((nodeId) => nodeById.get(nodeId)?.instances.map((instance) => ({
     run: instance.run, instanceId: instance.id,
@@ -123,7 +141,8 @@ export function focusSelection(
     });
   });
   const uniqueSeeds = [...new Map(seeds.map((state) => [stateKey(state), state])).values()];
-  if (filters.context === 'workflow' && uniqueSeeds.length) {
+  const visibleStates = new Set(uniqueSeeds.map(stateKey));
+  if (filters.context !== 'none' && uniqueSeeds.length) {
     const incoming = new Map<string, Array<{ edge: JoinedProvenanceEdge; witness: JoinedProvenanceEdge['witnesses'][number] }>>();
     const outgoing = new Map<string, Array<{ edge: JoinedProvenanceEdge; witness: JoinedProvenanceEdge['witnesses'][number] }>>();
     edges.forEach((edge) => witnessByEdge.get(edge.id)!.forEach((witness) => {
@@ -139,7 +158,7 @@ export function focusSelection(
     const traverse = (direction: 'upstream' | 'downstream') => {
       const visited = new Set(uniqueSeeds.map(stateKey));
       const queue = [...uniqueSeeds];
-      for (let cursor = 0; cursor < queue.length; cursor++) {
+      for (let cursor = 0; cursor < queue.length && (!['parents', 'neighbors'].includes(filters.context) || cursor < uniqueSeeds.length); cursor++) {
         const current = queue[cursor];
         const adjacent = (direction === 'upstream' ? incoming : outgoing).get(stateKey(current)) ?? [];
         adjacent.forEach(({ edge, witness }) => {
@@ -149,14 +168,16 @@ export function focusSelection(
           selectedNodes.add(nodeId);
           const next = { run: witness.run, instanceId };
           const key = stateKey(next);
+          visibleStates.add(key);
           if (!visited.has(key)) { visited.add(key); queue.push(next); }
         });
       }
     };
     traverse('upstream');
-    traverse('downstream');
+    if (filters.context !== 'inputs' && filters.context !== 'parents') traverse('downstream');
   }
-  return { nodes: selectedNodes, edges: new Set(edges.filter((edge) => selectedEdges.has(edge.id) && selectedNodes.has(edge.source) && selectedNodes.has(edge.target)).map((edge) => edge.id)) };
+  const boundaryEdges = new Set(edges.filter((edge) => !selectedEdges.has(edge.id) && witnessByEdge.get(edge.id)!.some((witness) => visibleStates.has(stateKey({run: witness.run, instanceId: witness.targetInstance})))).map((edge) => edge.id));
+  return { nodes: selectedNodes, boundaryEdges, edges: new Set(edges.filter((edge) => selectedEdges.has(edge.id) && selectedNodes.has(edge.source) && selectedNodes.has(edge.target)).map((edge) => edge.id)) };
 }
 
 type FocusNode = {

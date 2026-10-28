@@ -8,6 +8,8 @@ import sqlite3
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from agent_provenance.workflow_window import prune_after_result
+
 SCHEMA = "workflow-events-v1"
 DIMENSIONS = ("electrophile", "nucleophile", "base", "ligand", "solvent")
 CANDIDATE_FIELDS = tuple(f"{name}_idx" for name in DIMENSIONS)
@@ -337,10 +339,12 @@ def import_record(data, source_name="<memory>", cache_index=None):
     warnings = ["All yields are offline dataset replay outcomes.", "Cache row counts do not identify executed model request counts.",
                 "Proposal joins represent only verified selected LLM contexts; other selection methods have unknown proposal context.",
                 "Cache observation counts describe local prompt context and may differ from workflow round; joins use verified local and peer evidence."]
-    return {"id": run, "eventSchemaVersion": SCHEMA, "participants": participants, "events": events, "eventLinks": links,
+    trace = {"id": run, "eventSchemaVersion": SCHEMA, "participants": participants, "events": events, "eventLinks": links,
             "outcomes": outcomes, "score": score, "scoreMetric": "best_yield_auc_20", "task_id": f"suzuki_edbo:{data['heterogeneity']}",
             "config": _decode_config(cfg), "final_yield": data["final_system_best"],
             "rounds_to_100": next((r + 1 for r, value in enumerate(system_best) if value >= 100), None), "seed": data["seed"],
+            "rounds_to_best": best_round + 1,
+            "best_reached_during_warmup": best_round < cfg["warmup_rounds"],
             "importMetadata": {"sourceFile": source_name, "experimentCount": len(steps), "deliveryCount": len(tokens),
                                "scoreWindowEnd": score_end, "featureWindowEnd": min(9, score_end - 1), "cacheMatchCounts": dict(matches),
                                "cacheRecordCounts": cache_index.record_counts if cache_index else {},
@@ -351,6 +355,7 @@ def import_record(data, source_name="<memory>", cache_index=None):
                                "cacheObservationCounterOffsets": dict(context_offsets),
                                "cacheJoinIdentity": "contextual evidence; cache has no run foreign key",
                                "encodeEnrichment": "attempted" if cache_index else "not_attempted", "warnings": warnings}}
+    return prune_after_result(trace, _id(run, best_round, best_agent, "experiment"))
 
 
 def import_run(path, cache=None, _cache_index=None):

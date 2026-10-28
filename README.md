@@ -1,238 +1,60 @@
-# AgentProvenance
+# AgentTrails
 
-A Python tool to convert agent traces into interactive UpSet plots and React-style provenance dashboards for Jupyter and standalone HTML.
+Visual analytics for comparing tool-using agent runs. AgentTrails reconstructs provenance, joins repeated operations across runs, and lets users inspect and filter compact patterns while retaining their source evidence.
 
-## Features
+## Run locally
 
-- **Parse Agent Traces**: Load JSON, JSONL, or in-memory trace payloads
-- **Interactive UpSet Plots**: Generate D3-based overlap views for tool usage
-- **Trace Dashboard**: Explore the React-side provenance matrix in a standalone HTML shell
-- **Jupyter Integration**: Display plots directly in Jupyter Notebooks
-- **Export to HTML**: Save visualizations as standalone HTML files
-- **Flexible Input Formats**: Support for various trace data formats
+Use Python 3.10+ and Node.js 22.18+.
 
-## Installation
-
-```bash
-pip install agent_provenance
-```
-
-For Jupyter Notebook support:
-
-```bash
-pip install agent_provenance[jupyter]
-```
-
-For development:
-
-```bash
-pip install agent_provenance[dev]
-```
-
-## Quick Start
-
-### Basic Usage
-
-```python
-from agent_provenance import AgentProvenance
-
-# Load traces from a JSON file
-provenance = AgentProvenance("traces.json")
-
-# Display the default provenance dashboard in Jupyter
-provenance.show()
-```
-
-## React App And Backend
-
-The React UI is in `agent_provenance_react`. The Python API backend is in
-`agent_provenance_backend`.
-
-The browser app stays focused on input and visualization. The backend owns PROV
-graph building, token-overlap candidate edges, graph caching, and LLM calls for
-both PROV refinement and the chat panel.
-
-The PROV graph is intentionally compact:
-
-- Activity nodes hold call identity, tool name, time index, and sanitized args.
-- Entity nodes hold the sanitized output response.
-- Responses are not duplicated on Activity nodes.
-- Entity metadata such as names and paths stays inside the response, not as
-  top-level `label`, `keys`, `name`, or `path` fields.
-- Dependency candidates are edges with explicit evidence, such as shared
-  artifacts or shared tokens. Adjacent calls are not connected by default.
-- The refinement LLM receives only the sanitized draft graph and returns graph
-  edits; raw calls and separate suggested-edge lists are not passed to it.
-
-### Backend Setup
-
-```bash
-cd agent_provenance_backend
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-The backend reads `agent_provenance_react/.env` if present. Configure the LLM
-there or in your shell:
-
-```bash
-PORTKEY_API_KEY=...
-PORTKEY_BASE_URL=https://your-portkey-server/v1/
-PORTKEY_MODEL=gpt-5-mini
-```
-
-### Frontend Setup
-
-```bash
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -e . -r agent_provenance_backend/requirements.txt
 cd agent_provenance_react
-npm install
+npm ci
+cd ..
+PYTHON="$PWD/.venv/bin/python" ./run_agent_provenance_system.sh
 ```
 
-### Run Together
+Open http://localhost:3000. No runs are selected automatically. **Open traces** accepts JSON/JSONL files. The three dropdown examples use local datasets:
 
-```bash
-./run_agent_provenance_system.sh
+| Example | Local file under `agent_provenance_react/public/` |
+| --- | --- |
+| Discovera | `tracings.jsonl` (full collection) |
+| App world (Use Case 2) | `appworld-bill-cached.jsonl`, `appworld-movie-cached.jsonl` |
+| Suzuki | `cached-suzuki-review.jsonl` |
+
+These datasets and paid caches stay local and are excluded from Git. Files containing `snapshotRef` require the corresponding content-addressed records under `agent_provenance_react/.cache/pattern-framework/analyses/`. Keep JSONL files and their cache together. A missing snapshot is reported rather than silently reconstructed. Opening the full Discovera collection does not imply that every run already has a semantic review.
+
+Uncached analysis and Copilot use the signed-in Codex CLI, defaulting to `gpt-6-luna`. The CLI must be on `PATH`; override it with `AGENTTRAILS_CODEX` and the model with `AGENTTRAILS_MODEL`. Cached replay and ordinary graph interactions require no new model calls. Model requests use the user's configured hosted service; they are not local model inference.
+
+## Workflow and interface
+
+1. Normalize calls into activities and output entities, retaining original parameters, responses and order.
+2. Recover recorded references; retrieve earlier evidence and review semantic candidates with cited source and consumer evidence. Recorded transport and inferred relevance stay distinct.
+3. Assess semantic significance, support for the final result and association with run outcomes. Outcome association is observational.
+4. Join compatible operations across runs. Expand display groups in place to inspect Activity–Entity records and original witnesses. Selection preserves complete witnessed multi-input patterns for downstream use.
+
+All traces, including user imports, use the same graph controls and importance heatmap. Search, Main flow and Shared flow reduce the displayed context. Click a node or connection to follow its neighborhood. **Fit all** frames the overview; **100%** restores readable detail. Run labels default to recorded outcomes or numeric scores. User-defined score rules affect display only. Tool errors remain separate from whole-run outcomes.
+
+## Repository
+
+- `agent_provenance/`: trace parsing, Python dashboard and import utilities.
+- `agent_provenance_backend/`: generic provenance, retrieval, importance, pattern selection and API.
+- `agent_provenance_react/`: interface and synthetic frontend tests.
+- `tests/`: focused, network-free Python regression tests.
+
+Local scientific archives, paper outputs, worlds, response caches and persistent state are deliberately outside version control. They are not deleted by source cleanup. There is no separate core export.
+
+## Verify
+
+```sh
+.venv/bin/python -B -m pytest -p no:cacheprovider tests -q
+cd agent_provenance_react
+npm test
+npx tsc --noEmit
+npm run build
 ```
 
-This starts:
+Tests use synthetic records and mocked inference, without paid requests. They cover temporal and multi-input dependencies, witness preservation, importance, selection, replay, protocol handling and display grouping. They do not establish inferred-edge accuracy or usability.
 
-- backend: `http://127.0.0.1:8008`
-- frontend: `http://127.0.0.1:3000`
-
-Optional ports:
-
-```bash
-PROVENANCE_BACKEND_PORT=8008 PROVENANCE_FRONTEND_PORT=3000 ./run_agent_provenance_system.sh
-```
-
-This script intentionally mirrors the future Docker Compose split: one backend
-service and one frontend service, connected by `PROVENANCE_BACKEND_URL`.
-
-### Docker Demo
-
-Build and run the combined frontend/backend image from the repository root:
-
-```bash
-docker build -t agent-provenance:demo .
-docker run --rm -p 3000:3000 \
-  -e PORTKEY_API_KEY \
-  -e PORTKEY_BASE_URL \
-  -e PORTKEY_MODEL \
-  agent-provenance:demo
-```
-
-### Working with Trace Data
-
-```python
-from agent_provenance import AgentProvenance
-
-# Create traces programmatically
-traces = [
-    {
-        "id": "trace_1",
-        "tool_calls": [
-            {"name": "search"},
-            {"name": "read_file"},
-            {"name": "write_file"}
-        ]
-    },
-    {
-        "id": "trace_2", 
-        "tool_calls": [
-            {"name": "search"},
-            {"name": "read_file"}
-        ]
-    },
-    {
-        "id": "trace_3",
-        "tool_calls": [
-            {"name": "execute_code"}
-        ]
-    }
-]
-
-# Initialize provenance with traces
-provenance = AgentProvenance(traces)
-
-# Get summary statistics
-print(provenance.summary())
-# Output: {'total_traces': 3, 'unique_tools': 4, 'tools': [...], ...}
-
-# Access the tools found
-print(provenance.tools)
-# Output: ['execute_code', 'read_file', 'search', 'write_file']
-```
-
-### Method Chaining
-
-```python
-from agent_provenance import AgentProvenance
-
-provenance = (
-    AgentProvenance()
-    .load("initial_traces.json")
-    .add_trace({"id": "new", "tool_calls": [{"name": "new_tool"}]})
-)
-provenance.show()
-```
-
-### Customizing the Dashboard
-
-```python
-provenance.show(
-    width=1000,
-    height=600,
-    title="Custom Trace Explorer",
-    subtitle="Tool provenance across runs"
-)
-```
-
-## Supported Trace Formats
-
-AgentProvenance supports multiple common formats for tool call data:
-
-```python
-# Format 1: Using 'tool_calls' with 'name'
-{"tool_calls": [{"name": "search"}, {"name": "read"}]}
-
-# Format 2: Using 'toolCalls' with 'toolName'
-{"toolCalls": [{"toolName": "search"}]}
-
-# Format 3: Using 'calls' with 'function'
-{"calls": [{"function": "search"}]}
-
-# Format 4: Using 'steps'
-{"steps": [{"name": "search"}, {"name": "read"}]}
-
-# Format 5: Simple string arrays
-{"tool_calls": ["search", "read"]}
-
-# Format 6: LangSmith-style traces with outputs.messages
-{"outputs": {"messages": [{"tool_calls": [{"id": "call-1", "name": "search"}]}]}}
-```
-
-## API Reference
-
-### AgentProvenance
-
-Main class for loading traces and generating visualizations.
-
-#### Methods
-
-- `load(data)` - Load traces from file, JSON string, or list
-- `add_trace(trace)` - Add a single trace
-- `add_traces(traces)` - Add multiple traces
-- `show(**kwargs)` - Display the provenance dashboard in Jupyter Notebook
-- `summary()` - Get summary statistics
-
-#### Properties
-
-- `traces` - List of loaded traces
-- `tools` - List of unique tools
-- `num_traces` - Total number of traces
-- `upset_data` - Computed UpSet plot data
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details
+Graph exploration adapts [motif simplification](https://doi.org/10.1145/2470654.2466444), [Search, Show Context, Expand on Demand](https://doi.org/10.1109/TVCG.2009.108), and findings on [path readability](https://doi.org/10.1057/palgrave.ivs.9500013). See [frontend controls](agent_provenance_react/README.md) and [backend API](agent_provenance_backend/README.md).

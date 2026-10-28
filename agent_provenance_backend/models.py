@@ -7,7 +7,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-FRAMEWORK_VERSION = "pattern-abstraction-v6-event-assessments"
+FRAMEWORK_VERSION = "pattern-abstraction-v7-recorded-reference-order"
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = ROOT / "agent_provenance_react" / ".cache" / "pattern-framework"
 

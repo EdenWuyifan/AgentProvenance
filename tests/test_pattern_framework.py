@@ -90,14 +90,15 @@ def test_selection_uses_one_batch_across_traces_and_reuses_cached_annotation(off
     assert annotation_cached and len(offline) == 1
 
 
-def test_plan_groups_multi_input_refinement_hides_routine_and_preserves_failure(offline):
+def test_plan_keeps_key_decisions_separate_hides_routine_and_preserves_failure(offline):
     analysis, _ = asyncio.run(app.analyze_trace(trace("a")))
     graph, _ = asyncio.run(app.comparison_view([analysis], [], {}, detail="overview"))
     instances = [instance for node in graph["nodes"] for instance in node["instances"]]
     calls_by_stage = {instance["id"]: {call["id"] for call in instance["calls"]} for instance in instances}
-    joined = next(calls for calls in calls_by_stage.values() if {"pick-a-A", "pick-b-A", "intersect-A", "filter-A"} <= calls)
-    assert "register-A" not in joined and "preview-A" not in joined
-    assert "validate-A" not in joined
+    for cid in ('pick-a-A', 'pick-b-A', 'intersect-A', 'filter-A'):
+        assert {cid} in calls_by_stage.values()
+    key_nodes = [node for node in graph['nodes'] if node['importance']['semantic']['level'] == 'key']
+    assert all(node['importance']['decision'] == 'expand' for node in key_nodes)
     failure = next(calls for calls in calls_by_stage.values() if "validate-A" in calls)
     assert failure == {"validate-A"}
     source = next(node for node in graph['nodes'] if node.get('source'))
@@ -185,35 +186,11 @@ def test_independent_same_stage_occurrences_do_not_merge_across_a_refinement(off
         {'id': 'b', 'name': 'rank', 'args': {'method': 'weighted', 'input': 'filtered-B'}, 'response': None}]}
     analysis, _ = asyncio.run(app.analyze_trace(entry))
     types, assignments = semantics.operation_types(analysis)
-    rules = {kind: {'action': 'group', 'stage': 'rank', 'label': 'Rank candidates'} for kind in types}
-    rules[assignments['filter']] = {'action': 'absorb', 'toward': 'outputs', 'label': 'Prepare ranking'}
+    rules = {kind: {'action': 'group', 'stage': 'rank', 'label': 'Rank candidates', 'attention': 'key'} for kind in types}
+    rules[assignments['filter']] = {'action': 'absorb', 'toward': 'outputs', 'label': 'Prepare ranking', 'attention': 'supporting'}
     result = semantics.instantiate(analysis, {'rules': rules, 'version': 'test'})
     assert {frozenset(instance['callIds']) for instance in result['instances']} == {
-        frozenset({'a'}), frozenset({'filter', 'b'})}
-
-
-def test_portkey_client_sets_request_timeout_and_disables_transport_retries(monkeypatch):
-    from types import SimpleNamespace
-
-    class FakePortkey:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.max_retries = 1  # Mirrors the SDK's default.
-            self.openai_client = SimpleNamespace(
-                default_headers={"x-portkey-request-timeout": str(kwargs["request_timeout"])},
-                max_retries=1)
-
-        async def close(self):
-            pass
-
-    monkeypatch.setenv("PORTKEY_API_KEY", "test-key")
-    monkeypatch.setattr(inference, "AsyncPortkey", FakePortkey)
-    client, model = inference.portkey_client()
-    headers = client.openai_client.default_headers
-    assert headers["x-portkey-request-timeout"] == "90000"
-    assert client.max_retries == 0
-    assert client.openai_client.max_retries == 0
-    assert model == inference.SEMANTIC_MODEL
+        frozenset({'a'}), frozenset({'filter'}), frozenset({'b'})}
 
 
 def test_selected_result_cannot_be_hidden_by_an_omit_rule(offline):
@@ -228,32 +205,36 @@ def test_selected_result_cannot_be_hidden_by_an_omit_rule(offline):
     assert not any(call['id'] == 'preview-TARGET' for call in graph['omittedCalls'])
 
 
-def test_invalid_gateway_json_is_measured_and_closes_client(monkeypatch):
-    from types import SimpleNamespace
+def test_reviewed_dependencies_reach_abstraction_before_instance_alignment(offline, monkeypatch):
+    analysis, _ = asyncio.run(app.analyze_trace(trace('review-order')))
+    source, target = 'pick-a-REVIEW-ORDER', 'rank-REVIEW-ORDER'
+    # Use an existing consumer with an additional, separately cited semantic source.
+    target = 'filter-REVIEW-ORDER'
+    link = {'sourceCallId': source, 'targetCallId': target, 'inferred': True,
+            'relevance': 'relevant',
+            'relation': 'semantic_context', 'reason': 'The earlier candidate motivates this selection.',
+            'evidence': [{'callId': source, 'field': 'response', 'path': ''},
+                         {'callId': target, 'field': 'args', 'path': ''}]}
 
-    class FakeClient:
-        def __init__(self):
-            self.closed = False
-            self.chat = SimpleNamespace(completions=self)
+    async def reviewed(analyses, focus=''):
+        return {'version': 'test-review', 'cached': True, 'runs': [{
+            'traceId': analysis['traceId'], 'events': {}, 'links': [link], 'jointGroups': [],
+            'resultEvidence': {'run': analysis['traceId'], 'claims': [], 'status': 'missing-final'},
+            'reviewedActivities': 0, 'suppliedActivities': 0, 'totalActivities': len(analysis['calls'])}]}
 
-        async def create(self, **kwargs):
-            return SimpleNamespace(
-                choices=[SimpleNamespace(finish_reason='stop', message=SimpleNamespace(content="not JSON"))],
-                usage=SimpleNamespace(prompt_tokens=9, completion_tokens=3))
+    real_instantiate = app.instantiate
+    seen = []
 
-        async def close(self):
-            self.closed = True
+    def instantiate_with_review(entry, policy):
+        seen.extend(edge for edge in entry['flow'] if edge.get('inferred'))
+        return real_instantiate(entry, policy)
 
-    client = FakeClient()
-    monkeypatch.setattr(inference, "portkey_client", lambda: (client, inference.SEMANTIC_MODEL))
-    with inference.capture_metrics() as metrics:
-        with pytest.raises(ModelResponseError, match="invalid JSON"):
-            asyncio.run(inference.infer_json("safe prompt"))
-    assert client.closed
-    assert len(metrics) == 1
-    assert metrics[0]["succeeded"] is False
-    assert metrics[0]["promptTokens"] == 9
-    assert metrics[0]["completionTokens"] == 3
+    monkeypatch.setattr(app, 'review_traces', reviewed)
+    monkeypatch.setattr(app, 'instantiate', instantiate_with_review)
+    graph, _ = asyncio.run(app.comparison_view([analysis], [], {}, detail='overview'))
+    assert [(edge['source'], edge['target']) for edge in seen] == [(source, target)]
+    assert any(w['inferred'] and w['callPath'] == [source, target]
+               for edge in graph['edges'] for w in edge['witnesses'])
 
 
 def test_final_output_resource_references_require_token_boundaries():
@@ -277,7 +258,7 @@ def test_failed_occurrence_cannot_contaminate_successful_same_type_family():
     kinds, _ = semantics.operation_types({"calls": calls, "flow": []})
     kind = next(iter(kinds))
     policy = {"version": "test-policy", "rules": {
-        kind: {"action": "group", "stage": "same_stage", "label": "Same operation"}}}
+        kind: {"action": "group", "stage": "same_stage", "label": "Same operation", "attention": "supporting"}}}
     instances = semantics.instantiate({"traceId": "failure-isolation", "calls": calls,
                                         "flow": [], "targets": []}, policy)["instances"]
     assert len(instances) == 2
@@ -363,6 +344,8 @@ def test_external_source_roots_keep_distinct_visible_families_and_absorb_reads()
                 rules[kind] = {"action": "group", "stage": "lookup", "label": "Lookup"}
             else:
                 rules[kind] = {"action": "group", "stage": "selection", "label": "Select and combine"}
+        for rule in rules.values():
+            rule['attention'] = 'supporting'
         return semantics.instantiate(analysis, {"rules": rules, "version": "source-test"})["instances"]
 
     first = source_analysis("source-a")

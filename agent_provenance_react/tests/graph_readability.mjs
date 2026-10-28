@@ -1,0 +1,25 @@
+import assert from 'node:assert/strict';
+import { connectionPorts } from '../app/components/graph_ports.ts';
+import { layoutProvCluster } from '../app/components/prov_cluster.ts';
+import { DEFAULT_RUN_RESULT, runResult, summarizeRunResults, resultMetrics } from '../app/components/run_result.ts';
+const traces=[{id:'a',score:1,latency:4,trainingOutcome:{status:'failure'}},{id:'b',score:0.75,latency:2},{id:'c',score:null}];
+assert.equal(runResult(traces[0],DEFAULT_RUN_RESULT).kind,'failure','Explicit outcomes remain distinct from numeric scores');
+assert.equal(runResult(traces[1],DEFAULT_RUN_RESULT).kind,'score');
+assert.equal(runResult(traces[2],DEFAULT_RUN_RESULT).kind,'unknown');
+assert.equal(runResult(traces[0],{...DEFAULT_RUN_RESULT,mode:'score'}).kind,'score');
+assert.equal(runResult(traces[1],{...DEFAULT_RUN_RESULT,mode:'threshold',threshold:0.8}).kind,'failure');
+assert.equal(runResult(traces[1],{...DEFAULT_RUN_RESULT,mode:'threshold',metric:'latency',threshold:3,direction:'atMost'}).kind,'success');
+assert.equal(runResult(undefined,DEFAULT_RUN_RESULT).kind,'unknown');
+assert(resultMetrics(traces).includes('latency')&&!resultMetrics(traces).includes('id'));
+assert.equal(summarizeRunResults(['a','a'],traces,DEFAULT_RUN_RESULT).failure,1,'Supporting runs are counted once');
+const boxes=[{id:'a',x:0,y:0,width:196,height:76},...Array.from({length:5},(_,i)=>({id:'b'+i,x:350,y:i*114,width:40,height:40,circle:true}))];
+const edges=boxes.slice(1).map(box=>({id:box.id,source:'a',target:box.id}));
+const ports=connectionPorts(boxes,edges);
+assert.equal(new Set([...ports.values()].map(port=>port.source.y)).size,5,'Fan-out connections have distinct ports');
+for(const [id,port] of ports){const target=boxes.find(box=>box.id===id);assert(Math.abs(Math.hypot(port.target.x-(target.x+20),port.target.y-(target.y+20))-20)<1e-8);}
+const nodes=[{id:'input',kind:'Entity',label:'input',members:[]},{id:'activity',kind:'Activity',label:'act',members:[]},{id:'output',kind:'Entity',label:'output',members:[]}];
+const cluster={nodes,edges:[{source:'input',target:'activity',relation:'usedBy',inferred:false,members:[]},{source:'activity',target:'output',relation:'generatedBy',inferred:false,members:[]}],rawNodeCount:3,rawActivityCount:1,rawEntityCount:2};
+const saved=JSON.stringify(cluster),layout=layoutProvCluster(cluster);
+assert.equal(layout.paths.length,2);assert.equal(JSON.stringify(cluster),saved);
+assert(layout.paths.every(path=>path.source.x<path.target.x));
+console.log('Run outcome/score/rule separation, custom metrics, port separation and immutable inline geometry passed');

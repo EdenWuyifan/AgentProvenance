@@ -3,6 +3,7 @@ export interface Tracing {
   toolCalls: ToolCall[];
   score?: number | null;
   finalOutput?: string | null;
+  snapshotRef?: string;
   eventSchemaVersion?: string;
   participants?: WorkflowParticipant[];
   events?: ToolCall[];
@@ -123,6 +124,9 @@ export type ProvEdge = {
     kind: "recorded" | "reference" | "token" | "semantic";
     shared?: string[];
     score?: number;
+    relation?: string;
+    evidenceLevel?: string;
+    details?: unknown[];
   }>;
   inferred?: boolean;
   eventRelation?: string;
@@ -136,6 +140,8 @@ export type ProvGraph = {
 export type AgentDag = ProvGraph;
 
 export type JoinedProvenanceNode = {
+  displayOrigin?: string;
+  displayRecovered?: boolean;
   id: string;
   kind: "JoinedActivity";
   label: string;
@@ -147,6 +153,8 @@ export type JoinedProvenanceNode = {
   attention: "key" | "supporting";
   resultBackbone: boolean;
   executionContext?: { laneId: string; roundStart: number; roundEnd: number; phase?: string; eventOrder?: number };
+  evidenceReview?: Array<{ run: string; callId: string; status: string; level: 'key' | 'supporting' | 'unknown';
+    label: string; reason: string; evidence: Array<{ callId: string; field: string; path: string; quote: string }> }>;
   assessment?: {
     status: 'assessed' | 'unknown';
     level: 'key' | 'supporting' | 'unknown';
@@ -165,7 +173,7 @@ export type JoinedProvenanceNode = {
     support: number;
     tier: "key" | "result" | "failure" | "context";
     facets: Array<{ id: string; label: string }>;
-    semantic: { level: "key" | "supporting" };
+    semantic: { level: "key" | "supporting" | "unknown" };
     result: {
       status: "supported" | "contradicted" | "referenced" | "none" | "missing-final" | "no-candidates";
       supportedClaims: string[];
@@ -198,6 +206,7 @@ export type JoinedProvenanceNode = {
     id: string;
     run: string;
     calls: Array<{ id: string; tool: string; step: number }>;
+    internalCalls: string[];
     internalFlow: Array<{ source: string; target: string }>;
     resultTargets: string[];
     resultBackbone: boolean;
@@ -267,6 +276,11 @@ export type JoinedScoreSummary = {
 };
 
 export type JoinedProvenanceGraph = {
+  inputSources?: Array<{ run: string; activities: Array<{ callId: string; status: string; candidateCount: number; rejectedLinks?: number;
+    candidates: Array<{ sourceCallId: string; similarity: number; evidence: unknown[] }>;
+    sources: Array<{ sourceCallId: string | null; kind: 'initial_task' | 'inferred'; relation: 'input' | 'context'; reason: string;
+      evidence: Array<{ callId: string | null; field: string; path: string; quote: string }> }> }>;
+    metrics: { embeddingRequests: number; reviewRequests: number; consumers?: number; elapsedSeconds?: number } }>;
   nodes: JoinedProvenanceNode[];
   edges: JoinedProvenanceEdge[];
   omittedCalls: Array<{ run: string; id: string; tool: string; step: number }>;
@@ -277,11 +291,16 @@ export type JoinedProvenanceGraph = {
     lanes: Array<{ id: string; label: string; kind: 'agent' | 'role'; participantIds: string[] }>;
     roundRange: [number, number]; roundLabel: string; laneBy: 'agent' | 'role'; granularity?: 'activity';
   };
+  semanticReview?: {
+    version: string; cached: boolean;
+    runs: Array<{ run: string; reviewed: number; supplied: number; total: number }>;
+  };
   workflowAssessment?: {
     version: string; cached: boolean; coverage: Record<string, number>;
     retrieval?: Record<string, unknown>;
     runs?: Array<{ run: string; retrieval: { rounds: number; cachedRounds: number; assessedEvents: number; unassessedEvents: number;
-      stopReason: string; remainingFrontier: number } }>;
+      stopReason: string; remainingFrontier: number; totalEvents: number; retrievalUnits: number;
+      contextQueries: number; contextCandidates: number } }>;
     jointGroups: Array<{ id: string; run: string; label: string; reason: string;
       sourceCallIds: string[]; targetCallIds: string[];
       evidence: Array<{ callId: string; field: string; path: string; quote: string }> }>;
@@ -289,6 +308,8 @@ export type JoinedProvenanceGraph = {
   workflowAttribution?: { cohorts: Array<Record<string, unknown>> };
   workflowInsights?: WorkflowInsights;
   structuredOutcomes?: Array<{ run: string; outcomes: WorkflowOutcome[] }>;
+  resultWindows?: Array<{ run: string; anchorEventId: string; retainedThroughRound: number;
+    sourceThroughRound: number; sourceEventCount: number; retainedEventCount: number; removedEventCount: number }>;
   projection?: { candidateEdges: number; shownEdges: number; hiddenContextEdges?: number };
   warnings: string[];
   cohort: {
@@ -313,8 +334,10 @@ export type JoinedProvenanceGraph = {
     supportingPoints?: number;
     unknownPoints?: number;
   };
+  processingSeconds: number;
   modelMetrics: {
     requestCount: number;
+    embeddingRequestCount?: number;
     elapsedSeconds: number;
     promptTokens: number;
   };

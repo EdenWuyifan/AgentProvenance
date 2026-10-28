@@ -155,3 +155,31 @@ def test_encode_cache_join_uses_insight_and_observation_context(tmp_path):
     publication = next(e for e in trace["events"] if e["eventType"] == "information_publication" and e["agentId"] == "agent-0")
     assert publication["args"]["encodeMatchStatus"] == "contextual_unique"
     assert publication["source"]["experimentPointer"] == "/steps/0"
+
+
+def test_import_prunes_at_first_maximum_preserving_original_score_and_pointers(tmp_path):
+    source = tmp_path / 'plateau.json'
+    data = make_run(source, agents=2, rounds=6)
+    data['steps'][2]['y_raw'] = data['steps'][2]['y_internal'] = 100
+    for step in data['steps']:
+        step['best_so_far_raw'] = max(s['y_raw'] for s in data['steps']
+                                        if s['agent'] == step['agent'] and s['round'] <= step['round'])
+    data['system_best'] = [max(step['best_so_far_raw'] for step in data['steps'] if step['round'] == r) for r in range(6)]
+    data['final_system_best'] = 100
+    source.write_text(json.dumps(data))
+    original = source.read_bytes()
+    trace = import_run(source)
+    assert source.read_bytes() == original
+    assert {event['round'] for event in trace['events']} == {0, 1}
+    assert len(trace['events']) == 2 * 2 * (2 + 1)
+    ids = {event['id'] for event in trace['events']}
+    assert all(link['source'] in ids and link['target'] in ids for link in trace['eventLinks'])
+    assert all(outcome['eventId'] in ids for outcome in trace['outcomes'])
+    assert trace['score'] == sum(data['system_best']) / 6
+    assert trace['score'] != sum(data['system_best'][:2]) / 2
+    assert trace['rounds_to_best'] == 2
+    assert trace['best_reached_during_warmup'] is False
+    assert trace['config']['n_rounds'] == 6
+    experiment = next(event for event in trace['events'] if event['id'].endswith('r1:a0:experiment'))
+    assert experiment['source']['jsonPointer'] == '/steps/2'
+    assert trace['importMetadata']['pruning']['removedEventCount'] == 24

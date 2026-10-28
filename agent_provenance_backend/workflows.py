@@ -4,17 +4,17 @@ Adapters describe what happened. This module aligns individual activities withou
 guessing dependencies from adjacent rows, numeric identifiers, or tool names.
 """
 
-from collections import Counter, defaultdict, deque
-from urllib.parse import quote
+from collections import Counter, defaultdict
 
 from importance import numeric_score, score_summary
 from models import digest
 from workflow_attribution import fit_workflow_attribution
 from workflow_insights import build_workflow_insights
 from abstraction import _entity_ports, _recorded_failure
+from provenance import assert_acyclic
+from evidence_context import result_path, is_transport
 
 VERSION = 'workflow-activities-v2'
-EVENT_FIELDS = ('eventType', 'agentId', 'role', 'round', 'phase', 'source', 'diagnostics', 'patterns')
 
 
 def has_workflow(entry):
@@ -48,27 +48,15 @@ def normalize_workflow(entry, calls):
     links = entry.get('eventLinks', [])
     if not isinstance(links, list):
         raise ValueError('eventLinks must be an array.')
-    links = list(links)
+    links = [{**link, 'relation': link.get('relation') or 'recorded'} for link in links]
     links.extend({'source': str(parent), 'target': call['id'], 'relation': 'recorded_parent', 'evidenceLevel': 'recorded'}
                  for call in calls for parent in call.get('parentCallIds', []))
-    outgoing, incoming = defaultdict(list), Counter({cid: 0 for cid in by_id})
     for link in links:
         if link.get('source') not in by_id or link.get('target') not in by_id:
             raise ValueError('Workflow links must reference existing event IDs.')
         if by_id[link['source']]['round'] > by_id[link['target']]['round']:
             raise ValueError('Workflow evidence cannot flow to an earlier round.')
-        outgoing[link['source']].append(link['target'])
-        incoming[link['target']] += 1
-    queue = deque(cid for cid, count in incoming.items() if count == 0)
-    visited = 0
-    while queue:
-        visited += 1
-        for target in outgoing[queue.popleft()]:
-            incoming[target] -= 1
-            if incoming[target] == 0:
-                queue.append(target)
-    if visited != len(calls):
-        raise ValueError('Workflow event links must be acyclic.')
+    assert_acyclic(by_id, links)
     outcomes = entry.get('outcomes', [])
     if any(outcome.get('eventId') not in by_id or not numeric_score(outcome.get('value')) for outcome in outcomes):
         raise ValueError('Structured outcomes need a finite value and an existing eventId.')
@@ -79,37 +67,12 @@ def normalize_workflow(entry, calls):
         for call in calls:
             if call['round'] <= feature_end:
                 features.update(call.get('patterns', []))
+    if 'sourcePatternFeatures' in metadata:
+        features = Counter(metadata['sourcePatternFeatures'])
     return {'participants': list(participants.values()), 'eventLinks': links, 'outcomes': outcomes, 'roundLabel': round_label,
             'patternFeatures': dict(features), 'featureWindowEnd': feature_end, 'scoreWindowEnd': score_end,
             'importMetadata': metadata,
             'roundCount': max((call['round'] for call in calls), default=0) + 1}
-
-
-def event_graph(calls, workflow):
-    namespace = quote(str(calls[0]['traceId']), safe='') if calls else 'empty'
-    nodes, edges, ids = [], [], {}
-    for call in calls:
-        identifier = quote(call['id'], safe='')
-        activity, entity = f'act:{namespace}:{identifier}', f'ent:{namespace}:{identifier}'
-        ids[call['id']] = (activity, entity)
-        context = {key: call[key] for key in EVENT_FIELDS if key in call}
-        nodes.extend([
-            {'id': activity, 'kind': 'Activity', 'toolCallId': call['id'], 'tool': call['tool'],
-             'args': call.get('args'), 'status': call.get('status'), 'timeIndex': call['timeIndex'],
-             'traceId': call['traceId'], **context},
-            {'id': entity, 'kind': 'Entity', 'entityType': call['eventType'],
-             'response': call.get('response'), 'traceId': call['traceId'], 'source': call.get('source')},
-        ])
-        edges.append({'source': activity, 'target': entity, 'relation': 'generatedBy',
-                      'inferred': False, 'evidence': [{'kind': 'recorded', 'source': call.get('source')}]})
-    for link in workflow['eventLinks']:
-        edges.append({'source': ids[link['source']][1], 'target': ids[link['target']][0],
-                      'relation': 'usedBy', 'eventRelation': link['relation'],
-                      'inferred': bool(link.get('inferred')), 'evidenceLevel': link.get('evidenceLevel'),
-                      'evidence': [{'kind': 'semantic' if link.get('inferred') else 'recorded',
-                                    'relation': link['relation'], 'evidenceLevel': link.get('evidenceLevel'),
-                                    'details': link.get('evidence', [])}]})
-    return {'nodes': nodes, 'edges': edges}
 
 
 def _outcome_importance(members, models, analyses):
@@ -259,20 +222,7 @@ def build_workflow_view(analyses, references=(), cohort=None, focus='', detail='
         for claim in a.get('resultEvidence', {}).get('claims', []):
             for link in claim['links']:
                 claims_by_event[run, link['callId']].append({**link, 'claimId': claim['id'], 'claimText': claim['text']})
-        incoming = defaultdict(list)
-        for link in workflow['eventLinks']:
-            if not link.get('inferred'):
-                incoming[link['target']].append(link['source'])
-        main_outcomes = [o for o in workflow['outcomes'] if o.get('scope') != 'participant']
-        final_outcomes = [o for o in main_outcomes if o.get('kind') == 'final' or o.get('terminal')]
-        ancestors = ({o['eventId'] for o in final_outcomes or main_outcomes}
-                     | set(a.get('targetCallIds', [])) | set(a.get('resultAnchors', [])))
-        queue = deque(ancestors)
-        while queue:
-            for source in incoming[queue.popleft()]:
-                if source not in ancestors:
-                    ancestors.add(source)
-                    queue.append(source)
+        _, ancestors = result_path(a)
         ancestors_by_run[run] = ancestors
         participants = {p['id']: p for p in workflow['participants']}
         occurrence = Counter()
@@ -361,7 +311,7 @@ def build_workflow_view(analyses, references=(), cohort=None, focus='', detail='
                           'tier': 'failure' if failures else 'result' if result_ids else 'key' if key else 'context',
                           'reasons': [chosen['reason']], 'support': len(support),
                           'facets': [{'id': 'key-event', 'label': 'Key event'}] if key else [],
-                          'semantic': {'level': 'key' if key else 'supporting'},
+                          'semantic': {'level': level},
                           'result': {'status': 'contradicted' if text_contradicted else 'supported' if text_supported else 'referenced' if result_ids or explicit_targets else 'none',
                                      'supportedClaims': sorted(result_ids | text_supported), 'contradictedClaims': sorted(text_contradicted),
                                      'onRecordedPath': backbone}, 'outcome': _outcome_importance(members, models, analyses)}})
@@ -376,7 +326,7 @@ def build_workflow_view(analyses, references=(), cohort=None, focus='', detail='
             group_ids = joint_links[key]
             source_key = assessments_by_event[run, link['source']]['level'] == 'key'
             target_key = assessments_by_event[run, link['target']]['level'] == 'key'
-            handoff = link['relation'] in {'publishes', 'delivered_to', 'recorded_parent'}
+            handoff = is_transport(link)
             relevant = (bool(group_ids) or decision.get('relevance') == 'relevant'
                         or handoff and source_key and target_key or link['relation'] == 'delivered_to' and target_key)
             # Delivery and publication retain their literal endpoints. Relevance
@@ -385,6 +335,7 @@ def build_workflow_view(analyses, references=(), cohort=None, focus='', detail='
             edge_groups[source, target, link['relation']].append({
                 'run': run, 'sourceInstance': source_instance, 'targetInstance': target_instance,
                 'callPath': [link['source'], link['target']], 'inferred': bool(link.get('inferred')),
+                'transport': handoff,
                 'highlighted': relevant, 'overviewVisible': visible,
                 'relevance': decision.get('relevance', 'unknown'), 'jointGroupIds': group_ids, 'internalPath': [],
                 'reason': decision.get('reason') or 'Recorded relationship; exposure alone does not demonstrate causal influence.',
@@ -403,9 +354,9 @@ def build_workflow_view(analyses, references=(), cohort=None, focus='', detail='
     while changed:
         changed = False
         for edge in all_edges:
-            if edge['relation'] not in {'publishes', 'delivered_to', 'recorded_parent'}:
-                continue
             for witness in edge['witnesses']:
+                if not witness['transport']:
+                    continue
                 source = witness['run'], witness['sourceInstance']
                 if not witness['inferred'] and (witness['run'], witness['targetInstance']) in reviewed:
                     if not witness['highlighted']:
@@ -427,6 +378,8 @@ def build_workflow_view(analyses, references=(), cohort=None, focus='', detail='
             'workflow': {'lanes': [{**lane, 'participantIds': sorted(lane['participantIds'])} for lane in lanes.values()],
                          'roundRange': [0, round_count - 1], 'roundLabel': analyses[0]['workflow']['roundLabel'],
                          'laneBy': lane_by, 'granularity': 'activity'},
+            'resultWindows': [{'run': a['traceId'], **a['workflow']['importMetadata']['pruning']}
+                              for a in analyses if a['workflow'].get('importMetadata', {}).get('pruning')],
             'workflowAssessment': {'version': (workflow_assessments or {}).get('version'), 'coverage': dict(counts),
                                    'jointGroups': joint_groups, 'cached': (workflow_assessments or {}).get('cached', False),
                                    'runs': [{'run': item['traceId'], 'retrieval': item.get('retrievalMetrics', {})}

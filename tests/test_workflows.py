@@ -88,10 +88,10 @@ def local_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(app, 'CACHE_DIR', tmp_path / 'analyses')
     monkeypatch.setattr(workflow_store, 'WORKFLOW_DIR', tmp_path / 'corpora')
 
-    async def assess_without_network(analyses, focus=''):
-        return _assess_runs(analyses, {})
+    async def review_without_network(analyses, focus=''):
+        return _review_runs(analyses, {})
 
-    monkeypatch.setattr(app, 'assess_workflow', assess_without_network, raising=False)
+    monkeypatch.setattr(app, 'review_traces', review_without_network)
 
 
 def analyze(entry):
@@ -112,6 +112,45 @@ def test_generic_lanes_explicit_evidence_and_no_numeric_resource_guessing(local_
     assert len(graph['edges']) == len(analysis['workflow']['eventLinks'])
     assert not any(w['highlighted'] for edge in graph['edges'] for w in edge['witnesses'])
     assert source['assessment']['level'] == 'supporting'
+
+
+def test_standard_comparison_reviews_and_preserves_the_supplied_key_call(local_cache, monkeypatch):
+    analysis = {'traceId': 'plain-comparison', 'analysisKey': 'plain-comparison-source', 'calls': [
+        {'id': 'setup', 'tool': 'prepare', 'args': {}, 'response': 'ready'},
+        {'id': 'review-key', 'tool': 'evaluate', 'args': {'method': 'compare'}, 'response': 'best result'},
+    ], 'flow': [{'source': 'setup', 'target': 'review-key', 'inferred': False}],
+        'targetCallIds': ['review-key']}
+    review_inputs, displayed = [], []
+
+    async def annotate(_analyses, focus=''):
+        return {}, {'newTypes': 0}
+
+    async def review(analyses, focus=''):
+        review_inputs.extend(analyses)
+        return {'version': 'test-review', 'cached': False, 'runs': [{
+            'traceId': 'plain-comparison',
+            'events': {'review-key': {'level': 'key', 'status': 'assessed'}},
+            'links': [], 'jointGroups': [],
+            'resultEvidence': {'run': 'plain-comparison', 'status': 'available', 'claims': [{
+                'id': 'c0', 'links': [{'callId': 'review-key', 'relation': 'supports'}]}]},
+            'reviewedActivities': 1, 'suppliedActivities': 2, 'totalActivities': 2}]}
+
+    def build(selected, *_args, **_kwargs):
+        displayed.extend(selected)
+        return {'nodes': [], 'edges': []}
+
+    monkeypatch.setattr(app, 'annotate_types', annotate)
+    monkeypatch.setattr(app, 'instantiate', lambda source, _policy: source)
+    monkeypatch.setattr(app, 'review_traces', review)
+    monkeypatch.setattr(app, 'build_views', build)
+
+    graph, _ = asyncio.run(app.comparison_view([analysis], [], {}, detail='overview'))
+
+    assert review_inputs[0]['targetCallIds'] == ['review-key']
+    assert displayed[0]['resultAnchors'] == ['review-key']
+    assert displayed[0]['evidenceReview']['events']['review-key']['level'] == 'key'
+    assert graph['semanticReview']['runs'][0] == {'run': 'plain-comparison', 'reviewed': 1,
+                                                   'supplied': 2, 'total': 2, 'dependencySearch': None}
 
 
 def test_support_counts_runs_and_role_grouping_is_generic(local_cache):
@@ -160,7 +199,7 @@ def _node_for_call(graph, call_id):
                 if any(call['id'] == call_id for instance in node['instances'] for call in instance['calls']))
 
 
-def _assess_runs(analyses, key_ids_by_run, joint_sources=()):
+def _review_runs(analyses, key_ids_by_run, joint_sources=()):
     runs = []
     for analysis in analyses:
         trace_id = analysis['traceId']
@@ -178,8 +217,11 @@ def _assess_runs(analyses, key_ids_by_run, joint_sources=()):
                            'reason': 'The activity used multiple recorded shared inputs together.',
                            'sourceCallIds': source_ids, 'targetCallIds': [target_id],
                            'linkRelations': ['used_shared_evidence'], 'evidence': []})
-        runs.append({'traceId': trace_id, 'events': event_assessments, 'links': [], 'jointGroups': groups})
-    return {'version': 'workflow-semantics-v1', 'cached': True, 'runs': runs}
+        runs.append({'traceId': trace_id, 'events': event_assessments, 'links': [], 'jointGroups': groups,
+                     'resultEvidence': {'run': trace_id, 'status': 'missing-final', 'claims': []},
+                     'reviewedActivities': len(event_assessments),
+                     'suppliedActivities': len(event_assessments), 'totalActivities': len(event_assessments)})
+    return {'version': 'fast-review-test-v1', 'cached': True, 'runs': runs}
 
 
 def test_joint_context_importance_marks_only_recorded_result_paths(local_cache):
@@ -191,7 +233,7 @@ def test_joint_context_importance_marks_only_recorded_result_paths(local_cache):
     for sender in ('A', 'C', 'D'):
         key_ids.update((f'joint:joint:{sender}-experiment', f'joint:joint:{sender}-publication',
                         f'joint:joint:{sender}-reception'))
-    assessment = _assess_runs([analysis], {'joint': key_ids}, {'joint': (joint_sources, target_id)})
+    assessment = _review_runs([analysis], {'joint': key_ids}, {'joint': (joint_sources, target_id)})
     analysis['workflowAssessment'] = assessment
     graph = build_workflow_view([analysis], detail='all', workflow_assessments=assessment)
     target = _node_for_call(graph, target_id)
@@ -232,7 +274,7 @@ def test_joint_context_importance_marks_only_recorded_result_paths(local_cache):
 
 def test_reviewed_uncertainty_is_distinct_from_an_unreviewed_occurrence(local_cache):
     analysis = analyze(joint_context_trace())
-    assessment = _assess_runs([analysis], {})
+    assessment = _review_runs([analysis], {})
     first, second = analysis['calls'][:2]
     assessment['runs'][0]['events'][first['id']]['level'] = 'unknown'
     assessment['runs'][0]['events'][second['id']].update(level='unknown', status='not_assessed')
@@ -246,7 +288,7 @@ def test_reviewed_uncertainty_is_distinct_from_an_unreviewed_occurrence(local_ca
 
 def test_overview_preserves_relevant_flow_between_supporting_activities(local_cache):
     analysis = analyze(joint_context_trace())
-    assessments = _assess_runs([analysis], {'joint': {'joint:joint:B-result'}})
+    assessments = _review_runs([analysis], {'joint': {'joint:joint:B-result'}})
     assessments['runs'][0]['links'] = [
         {'sourceCallId': edge['source'], 'targetCallId': edge['target'], 'relation': edge['relation'],
          'relevance': 'relevant', 'reason': 'Recorded input in the reviewed result flow.'}
@@ -260,7 +302,7 @@ def test_overview_preserves_relevant_flow_between_supporting_activities(local_ca
 
 def test_delivery_to_key_reception_is_visible_without_promoting_publication(local_cache):
     analysis = analyze(joint_context_trace())
-    assessments = _assess_runs([analysis], {'joint': {'joint:joint:A-reception'}})
+    assessments = _review_runs([analysis], {'joint': {'joint:joint:A-reception'}})
     graph = build_workflow_view([analysis], workflow_assessments=assessments)
     source = _node_for_call(graph, 'joint:joint:A-publication')
     reception = _node_for_call(graph, 'joint:joint:A-reception')
@@ -274,7 +316,7 @@ def test_cross_run_alignment_requires_same_sender_and_semantic_parameters(local_
               joint_context_trace('run-sender-change', third_sender='E'),
               joint_context_trace('run-parameter-change', topic='different-topic')]
     analyses = [analyze(entry) for entry in traces]
-    assessment = _assess_runs(analyses, {})
+    assessment = _review_runs(analyses, {})
     for analysis in analyses:
         analysis['workflowAssessment'] = assessment
     graph = build_workflow_view(analyses, detail='all', workflow_assessments=assessment)
@@ -298,7 +340,7 @@ def test_semantic_workflow_assessment_uses_mocked_occurrence_and_joint_context_c
     monkeypatch.setattr(workflow_semantics, 'CACHE_DIR', tmp_path / 'semantic-cache')
     requests = []
 
-    async def mocked_model(prompt):
+    async def mocked_model(prompt, **_kwargs):
         payload = json.loads(prompt.rsplit('\n', 1)[-1])
         requests.append(payload)
         assessments = []
@@ -315,12 +357,17 @@ def test_semantic_workflow_assessment_uses_mocked_occurrence_and_joint_context_c
         if len(levels_by_link) >= 2:
             target = levels_by_link[0]['target']
             source_refs = [link['source'] for link in levels_by_link if link['target'] == target]
-            refs = {ref for event in payload['events'] if event['ref'] in source_refs
+            refs = {ref for event in payload['events'] if event['ref'] in [*source_refs, target]
                     for ref in event['evidence'][:1]}
             groups.append({'target': target, 'sources': source_refs,
                            'label': 'Joint peer context', 'reason': 'Multiple peer observations inform one experiment.',
-                           'evidence': list(refs)[:2]})
-        return {'defaultLevel': 'unknown', 'assessments': assessments, 'keyParents': [], 'searchQueries': [], 'linkAssessments': [],
+                           'evidence': list(refs)})
+        cards = {event['ref']: event for event in payload['events']}
+        links = [{'link': link['ref'], 'relevance': 'relevant', 'reason': 'The consumer combines these recorded observations.',
+                  'evidence': cards[link['source']]['evidence'][:1] + cards[link['target']]['evidence'][:1]}
+                 for link in levels_by_link]
+        return {'defaultLevel': 'unknown', 'backtrace': {'decision': 'stop', 'reason': 'The supplied result is adequately reviewed.'},
+                'assessments': assessments, 'keyParents': [], 'searchQueries': [], 'linkAssessments': links,
                 'jointGroups': groups, 'semanticContexts': []}
 
     monkeypatch.setattr(workflow_semantics, 'infer_json', mocked_model)
@@ -376,6 +423,26 @@ def test_manifest_is_small_and_lazy_loading_preserves_source_events(local_cache)
         workflow_store.resolve_entry({'traceId': 'one', 'workflowRef': {'corpusId': '../bad', 'traceKey': 'bad'}})
 
 
+def test_result_prefix_keeps_fixed_window_features_and_exposes_import_boundary(local_cache):
+    from agent_provenance.workflow_window import prune_after_result
+    entry = joint_context_trace()
+    entry['importMetadata'] = {'featureWindowEnd': 2, 'scoreWindowEnd': 3}
+    for event in entry['events']:
+        event['patterns'] = [event['eventType']]
+    full = analyze(entry)
+    # Keep a prefix before the final event to exercise source-window feature preservation.
+    anchor = next(event['id'] for event in entry['events'] if event['round'] == 0)
+    cropped = prune_after_result(entry, anchor)
+    analysis = analyze(cropped)
+    assert analysis['workflow']['patternFeatures'] == full['workflow']['patternFeatures']
+    assert analysis['workflow']['roundCount'] == 1
+    graph = build_workflow_view([analysis])
+    assert graph['workflow']['roundRange'] == [0, 0]
+    assert graph['resultWindows'][0]['anchorEventId'] == anchor
+    assert graph['resultWindows'][0]['retainedThroughRound'] == 0
+    assert graph['resultWindows'][0]['removedEventCount'] > 0
+
+
 def test_corpus_menu_identifies_earlier_imports_without_removing_them(local_cache):
     previous = workflow_store.save_corpus([trace()], 'Same batch')
     previous_path = workflow_store.WORKFLOW_DIR / previous['corpusId'] / 'manifest.json'
@@ -411,7 +478,7 @@ def test_role_path_validation_uses_the_displayed_lane_mode(local_cache, monkeypa
     client = TestClient(app.app)
     entry = trace()
     async def assess_recorded_path(analyses, focus=''):
-        base = _assess_runs(analyses, {})
+        base = _review_runs(analyses, {})
         analysis = analyses[0]
         first = analysis['workflow']['eventLinks'][0]
         base['runs'][0]['events'][first['target']]['level'] = 'key'
@@ -419,7 +486,7 @@ def test_role_path_validation_uses_the_displayed_lane_mode(local_cache, monkeypa
                                      'relation': first['relation'], 'relevance': 'relevant',
                                      'reason': 'Fixture explicitly selects this recorded path.', 'evidence': []}]
         return base
-    monkeypatch.setattr(app, 'assess_workflow', assess_recorded_path)
+    monkeypatch.setattr(app, 'review_traces', assess_recorded_path)
     graph = client.post('/api/joined-provenance-graph', json={'graphs': [entry], 'laneBy': 'role'}).json()['joinedGraph']
     edge = graph['edges'][0]
     response = client.post('/api/validate-path', json={'graphs': [entry], 'laneBy': 'role', 'traceId': 'one',
@@ -433,10 +500,14 @@ def test_native_role_tool_calls_retain_parent_evidence_and_text_results(local_ca
         {'id': 'research', 'name': 'lookup', 'agentId': 0, 'role': 'researcher', 'response': 'Observed result'},
         {'id': 'write', 'name': 'summarize', 'agentId': 1, 'role': 'writer', 'parentCallIds': ['research'], 'response': 'Result confirmed'},
     ], 'finalOutput': 'Result confirmed'}
-    async def evidence(analyses):
-        return {'roles': {'run': 'roles', 'status': 'available', 'claims': [{
-            'id': 'c0', 'text': 'Result confirmed', 'links': [{'callId': 'write', 'relation': 'supports', 'reason': 'Output quote', 'evidence': []}]}]}}, {'newTraces': 0}
-    monkeypatch.setattr(app, 'associate_results', evidence)
+    async def evidence(analyses, focus=''):
+        return {'version': 'test-review', 'cached': True, 'runs': [{
+            'traceId': 'roles', 'events': {}, 'links': [], 'jointGroups': [],
+            'resultEvidence': {'run': 'roles', 'status': 'available', 'claims': [{
+                'id': 'c0', 'text': 'Result confirmed', 'links': [{'callId': 'write',
+                    'relation': 'supports', 'reason': 'Output quote', 'evidence': []}]}]},
+            'reviewedActivities': 0, 'suppliedActivities': 2, 'totalActivities': 2}]}
+    monkeypatch.setattr(app, 'review_traces', evidence)
     analysis = analyze(entry)
     assert analysis['calls'][0]['agentId'] == '0'
     assert analysis['workflow']['roundLabel'] == 'Step'

@@ -1,0 +1,40 @@
+import assert from 'node:assert/strict';
+import { workflowCurve, cubicPath, curveSamples } from '../app/components/workflow_curve.ts';
+import { createGraphWorkspace, layoutWorkflowLanes, workflowGeometry } from '../app/components/graph_layout.ts';
+
+const a = { id: 'a', x: 0, y: 0, width: 272, height: 144 };
+const b = { id: 'b', x: 320, y: 624, width: 272, height: 144 };
+const obstacle = { id: 'c', x: 260, y: 340, width: 72, height: 88 };
+const inside = (point, box) => point.x > box.x && point.x < box.x + box.width && point.y > box.y && point.y < box.y + box.height;
+const down = workflowCurve(a, b, true, [obstacle]);
+assert.deepEqual([down.sourceHandle, down.targetHandle], ['out-bottom', 'in-top']);
+assert.deepEqual(down.curve[0], { x: 136, y: 144 });
+assert.deepEqual(down.curve.at(-1), { x: 456, y: 624 });
+assert.equal(down.curve.length, 4, 'Cross-agent handoffs use a complete cubic curve');
+assert(!cubicPath(down.curve).includes('L'));
+assert(!curveSamples(down.curve).some((point) => inside(point, obstacle)));
+const up = workflowCurve(b, a, true, []);
+assert.deepEqual([up.sourceHandle, up.targetHandle], ['out-top', 'in-bottom']);
+
+const dot = { id: 'dot', x: 0, y: 0, width: 28, height: 28 };
+const later = { ...dot, id: 'later', x: 10000 };
+const neighbors = [{ ...dot, id: 'next', x: 52 }, { ...a, id: 'middle', x: 5000, y: -58 }];
+const skip = workflowCurve(dot, later, false, neighbors);
+assert(!curveSamples(skip.curve).some((point) => neighbors.some((box) => inside(point, box))));
+assert(!cubicPath(skip.curve).includes('L'));
+
+const boxes = [{ ...a }, { ...dot, id: 'small' }];
+const contexts = new Map(boxes.map((box) => [box.id, { laneId: 'reviewer', roundStart: 0, roundEnd: 0 }]));
+const workflow = { lanes: [{ id: 'reviewer', label: 'Reviewer', kind: 'role', participantIds: [] }], roundRange: [0, 0], roundLabel: 'Step' };
+const workspace = createGraphWorkspace('generic');
+const positions = layoutWorkflowLanes(boxes, workflow, contexts, workspace);
+assert.equal(positions.get('a').y + 72, positions.get('small').y + 14, 'Cards and dots share a timeline center');
+workspace.positions.set('a', { x: 91, y: 111 }); workspace.pinned.add('a');
+assert.deepEqual(layoutWorkflowLanes(boxes, workflow, contexts, workspace).get('a'), { x: 91, y: 111 });
+const multiActor = { ...workflow, lanes: [...workflow.lanes, { id: 'peer', label: 'Peer', kind: 'agent', participantIds: [] }] };
+const expandedBoxes = [{ ...a, height: 400 }, { ...dot, id: 'peer-dot' }];
+const expandedContexts = new Map([['a', contexts.get('a')], ['peer-dot', { laneId: 'peer', roundStart: 0, roundEnd: 0 }]]);
+const expandedRows = workflowGeometry(expandedBoxes, multiActor, expandedContexts).laneRows;
+assert.equal(expandedRows[1].height, 208, 'Expanding one actor must not enlarge its peers');
+assert(expandedRows[0].height > expandedRows[1].height);
+console.log('Cross-agent curves, obstacle avoidance, long skips, centered timelines and manual positions passed');

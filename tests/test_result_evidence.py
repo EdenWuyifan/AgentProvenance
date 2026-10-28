@@ -97,11 +97,12 @@ def test_invented_output_citation_is_rejected_and_not_cached(monkeypatch, tmp_pa
 
 
 def test_interpreted_output_anchors_use_recorded_ancestry_not_inferred_links():
-    from abstraction import _targets
-    analysis = {'targets': [], 'resultAnchors': ['evidence'], 'flow': [
+    from evidence_context import result_path
+    analysis = {'calls': [{'id': cid} for cid in ('input', 'evidence', 'speculation')],
+                'targets': [], 'resultAnchors': ['evidence'], 'flow': [
         {'source': 'input', 'target': 'evidence', 'inferred': False},
         {'source': 'speculation', 'target': 'evidence', 'inferred': True}]}
-    targets, ancestors = _targets(analysis)
+    targets, ancestors = result_path(analysis)
     assert targets == {'evidence'} and ancestors == {'input', 'evidence'}
 
 
@@ -127,3 +128,33 @@ def test_chunked_retrieval_finds_single_rare_subject_and_keeps_exact_source_quot
     source = json.dumps(analysis['calls'][0]['response'], ensure_ascii=False)
     assert matches[0]['quote'] == source[matches[0]['start']:matches[0]['start'] + len(matches[0]['quote'])]
     assert coverage['indexedChunks'] > 1
+
+
+def test_scalar_receipts_are_indexed_at_json_paths_without_private_fields():
+    analysis = trace()
+    analysis['finalOutput'] = 'Receipt timestamp 1700000000. True.'
+    analysis['calls'][0]['response'] = {
+        'timestamp': 1700000000, 'accepted': True, 'receipt': 'OK',
+        'api_token': 'private-value', 'url': 'https://private.example/item', 'empty': None,
+    }
+
+    units = list(module._units(analysis['calls'][0]['response']))
+    assert ('/timestamp', '1700000000') in units
+    assert ('/accepted', 'true') in units
+    assert any('OK' in quote for _, quote in units)
+    assert all('api_token' not in path and 'url' not in path for path, _ in units)
+    assert all(path != '/empty' for path, _ in units)
+
+    from retrieval import BM25Retriever
+    documents = [{'callId': '0', 'path': path, 'quote': quote} for path, quote in units]
+    retriever = BM25Retriever(documents, module._terms)
+    assert any(item['path'] == '/timestamp' for item in retriever.search('1700000000'))
+    assert any(item['path'] == '/accepted' for item in retriever.search('true'))
+    claims, _, evidence, coverage = module.evidence_cards(analysis)
+    assert all('private-value' not in item['quote'] for item in evidence.values())
+    assert coverage['indexedChunks'] > 0
+
+
+def test_tokenizer_keeps_hyphenated_and_dotted_identifiers_intact():
+    assert module._terms('NFKB1/p65:IL-6; TNF-alpha, gene.info_v2!') == [
+        'nfkb1', 'p65', 'il-6', 'tnf-alpha', 'gene.info_v2']

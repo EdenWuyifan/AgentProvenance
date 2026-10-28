@@ -9,7 +9,8 @@ from urllib.parse import unquote, urlsplit
 
 from inference import ANNOTATION_SETTINGS, SEMANTIC_MODEL, infer_json
 from models import CACHE_DIR, ModelResponseError, digest, read_cache, write_json
-from provenance import _resource_values
+from provenance import output_resources
+from abstraction import align_instances
 
 PROMPT_VERSION = 'pattern-plan-v4'
 TYPE_BATCH_SIZE = 64
@@ -129,7 +130,7 @@ def _parameters(value, resources, key='', depth=0):
 
 def operation_types(analysis):
     calls, flow = analysis['calls'], analysis['flow']
-    resources = {value for call in calls for _, value in _resource_values(call['response'])}
+    resources = {value for call in calls for _, value in output_resources(call, analysis.get('referenceSchema'))}
     by_id = {call['id']: call for call in calls}
     incoming, outgoing = defaultdict(set), defaultdict(set)
     for edge in flow:
@@ -205,7 +206,8 @@ async def annotate_types(analyses, focus=''):
         for offset in range(0, len(missing), TYPE_BATCH_SIZE):
             batch = missing[offset:offset + TYPE_BATCH_SIZE]
             aliases = {f't{index}': key for index, key in enumerate(batch)}
-            payload = {'focus': focus or 'Show substantive evidence-processing stages and hide routine implementation work.',
+            payload = {'focus': focus or ('Keep key methods and selection decisions separate. Group only routine supporting preparation; '
+                                         'keep substantive result filtering as a separate key step, not absorbed into analysis.'),
                        'existingStages': cache['stages'],
                        'types': [{'id': alias, **catalogue[key]} for alias, key in aliases.items()]}
             prompt = PROMPT + '\n' + json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
@@ -280,34 +282,69 @@ def _external_source_roots(calls, flow):
     return roots
 
 
+def _input_preparation(call, parents, schema):
+    """Recognize bounded artifact previews/projections independently of importance."""
+    args = call.get('args')
+    if not isinstance(args, dict):
+        return False
+    projection = {'columns', 'keep_columns', 'select'}
+    preview = {'n_rows', 'max_rows', 'preview_rows'}
+    if not args.keys() & (projection | preview):
+        return False
+    options = projection | preview | {'name', 'limit', 'offset', 'preview'}
+    resources = {value for parent in parents for _, value in output_resources(parent, schema)}
+    references = {key for key, value in args.items() if key not in options
+                  and isinstance(value, (str, int, float)) and not isinstance(value, bool)
+                  and str(value) in resources}
+    if not references or args.keys() - references - options:
+        return False
+    # A preview does not produce a new artifact; column projection may do so.
+    return bool(args.keys() & projection) or all(
+        value in resources for _, value in output_resources(call, schema))
+
+
 def instantiate(analysis, policy):
     calls, flow = analysis['calls'], analysis['flow']
     _, types = operation_types(analysis)
     by_id = {call['id']: call for call in calls}
-    rules = {cid: policy['rules'][kind] for cid, kind in types.items()}
+    rules = {cid: dict(policy['rules'][kind]) for cid, kind in types.items()}
+    reviewed = analysis.get('evidenceReview', {}).get('events', {})
+    for cid, rule in rules.items():
+        # Old absorb templates describe substantive refinement, not routine plumbing.
+        # Keep those decisions separate from the analysis whose output they select.
+        if rule['action'] == 'absorb' or reviewed.get(cid, {}).get('level') == 'key':
+            rule.update(action='group', attention='key')
+            rule.setdefault('stage', 'decision_' + types[cid])
+        args = by_id[cid].get('args')
+        if rule['action'] == 'omit' and isinstance(args, dict) and (args.get('conditions') or args.get('filters')):
+            rule.update(action='group', stage='selection_' + types[cid], label=by_id[cid]['tool'])
     failures = {cid for cid, call in by_id.items() if recorded_diagnostics(call)}
     parents = {cid: cid for cid in by_id}
-    incoming, outgoing = defaultdict(list), defaultdict(list)
-    for edge in flow:
-        incoming[edge['target']].append(edge['source'])
-        outgoing[edge['source']].append(edge['target'])
-
-    source_roots = _external_source_roots(calls, flow)
+    recorded = [edge for edge in flow if not edge.get('inferred')]
+    source_incoming, source_outgoing = defaultdict(list), defaultdict(list)
+    for edge in recorded:
+        source_incoming[edge['target']].append(edge['source'])
+        source_outgoing[edge['source']].append(edge['target'])
+    source_roots = _external_source_roots(calls, recorded)
     source_candidates = defaultdict(set)
     for root_id, source in source_roots.items():
         source_candidates[root_id].add(root_id)
         rules[root_id] = {'action': 'group', 'stage': 'external_source_' + digest([analysis['traceId'], root_id])[:12],
                           'label': source['label'], 'attention': 'supporting'}
-        queue, seen = deque(outgoing[root_id]), {root_id}
+        queue, seen = deque(source_outgoing[root_id]), {root_id}
         while queue:
             cid = queue.popleft()
             if cid in seen:
                 continue
             seen.add(cid)
-            if rules[cid]['action'] != 'omit':
+            if cid in failures or cid in analysis.get('targetCallIds', []):
+                continue
+            if rules[cid]['action'] != 'omit' and not _input_preparation(
+                    by_id[cid], [by_id[parent] for parent in source_incoming[cid]],
+                    analysis.get('referenceSchema')):
                 continue
             source_candidates[cid].add(root_id)
-            queue.extend(outgoing[cid])
+            queue.extend(source_outgoing[cid])
     source_owner = {cid: next(iter(owners)) for cid, owners in source_candidates.items() if len(owners) == 1}
 
     def root(cid):
@@ -331,31 +368,10 @@ def instantiate(analysis, policy):
     for left, right in [(e['source'], e['target']) for e in flow] + list(zip(ordered, ordered[1:])):
         if left in failures or right in failures:
             continue
-        if (can_union(left, right) and rules[left]['action'] == rules[right]['action'] == 'group'
+        if (rules[left]['attention'] != 'key' and rules[right]['attention'] != 'key'
+                and can_union(left, right) and rules[left]['action'] == rules[right]['action'] == 'group'
                 and rules[left]['stage'] == rules[right]['stage']):
             union(left, right)
-    # Attach refinements to an unambiguous analytical producer/consumer. The
-    # original graph, including all forks and separate input/output ports, survives.
-    for cid, rule in rules.items():
-        if rule['action'] != 'absorb' or cid in failures:
-            continue
-        adjacency = incoming if rule['toward'] == 'inputs' else outgoing
-        queue, seen, anchors = deque(adjacency[cid]), {cid}, set()
-        while queue:
-            other = queue.popleft()
-            if other in seen:
-                continue
-            seen.add(other)
-            if other in failures:
-                continue
-            if rules[other]['action'] == 'group':
-                anchors.add(root(other))
-            else:
-                queue.extend(adjacency[other])
-        if len(anchors) == 1:
-            anchor = next(iter(anchors))
-            if can_union(anchor, cid):
-                union(anchor, cid)
     targets = set(analysis.get('targets', []))
     background = [cid for cid in by_id if rules[cid]['action'] == 'omit'
                   and cid not in targets and cid not in failures]
@@ -373,6 +389,12 @@ def instantiate(analysis, policy):
         hidden = all(cid in background for cid in ids)
         stage = rule.get('stage', 'tool_' + digest(by_id[substantive]['tool'])[:12])
         label = rule['label']
+        args = by_id[substantive]['args']
+        conditions = args.get('conditions', []) if isinstance(args, dict) else []
+        if rule['attention'] == 'key' and conditions and all(
+                isinstance(c, dict) and 'column' in c and ('op' in c or 'operator' in c) and 'value' in c
+                for c in conditions):
+            label = '; '.join(f"{c['column']} {c.get('op', c.get('operator'))} {c['value']}" for c in conditions)[:100]
         if diagnostics:
             stage, label = 'failure_' + digest(by_id[substantive]['tool'])[:12], by_id[substantive]['tool'] + ' failed'
         elif targets.intersection(ids) and rule['action'] == 'omit':
@@ -383,8 +405,9 @@ def instantiate(analysis, policy):
         if len(owners) == 1:
             owner = next(iter(owners))
             source = {**source_roots[owner], 'callId': owner}
+        identity = [policy['version'], stage]
         family_id = ('source:' + source_roots[next(iter(owners))]['identity']
-                     if len(owners) == 1 else 'pattern:' + digest([policy['version'], stage])[:20])
+                     if len(owners) == 1 else 'pattern:' + digest(identity)[:20])
         instance = {'id': instance_id, 'familyId': family_id,
                           'templateId': stage, 'label': label, 'intent': label, 'roleBindings': {'purpose': label},
                           'attention': rule.get('attention', 'supporting'),
@@ -397,7 +420,7 @@ def instantiate(analysis, policy):
         if source is not None:
             instance['source'] = source
         instances.append(instance)
-    return {**analysis, 'instances': instances, 'templateVersion': policy['version']}
+    return align_instances({**analysis, 'instances': instances, 'templateVersion': policy['version']})
 
 
 def resolve_targets(analysis):
@@ -408,7 +431,7 @@ def resolve_targets(analysis):
     evidence = [{'callId': cid, 'reason': 'Selected result target', 'kind': 'explicit'} for cid in sorted(targets)]
     final = analysis.get('finalOutput') or ''
     for call in analysis['calls']:
-        for path, value in _resource_values(call['response']):
+        for path, value in output_resources(call, analysis.get('referenceSchema')):
             if len(value) >= 6 and re.search(r'(?<!\w)' + re.escape(value) + r'(?!\w)', final):
                 targets.add(call['id'])
                 evidence.append({'callId': call['id'], 'reason': 'Final output explicitly references this artifact',

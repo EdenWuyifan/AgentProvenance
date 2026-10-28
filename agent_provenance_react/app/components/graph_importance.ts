@@ -3,7 +3,7 @@ import type { JoinedProvenanceGraph, JoinedProvenanceNode } from './types';
 export type ImportanceAxis = 'outcome' | 'evidence' | 'semantic';
 
 export function importanceValue(family: JoinedProvenanceNode, axis: ImportanceAxis, tool?: string): number | null {
-  if (axis === 'semantic') return family.importance.semantic.level === 'key' ? 1 : 0;
+  if (axis === 'semantic') return family.importance.semantic.level === 'unknown' ? null : family.importance.semantic.level === 'key' ? 1 : 0;
   if (axis === 'evidence') return new Set([
     ...family.importance.result.supportedClaims, ...family.importance.result.contradictedClaims,
   ]).size;

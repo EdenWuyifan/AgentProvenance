@@ -3,10 +3,10 @@ import math
 import os
 import re
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any
 
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from portkey_ai import AsyncPortkey
+from inference import capture_metrics, infer_json
 from graph_focus import MAX_CATALOG_CHARS, MAX_EDGES, MAX_NODES, _validate_catalog
 
 MAX_ARRAY_ITEMS = 12
@@ -14,7 +14,6 @@ MAX_OBJECT_KEYS = 16
 MAX_STRING_LENGTH = 600
 DEFAULT_MODEL_REQUESTS = 6
 DEFAULT_TOOL_CALLS = 24
-DEFAULT_MAX_TOKENS = 8192
 DEFAULT_GRAPH_MATCHES = 20
 
 
@@ -38,32 +37,6 @@ def model_tool_result(result: Any) -> Any:
     if isinstance(result, dict) and isinstance(result.get("action"), dict):
         return {key: value for key, value in result.items() if key != "action"}
     return result
-
-
-def content_blocks(value: Any) -> list[dict[str, Any]]:
-    blocks = value.get("content_blocks") if isinstance(value, dict) else None
-    return [block for block in blocks or [] if isinstance(block, dict)]
-
-
-def split_content_blocks(blocks: list[dict[str, Any]]) -> tuple[str, str]:
-    thinking: list[str] = []
-    text: list[str] = []
-
-    for block in blocks:
-        delta = block.get("delta") if isinstance(block.get("delta"), dict) else block
-        if block.get("type") == "thinking" or delta.get("thinking"):
-            thinking.append(str(delta.get("thinking") or ""))
-        elif block.get("type") == "text" or delta.get("text"):
-            text.append(str(delta.get("text") or ""))
-
-    return "".join(thinking), "".join(text)
-
-
-def message_text(payload: dict[str, Any]) -> tuple[str, str]:
-    thinking, text = split_content_blocks(content_blocks(payload))
-    if not text and isinstance(payload.get("content"), str):
-        text = payload["content"]
-    return thinking, text
 
 
 def parse_json_args(value: Any) -> dict[str, Any]:
@@ -241,6 +214,7 @@ class CopilotStore:
             "set_graph_view": self.set_graph_view,
             "get_workflow_outcomes": self.get_workflow_outcomes,
             "get_workflow_insights": self.get_workflow_insights,
+            "get_input_patterns": self.get_input_patterns,
         }
         tool = tools.get(name)
         return tool(args) if tool else {"error": f"Unknown tool: {name}"}
@@ -337,7 +311,7 @@ class CopilotStore:
                 or not set(mapped_nodes) <= node_ids or not set(mapped_edges) <= edge_ids):
             return {"error": "Graph action contains an ID outside the current selection."}
         action = {"type": action_type, "nodeIds": mapped_nodes, "edgeIds": mapped_edges}
-        if args.get("context") in {"none", "workflow"}:
+        if args.get("context") in {"none", "parents", "inputs", "neighbors", "workflow"}:
             action["context"] = args["context"]
         return self.graph_action(action)
 
@@ -345,7 +319,7 @@ class CopilotStore:
         action = {"type": "set_graph_view"}
         if args.get("axis") in {"outcome", "evidence", "semantic"}:
             action["axis"] = args["axis"]
-        if args.get("context") in {"none", "workflow"}:
+        if args.get("context") in {"none", "parents", "inputs", "neighbors", "workflow"}:
             action["context"] = args["context"]
         if args.get("links") in {"all", "recorded", "inferred"}:
             action["links"] = args["links"]
@@ -354,10 +328,10 @@ class CopilotStore:
             if not isinstance(filters, dict) or set(filters) - {"text", "role", "evidence", "minSupport", "minOutcome", "view", "context", "links"}:
                 return {"error": "filters contains an unsupported field."}
             allowed = {
-                "role": {"all", "key", "supporting"},
-                "evidence": {"all", "direct", "path", "failure"},
+                "role": {"all", "key", "supporting", "unknown"},
+                "evidence": {"all", "supported", "direct", "main", "path", "failure"},
                 "view": {"highlight", "isolate"},
-                "context": {"none", "workflow"},
+                "context": {"none", "parents", "inputs", "neighbors", "workflow"},
                 "links": {"all", "recorded", "inferred"},
             }
             for key, value in filters.items():
@@ -599,6 +573,51 @@ class CopilotStore:
                               'value': outcome['value'], 'round': outcome['round'] + 1,
                               'step': next((i + 1 for i, call in enumerate(tool_calls(trace)) if call.get('id') == outcome['eventId']), None)}
                              for outcome in outcomes[int(args.get('offset') or 0):int(args.get('offset') or 0) + 12]]}
+
+    def get_input_patterns(self, args):
+        minimum = max(1, int(args.get('minSupport', 1)))
+        node_index = {}
+        for node in (self.joined_graph or {}).get('nodes', []):
+            alias = self.catalog_node_id(node['id'])
+            if alias is None:
+                continue
+            for instance in node.get('instances', []):
+                for call in instance.get('calls', []):
+                    node_index.setdefault((instance['run'], str(call['id'])), set()).add(alias)
+        patterns = []
+        for pattern in (self.joined_graph or {}).get('inputPatterns', []):
+            if pattern['supportCount'] < minimum:
+                continue
+            witnesses = []
+            for witness in pattern['witnesses']:
+                run = witness['run']
+                trace = self.trace_by_id.get(run)
+                if trace is None:
+                    continue
+                steps = {str(call.get('id', i)): i + 1 for i, call in enumerate(tool_calls(trace))}
+                witnesses.append({'traceAlias': self.trace_alias_by_id[run],
+                    'consumerStep': steps.get(witness['consumerCallId']),
+                    'consumerSteps': [steps[cid] for cid in witness['consumerCallIds'] if cid in steps],
+                    'steps': [steps[cid] for cid in witness['callIds'] if cid in steps],
+                    'nodeIds': sorted({nid for cid in witness['callIds'] for nid in node_index.get((run, cid), ())}),
+                    'links': [{'sourceStep': steps.get(edge['source']), 'targetStep': steps.get(edge['target']),
+                               'inferred': edge['inferred'], 'relation': self.safe_text(edge['relation'], 80),
+                               'evidenceRole': edge.get('evidenceRole')} for edge in witness['links']],
+                    'boundaryInputCount': len(witness['boundaryInputs']),
+                    'inputCoverage': [{'consumerStep': steps.get(row['consumerCallId']),
+                        'observedRoleCount': len(row['observedDirectRoles']),
+                        'unknownRoleCount': len(row['unknownDirectRoles']),
+                        'boundaryInputCount': len(row['boundaryInputs'])}
+                        for row in witness['inputCoverage']]})
+            patterns.append({'id': pattern['id'], 'consumerTool': self.safe_text(pattern['consumerTool'], 80),
+                             'supportCount': pattern['supportCount'],
+                             'successfulSourceCount': len(pattern['successfulSourceTraces']),
+                             'failedSourceCount': len(pattern['failedSourceTraces']),
+                             'resultAnchorCount': pattern['explicitResultAnchorCount'],
+                             'keyActivityCount': pattern['keyActivityWitnessCount'], 'witnesses': witnesses})
+        return {'patterns': patterns, 'interpretation':
+                'Per-run input bundles, not stitched quotient paths. Use supplied steps to inspect original inputs/outputs. '
+                'Recorded transport and inferred context remain distinct. Recurrence does not establish skill transfer.'}
 
     def get_workflow_insights(self, args):
         section = args.get('section', 'timing')
@@ -855,6 +874,7 @@ Dependency and score interpretation:
 - Use participantId/eventType/roundStart/roundEnd filters to inspect a specific workflow interval. get_workflow_outcomes returns structured, source-anchored milestones.
 - Message delivery, prompt exposure and demonstrated decision influence are distinct. Never call delivery or exposure alone a causal effect. A cache match is contextual unless an execution foreign key exists.
 - Agent workflows center on choosing and experimenting, publishing information, and receiving information. Candidate generation and prompt exposures are evidence within an activity. Use get_workflow_insights for communication timing, outcomes, key recorded paths and skill candidates. A repeated motif alone does not establish a transferable skill or a score benefit.
+- For reusable core patterns, use get_input_patterns for source-backed input bundles in any trace format. Prefer result-linked, semantically key and independently repeated witnesses. Inspect their source steps before suggesting a skill; highlight only returned canvas IDs. Never join steps from different runs into one executed path.
 - For workflow pattern rankings, coefficient sign describes association direction; importance describes absolute magnitude. State the fixed prefix and outcome windows and the exploratory status.
 
 Graph interaction:
@@ -864,7 +884,7 @@ Graph interaction:
 - Use highlight_graph, filter_graph, and set_graph_view to change the visible graph. These tools emit a graph_action for the current opaque scope. Only use IDs supplied by the catalog or graph evidence.
 - When asked to locate, highlight, or filter graph content, act from the catalog or ranking results when they already identify the target, then frame the graph. Do not fetch more evidence solely to repeat that action. Only skip the graph action when the user asks for an explanation without changing the view.
 
-For broad exploration, start with at most three strongest matching steps or tools; avoid highlighting nearly the whole graph. Include extra context through the workflow setting rather than selecting every upstream step. If the user requests all matches, show all.
+For broad exploration, start with at most three strongest matching steps or tools; avoid highlighting nearly the whole graph. Use parents for immediate inputs, inputs for all prerequisites, neighbors for one-step context, or workflow for full paths rather than selecting every upstream step. If the user requests all matches, show all.
 Batch independent highlight/filter and view changes in the same tool-call round. When acting on score associations, set axis to outcome; for conclusion evidence, use evidence.
 For higher-score questions, rank positive signed meanWhenPresent values; a large absolute importance with a negative sign is not a higher-score signal. Distinguish global tool estimates from local task-pattern estimates and state the relevant sample size/status briefly. Do not mix their scales.
 Keep the explanation brief (normally under 150 words); name the top tools, what changed on the canvas, and any evidence limitation. Do not dump the catalog or a long table unless requested.
@@ -901,6 +921,8 @@ def tool_definitions() -> list[dict[str, Any]]:
         }
 
     return [
+        tool('get_input_patterns', 'Find source-backed multi-input patterns in either single-agent or agent-lane graphs. Returns separate run witnesses, source steps and canvas IDs; use IO tools to inspect evidence before proposing a skill.',
+             {'minSupport': {'type': 'integer', 'minimum': 1}}),
         tool('get_workflow_insights', 'Read measured communication timing, final outcomes, key recorded paths, or candidate reusable workflows. No causal or transfer guarantee.',
              {'section': {'type': 'string', 'enum': ['timing', 'outcomes', 'keySteps', 'skills']}, 'traceAlias': {'type': 'string'}}),
         tool('get_workflow_outcomes', 'Read up to 12 structured milestones with source steps for a selected workflow run.',
@@ -912,23 +934,23 @@ def tool_definitions() -> list[dict[str, Any]]:
         tool("highlight_graph", "Highlight supplied catalog IDs in the graph.",
              {"nodeIds": {"type": "array", "items": {"type": "string"}},
               "edgeIds": {"type": "array", "items": {"type": "string"}},
-              "context": {"type": "string", "enum": ["none", "workflow"]}}),
+              "context": {"type": "string", "enum": ["none", "parents", "inputs", "neighbors", "workflow"]}}),
         tool("filter_graph", "Filter the graph to supplied catalog IDs.",
              {"nodeIds": {"type": "array", "items": {"type": "string"}},
               "edgeIds": {"type": "array", "items": {"type": "string"}},
-              "context": {"type": "string", "enum": ["none", "workflow"]}}),
+              "context": {"type": "string", "enum": ["none", "parents", "inputs", "neighbors", "workflow"]}}),
         tool("set_graph_view", "Change graph axis, link visibility, context, or node expansion.",
              {"axis": {"type": "string", "enum": ["outcome", "evidence", "semantic"]},
-              "context": {"type": "string", "enum": ["none", "workflow"]},
+              "context": {"type": "string", "enum": ["none", "parents", "inputs", "neighbors", "workflow"]},
               "links": {"type": "string", "enum": ["all", "recorded", "inferred"]},
               "filters": {"type": "object", "additionalProperties": False, "properties": {
                   "text": {"type": "string"},
-                  "role": {"type": "string", "enum": ["all", "key", "supporting"]},
-                  "evidence": {"type": "string", "enum": ["all", "direct", "path", "failure"]},
+                  "role": {"type": "string", "enum": ["all", "key", "supporting", "unknown"]},
+                  "evidence": {"type": "string", "enum": ["all", "supported", "direct", "main", "path", "failure"]},
                   "minSupport": {"type": "integer", "minimum": 0},
                   "minOutcome": {"type": "number", "minimum": 0},
                   "view": {"type": "string", "enum": ["highlight", "isolate"]},
-                  "context": {"type": "string", "enum": ["none", "workflow"]},
+                  "context": {"type": "string", "enum": ["none", "parents", "inputs", "neighbors", "workflow"]},
                   "links": {"type": "string", "enum": ["all", "recorded", "inferred"]}}},
               "expandNodeIds": {"type": "array", "items": {"type": "string"}},
               "collapseNodeIds": {"type": "array", "items": {"type": "string"}},
@@ -987,173 +1009,46 @@ def tool_definitions() -> list[dict[str, Any]]:
     ]
 
 
-def model_messages(store: CopilotStore) -> list[dict[str, Any]]:
-    return [
-        {"role": "system", "content": [{"type": "text", "text": system_prompt()}]},
-        *store.chat_history,
-        {"role": "user", "content": user_prompt(store)},
-    ]
-
-
-def request_kwargs(model: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "model": model,
-        "max_tokens": env_int("COPILOT_MAX_TOKENS", DEFAULT_MAX_TOKENS),
-        "reasoning_effort": "low",
-        "stream": True,
-        "messages": messages,
-        "tools": tool_definitions(),
-    }
-
-
-def chunk_payload(chunk: Any) -> dict[str, Any]:
-    return chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
-
-
-def update_tool_call(
-    tool_calls: dict[str, dict[str, Any]], index: int, raw_call: dict[str, Any]
-) -> None:
-    stream_index = str(raw_call.get("index", index))
-    call_id = raw_call.get("id")
-    key = f"id:{call_id}" if call_id else f"index:{stream_index}"
-    if not call_id:
-        matching_calls = [
-            existing_key
-            for existing_key, existing in tool_calls.items()
-            if existing.get("_stream_index") == stream_index and existing.get("_has_id")
-        ]
-        if len(matching_calls) == 1:
-            key = matching_calls[0]
-    if call_id and key not in tool_calls:
-        partial_key = f"index:{stream_index}"
-        partial = tool_calls.get(partial_key)
-        if partial is not None and not partial.get("_has_id"):
-            tool_calls.pop(partial_key)
-            tool_calls[key] = partial
-    call = tool_calls.setdefault(
-        key,
-        {
-            "id": call_id or f"portkey-tool-{stream_index}",
-            "type": "function",
-            "function": {"name": "", "arguments": ""},
-            "_stream_index": stream_index,
-            "_has_id": bool(call_id),
-        },
-    )
-    if call_id:
-        call["id"] = call_id
-        call["_has_id"] = True
-    call["_stream_index"] = stream_index
-    if raw_call.get("type"):
-        call["type"] = raw_call["type"]
-
-    function = (
-        raw_call.get("function") if isinstance(raw_call.get("function"), dict) else {}
-    )
-    target = call["function"]
-    if function.get("name"):
-        target["name"] = function["name"]
-    if function.get("arguments"):
-        target["arguments"] = f"{target.get('arguments', '')}{function['arguments']}"
-    if function.get("thought_signature"):
-        target["thought_signature"] = function["thought_signature"]
-    if raw_call.get("thought_signature"):
-        call["thought_signature"] = raw_call["thought_signature"]
-    extra = raw_call.get("extra_content")
-    if isinstance(extra, dict) and extra.get("google"):
-        call["extra_content"] = {"google": dict(extra["google"])}
-
-
-async def stream_model_round(
-    client: AsyncPortkey, model: str, messages: list[dict[str, Any]]
-):
-    text = ""
-    tool_calls: dict[str, dict[str, Any]] = {}
-    stream = await client.chat.completions.create(**request_kwargs(model, messages))
-
-    async for chunk in stream:
-        payload = chunk_payload(chunk)
-        choices = payload.get("choices") or []
-        if not choices:
-            continue
-        choice = choices[0]
-        message = choice.get("delta") or choice.get("message") or {}
-        thinking_delta, text_delta = message_text(message)
-
-        if thinking_delta:
-            yield {"type": "thinking_delta", "delta": thinking_delta}
-        if text_delta:
-            text += text_delta
-            yield {"type": "message_delta", "delta": text_delta}
-
-        for index, raw_call in enumerate(message.get("tool_calls") or []):
-            update_tool_call(tool_calls, index, raw_call)
-
-    completed_tool_calls = []
-    for call in tool_calls.values():
-        call.pop("_stream_index", None)
-        call.pop("_has_id", None)
-        completed_tool_calls.append(call)
-    yield {
-        "type": "round_done",
-        "text": text,
-        "tool_calls": completed_tool_calls,
-    }
-
-
-async def provenance_agent_response(
-    body: dict[str, Any],
-    client_factory: Callable[[], tuple[AsyncPortkey, str]],
-):
+async def provenance_agent_response(body: dict[str, Any]):
     store = CopilotStore(body)
     if not store.question:
         return PlainTextResponse("Question is required.", status_code=400)
 
-    try:
-        client, model = client_factory()
-    except RuntimeError as error:
-        return PlainTextResponse(str(error), status_code=500)
-
     async def stream():
-        messages = model_messages(store)
+        prompt = (system_prompt()
+                  + '\nReturn text and calls. Each call contains a tool name and arguments encoded as a JSON string. '
+                    'Use calls=[] for a final answer. Only the application executes these local tools.\n'
+                  + "\nAvailable local tools and argument schemas:\n"
+                  + json.dumps(tool_definitions(), separators=(",", ":"))
+                  + "\n\nConversation and bounded context:\n"
+                  + json.dumps([*store.chat_history, {"role": "user", "content": user_prompt(store)}], default=str))
         tool_call_count = 0
         model_request_count = 0
         started = perf_counter()
 
         try:
             for _ in range(env_int("COPILOT_MODEL_REQUESTS", DEFAULT_MODEL_REQUESTS)):
-                model_request_count += 1
-                round_text = ""
-                round_tool_calls: list[dict[str, Any]] = []
-
-                async for event in stream_model_round(client, model, messages):
-                    if event["type"] == "round_done":
-                        round_text = event["text"]
-                        round_tool_calls = event["tool_calls"]
-                    else:
-                        yield event_line(
-                            event["type"],
-                            **{
-                                key: value
-                                for key, value in event.items()
-                                if key != "type"
-                            },
-                        )
-
+                try:
+                    with capture_metrics() as metrics:
+                        plan = await infer_json(prompt, tier="semantic", schema={
+                            "type": "object", "additionalProperties": False,
+                            "properties": {"text": {"type": "string"}, "calls": {
+                                "type": "array", "items": {"type": "object", "additionalProperties": False,
+                                    "properties": {"name": {"type": "string"}, "arguments": {"type": "string"}},
+                                    "required": ["name", "arguments"]}}}, "required": ["text", "calls"]})
+                finally:
+                    model_request_count += sum(not item.get('cached') for item in metrics)
+                round_text = str(plan.get("text") or "")
+                if round_text:
+                    yield event_line("message_delta", delta=round_text)
+                round_tool_calls = plan.get("calls", [])
                 if not round_tool_calls:
                     yield event_line("final", output=round_text)
                     yield event_line("telemetry", modelRequests=model_request_count,
                                      toolCalls=tool_call_count, elapsedSeconds=round(perf_counter() - started, 3))
                     return
 
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": round_text,
-                        "tool_calls": round_tool_calls,
-                    }
-                )
-
+                prompt += '\n\nPrevious plan:\n' + json.dumps(plan)
                 for call in round_tool_calls:
                     tool_call_count += 1
                     if tool_call_count > env_int(
@@ -1166,12 +1061,12 @@ async def provenance_agent_response(
                                          toolCalls=tool_call_count, elapsedSeconds=round(perf_counter() - started, 3))
                         return
 
-                    function = call.get("function") or {}
-                    tool_name = str(function.get("name") or "")
-                    args = parse_json_args(function.get("arguments"))
+                    tool_name = str(call.get("name") or "")
+                    args = parse_json_args(call.get("arguments"))
+                    call_id = f"tool-{tool_call_count}"
 
                     yield event_line(
-                        "tool_call", id=call["id"], name=tool_name, args=compact(args)
+                        "tool_call", id=call_id, name=tool_name, args=compact(args)
                     )
                     result = store.call_tool(tool_name, args)
                     if isinstance(result, dict) and result.get("type") == "graph_action":
@@ -1181,17 +1076,11 @@ async def provenance_agent_response(
                     safe_result = model_tool_result(result)
                     yield event_line(
                         "tool_result",
-                        id=call["id"],
+                        id=call_id,
                         name=tool_name,
                         result=compact(safe_result),
                     )
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "content": json.dumps(safe_result, default=str),
-                        }
-                    )
+                    prompt += "\n\nTool result for " + tool_name + ":\n" + json.dumps(compact(safe_result), default=str)
 
             yield event_line("error", message="Copilot model request budget reached.")
             yield event_line("telemetry", modelRequests=model_request_count,
@@ -1203,9 +1092,6 @@ async def provenance_agent_response(
             yield event_line("error", message=str(error))
             yield event_line("telemetry", modelRequests=model_request_count,
                              toolCalls=tool_call_count, elapsedSeconds=round(perf_counter() - started, 3))
-        finally:
-            await client.close()
-
     return StreamingResponse(
         stream(),
         media_type="application/x-ndjson",

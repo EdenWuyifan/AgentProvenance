@@ -27,3 +27,16 @@ def test_allowed_search_scores_only_the_selected_call_documents():
     retriever = BM25Retriever(documents, lambda text: text.split())
 
     assert retriever.search('alpha', limit=5, allowed_call_ids={'run:1500'})
+
+
+def test_scoped_postings_search_matches_unscoped_scores_and_ties():
+    import random
+    random.seed(17)
+    words = ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
+    documents = [{'callId': str(i // 3), 'quote': ' '.join(random.choices(words, k=random.randrange(1, 30)))}
+                 for i in range(180)]
+    retriever = BM25Retriever(documents, str.split)
+    for query in ('alpha beta', 'gamma epsilon delta', 'absent', ''):
+        for allowed in (set(), {'0', '3', '19'}, {str(i) for i in range(50)}):
+            expected = [d for d in retriever.search(query, limit=180) if d['callId'] in allowed][:7]
+            assert retriever.search(query, limit=7, allowed_call_ids=allowed) == expected

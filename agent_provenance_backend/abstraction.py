@@ -8,13 +8,14 @@ from urllib.parse import urlsplit
 from importance import assess_importance, score_summary
 from score_attribution import fit_score_models
 from models import digest
-from provenance import _resource_values
+from provenance import output_resources, declared_resources, project_dependencies
+from evidence_context import display_links, result_path
 
 
 def _flow(analysis):
     outgoing = defaultdict(list)
     incoming = defaultdict(list)
-    for edge in analysis.get("flow", []):
+    for edge in display_links(analysis):
         outgoing[edge["source"]].append(edge)
         incoming[edge["target"]].append(edge)
     return outgoing, incoming
@@ -110,23 +111,6 @@ def compatible_path(graph: dict, family_path: list[str], trace_id: str) -> list:
     return [chain for chain, _ in states]
 
 
-def _targets(analysis):
-    target_ids = set(analysis.get("targets", [])) | set(analysis.get('resultAnchors', []))
-    _, incoming = _flow(analysis)
-    ancestors = set(target_ids)
-    queue = deque(target_ids)
-    while queue:
-        current = queue.popleft()
-        for edge in incoming[current]:
-            if edge.get('inferred'):
-                continue
-            parent = edge["source"]
-            if parent not in ancestors:
-                ancestors.add(parent)
-                queue.append(parent)
-    return target_ids, ancestors
-
-
 _PRIVATE_PARAMETER = re.compile(r'password|secret|token|authorization|api.?key|^email$', re.I)
 _LOCATION_PARAMETER = re.compile(r'url|path|file', re.I)
 _PROJECTION_PARAMETER = re.compile(r'^(?:keep_columns|select|suffixes)$', re.I)
@@ -143,14 +127,19 @@ def _operation_value(value, resources, latest, source, key='', display=False, ou
     if source and re.fullmatch(r'name|url|path|file|.*_url|.*_path', key, re.I):
         return None
     if isinstance(value, dict):
-        return {child_key: child for child_key, raw in sorted(value.items())
-                if (child := _operation_value(
+        parts = {child_key: child for child_key, raw in sorted(value.items())
+                 if (child := _operation_value(
                     raw, resources, latest, source, str(child_key), display, output_aliases,
                     bool(_THRESHOLD_PARAMETER.search(str(child_key)))
                     or key.casefold() in {'conditions', 'filters'}
                     and str(child_key).casefold() in {'value', 'threshold', 'cutoff'}
                     and value.get('op', value.get('operator')) in ('<', '<=', '>', '>=')
                 )) is not None}
+        if not display and str(value.get('op', value.get('operator', ''))).casefold() in {'in', 'not in'}:
+            for field in ('value', 'values'):
+                if isinstance(parts.get(field), list):
+                    parts[field].sort(key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False))
+        return parts
     if isinstance(value, list):
         items = [_operation_value(child, resources, latest, source, key, display, output_aliases,
                                   threshold_value) for child in value]
@@ -181,14 +170,16 @@ def _operation_value(value, resources, latest, source, key='', display=False, ou
 
 
 def _entity_ports(analysis):
-    nodes = {node['id']: node for node in analysis.get('graph', {}).get('nodes', [])}
+    graph = project_dependencies(analysis)
+    nodes = {node['id']: node for node in graph.get('nodes', [])}
     inputs, outputs = defaultdict(list), defaultdict(list)
-    for edge in analysis.get('graph', {}).get('edges', []):
+    for edge in graph.get('edges', []):
         if edge.get('relation') == 'generatedBy' and edge.get('source') in nodes:
             call_id = nodes[edge['source']].get('toolCallId')
             if call_id is not None:
                 outputs[call_id].append(edge['target'])
-        elif edge.get('relation') == 'usedBy' and edge.get('target') in nodes:
+        elif (edge.get('relation') == 'usedBy' and not edge.get('inferred', False)
+              and edge.get('target') in nodes):
             call_id = nodes[edge['target']].get('toolCallId')
             if call_id is not None:
                 inputs[call_id].append(edge['source'])
@@ -249,49 +240,105 @@ def _operation_signature_parameters(parameters):
     return parameters
 
 
-def _operation_groups(family, members, entries):
+def _projection_lineage(parameters, args):
+    """Treat supporting column-only preparation as the same pattern input.
+
+    This aligns operations, not their results: the original preparation activity,
+    entity ports and per-run values remain in the graph.
+    """
+    if not isinstance(parameters, dict) or not isinstance(args, dict) or not any(
+            key in {'columns', 'keep_columns', 'select'} for key in args):
+        return None
+    inputs = set()
+    for key, value in parameters.items():
+        if isinstance(value, dict) and set(value) == {'inputFrom'}:
+            inputs.add(value['inputFrom'])
+        elif key not in {'columns', 'keep_columns', 'select', 'name'}:
+            return None
+    return next(iter(inputs)) if len(inputs) == 1 else None
+
+
+def _declared_arguments(call, schema, latest, display=False):
+    refs = {path: '<artifact>' if display else {'inputFrom': latest[identity]}
+            if identity in latest else {'unresolvedArtifact': digest(identity)}
+            for identity, path, _ in declared_resources(call, schema, 'inputs')}
+
+    def replace(value, path=''):
+        if path in refs:
+            return refs[path]
+        if isinstance(value, dict):
+            return {key: replace(child, path + '/' + str(key).replace('~', '~0').replace('/', '~1'))
+                    for key, child in value.items()}
+        if isinstance(value, list):
+            return [replace(child, path + f'/{index}') for index, child in enumerate(value)]
+        return value
+
+    return replace(call.get('args'))
+
+
+def _operation_records(analysis):
+    source_by_call = {cid: member['source'] for member in analysis['instances'] if member.get('source')
+                      for cid in member['callIds']}
+    supporting = {cid for member in analysis['instances'] if member.get('attention') == 'supporting'
+                  for cid in member['callIds']}
+    schema = analysis.get('referenceSchema')
+    resources = ({value for call in analysis['calls'] for _, value in output_resources(call)}
+                 if schema is None else set())
+    input_entities, output_entities = _entity_ports(analysis)
+    latest, lineage_occurrences, records = {}, defaultdict(int), {}
+    for order, call in enumerate(sorted(analysis['calls'], key=lambda item: item['timeIndex'])):
+        source = source_by_call.get(call['id'])
+        aliases = _operation_aliases(call.get('args'), call.get('response'))
+        args = _declared_arguments(call, schema, latest) if schema is not None else call.get('args')
+        parameters = _operation_signature_parameters(_operation_value(
+            args, resources, latest, source, output_aliases=aliases) or {})
+        failure = _recorded_failure(call)
+        signature = digest([call['tool'], parameters, source.get('identity') if source else None, failure])
+        lineage_ordinal = lineage_occurrences[signature]
+        lineage_occurrences[signature] += 1
+        shown_args = _declared_arguments(call, schema, latest, display=True) if schema is not None else call.get('args')
+        variant = _operation_value(shown_args, resources, latest, source, display=True,
+                                   output_aliases=aliases) or {}
+        records[call['id']] = {'tool': call['tool'], 'signature': signature, 'failure': failure,
+                               'order': order, 'step': call['timeIndex'] + 1,
+                               'inputEntityIds': sorted(input_entities.get(call['id'], [])),
+                               'outputEntityIds': sorted(output_entities.get(call['id'], [])),
+                               'variant': variant, 'variantKey': digest(variant)}
+        # Calls folded into one external input expose the same dataset despite local aliases.
+        lineage_id = digest(['external-input', source['identity']]) if source else digest([signature, lineage_ordinal])
+        if not source and not failure and call['id'] in supporting:
+            lineage_id = _projection_lineage(parameters, args) or lineage_id
+        outputs = (declared_resources(call, schema, 'outputs') if schema is not None else
+                   ((value, path, value) for path, value in output_resources(call)))
+        for identity, _, _ in outputs:
+            latest[identity] = lineage_id
+    return records
+
+
+def _operation_groups(family, members, entries, records_by_run=None):
     groups = {}
     for run in sorted({member['traceId'] for member in members}):
-        analysis = entries[run]
+        records = records_by_run[run] if records_by_run is not None else _operation_records(entries[run])
         family_call_ids = {cid for member in members if member['traceId'] == run for cid in member['callIds']}
-        source_by_call = {cid: member['source'] for member in analysis['instances'] if member.get('source')
-                          for cid in member['callIds']}
-        resources = {value for call in analysis['calls'] for _, value in _resource_values(call.get('response'))}
-        input_entities, output_entities = _entity_ports(analysis)
-        latest, lineage_occurrences, group_occurrences = {}, defaultdict(int), defaultdict(int)
-        for call in sorted(analysis['calls'], key=lambda item: item['timeIndex']):
-            source = source_by_call.get(call['id'])
-            aliases = _operation_aliases(call.get('args'), call.get('response'))
-            parameters = _operation_value(call.get('args'), resources, latest, source,
-                                          output_aliases=aliases) or {}
-            parameters = _operation_signature_parameters(parameters)
-            signature = digest([call['tool'], parameters, source.get('identity') if source else None,
-                                _recorded_failure(call)])
-            lineage_ordinal = lineage_occurrences[signature]
-            lineage_occurrences[signature] += 1
-            lineage_id = digest([signature, lineage_ordinal])
-            if call['id'] in family_call_ids:
-                occurrence = group_occurrences[signature]
-                group_occurrences[signature] += 1
-                group_key = (call['tool'], signature, occurrence)
-                group = groups.setdefault(group_key, {
-                    'id': 'operation:' + digest([family, call['tool'], signature, occurrence])[:20],
-                    'tool': call['tool'], 'failure': _recorded_failure(call),
-                    'supportTraces': set(), 'members': [], 'parameterVariants': {}})
-                member_ref = {'run': run, 'callId': call['id']}
-                group['supportTraces'].add(run)
-                group['members'].append({'run': run, 'callId': call['id'],
-                                         'step': call['timeIndex'] + 1,
-                                         'inputEntityIds': sorted(input_entities.get(call['id'], [])),
-                                         'outputEntityIds': sorted(output_entities.get(call['id'], []))})
-                variant_parameters = _operation_value(call.get('args'), resources, latest, source, display=True,
-                                                       output_aliases=aliases) or {}
-                variant_key = digest(variant_parameters)
-                variant = group['parameterVariants'].setdefault(variant_key,
-                            {'parameters': variant_parameters, 'members': []})
-                variant['members'].append(member_ref)
-            for _, value in _resource_values(call.get('response')):
-                latest[value] = lineage_id
+        group_occurrences = defaultdict(int)
+        for cid in sorted(family_call_ids, key=lambda item: records[item]['order']):
+            record = records[cid]
+            signature = record['signature']
+            occurrence = group_occurrences[signature]
+            group_occurrences[signature] += 1
+            tool = record['tool']
+            group_key = (tool, signature, occurrence)
+            group = groups.setdefault(group_key, {
+                'id': 'operation:' + digest([family, tool, signature, occurrence])[:20],
+                'tool': tool, 'failure': record['failure'],
+                'supportTraces': set(), 'members': [], 'parameterVariants': {}})
+            group['supportTraces'].add(run)
+            group['members'].append({'run': run, 'callId': cid, 'step': record['step'],
+                                     'inputEntityIds': record['inputEntityIds'],
+                                     'outputEntityIds': record['outputEntityIds']})
+            variant = group['parameterVariants'].setdefault(record['variantKey'],
+                {'parameters': record['variant'], 'members': []})
+            variant['members'].append({'run': run, 'callId': cid})
     result = []
     for group in groups.values():
         group['supportTraces'] = sorted(group['supportTraces'])
@@ -303,17 +350,37 @@ def _operation_groups(family, members, entries):
     return sorted(result, key=lambda group: (group['tool'], group['id']))
 
 
+def align_instances(analysis):
+    """Align standalone calls across runs independently of annotation shape/stage.
+
+    Same-run repeats retain their occurrence identity. Source preparation and
+    multi-call semantic abstractions keep the groups chosen during instantiation.
+    """
+    operations = _operation_groups('cross-trace-v1', analysis['instances'], {analysis['traceId']: analysis})
+    identities = {member['callId']: operation['id'] for operation in operations for member in operation['members']}
+    instances = [dict(instance, familyId='pattern:' + digest([
+        analysis['templateVersion'], identities[instance['callIds'][0]]])[:20])
+        if len(instance['callIds']) == 1 and not instance.get('source') and instance['display'] != 'omit'
+        else instance for instance in analysis['instances']]
+    return {**analysis, 'instances': instances}
+
+
 def build_views(analyses: list, reference: list, cohort_info: dict, focus: str = "", detail: str = "all", tool_reference=()) -> dict:
     families = defaultdict(list)
     score_models = fit_score_models(reference, tool_reference)
     entries = {a["traceId"]: a for a in analyses}
+    operation_records = {a['traceId']: _operation_records(a) for a in analyses}
     call_maps = {a["traceId"]: {c["id"]: c for c in a["calls"]} for a in analyses}
-    target_data = {a["traceId"]: _targets(a) for a in analyses}
+    target_data = {a["traceId"]: result_path(a) for a in analyses}
     visible_ids = {m["id"] for a in analyses for m in a["instances"]
                    if detail == "all" or m.get("display", "show") != "omit"
-                   or set(m['callIds']).intersection(a.get('resultAnchors', []))}
+                   or set(m['callIds']).intersection(a.get('resultAnchors', []))
+                   or any(a.get('evidenceReview', {}).get('events', {}).get(cid, {}).get('level') == 'key'
+                          for cid in m['callIds'])}
     for analysis in analyses:
         targets, ancestors = target_data[analysis["traceId"]]
+        review = analysis.get('evidenceReview', {})
+        reviewed_events = review.get('events', {})
         for instance in analysis["instances"]:
             if instance["id"] in visible_ids:
                 member = dict(instance)
@@ -323,6 +390,14 @@ def build_views(analyses: list, reference: list, cohort_info: dict, focus: str =
                 member['resultEvidence'] = [dict(link, claimId=claim['id'], claimText=claim['text'])
                     for claim in analysis.get('resultEvidence', {}).get('claims', []) for link in claim['links']
                     if link['callId'] in instance['callIds']]
+                judgments = [reviewed_events[cid] for cid in instance['callIds'] if cid in reviewed_events]
+                explicit = [item for item in judgments if item['status'] == 'assessed' and item['level'] != 'unknown']
+                if any(item['level'] == 'key' for item in explicit):
+                    member['attention'] = 'key'
+                elif member.get('attention') != 'key' and len(explicit) == len(instance['callIds']) and explicit:
+                    member['attention'] = 'supporting'
+                member['evidenceReview'] = [{'callId': cid, **reviewed_events[cid]}
+                                            for cid in instance['callIds'] if cid in reviewed_events]
                 member["targetEvidence"] = [e for e in analysis.get("targetEvidence", [])
                                              if e.get("callId") in instance["callIds"]]
                 families[instance["familyId"]].append(member)
@@ -368,18 +443,32 @@ def build_views(analyses: list, reference: list, cohort_info: dict, focus: str =
                       "attention": "key" if any(m.get("attention") == "key" for m in members) else "supporting",
                       "supportCount": len(support),
                       "methods": methods,
-                      "instances": instances, "variants": variants, "operationGroups": _operation_groups(family, members, entries),
+                      "instances": instances, "variants": variants,
+                      "operationGroups": _operation_groups(family, members, entries, operation_records),
                       "importance": importance,
                       **({'source': members[0]['source']} if members[0].get('source') else {}),
                       "resultBackbone": any(m["resultBackbone"] for m in members),
                       "scoreSummary": score_summary([entries[r] for r in support])})
+        nodes[-1]['evidenceReview'] = [{'run': m['traceId'], **item}
+                                       for m in members for item in m.get('evidenceReview', [])]
     kept = {m["id"] for members in families.values() for m in members}
     edge_groups = defaultdict(list)
     for analysis in analyses:
         targets, ancestors = target_data[analysis["traceId"]]
+        reviewed_links = {(link['sourceCallId'], link['targetCallId']): link
+                          for link in analysis.get('evidenceReview', {}).get('links', [])}
         for edge in instance_edges(analysis, kept):
             edge["witness"]["highlighted"] = bool(not edge['witness']['inferred'] and edge["witness"]["callPath"] and
                                                   all(cid in ancestors for cid in edge["witness"]["callPath"]))
+            path = edge['witness']['callPath']
+            judgments = [reviewed_links.get((source, target), {}) for source, target in zip(path, path[1:])]
+            if any(item.get('relevance') == 'context' for item in judgments):
+                edge['witness']['relevance'] = 'context'
+            if judgments and all(item.get('relevance') == 'relevant' for item in judgments):
+                edge['witness']['highlighted'] = True
+                edge['witness']['relevance'] = 'relevant'
+                edge['witness']['evidence'] = [item for judgment in judgments for item in judgment.get('evidence', [])]
+                edge['witness']['reason'] = ' '.join(dict.fromkeys(item['reason'] for item in judgments))
             edge_groups[(edge["source"], edge["target"])].append(edge["witness"])
     edges = []
     for (source, target), witnesses in sorted(edge_groups.items()):

@@ -1,11 +1,12 @@
 import ELK from 'elkjs/lib/elk.bundled.js';
 import type { GraphFilters } from './graph_search';
 import type { GraphHighlight } from './graph_controls';
+import type { RunResultConfig } from './run_result';
 import type { JoinedProvenanceGraph } from './types';
 
 export type Point = { x: number; y: number };
 export type Box = Point & { id: string; width: number; height: number; parentId?: string };
-export type LayoutLink = { id: string; source: string; target: string; priority: number };
+export type LayoutLink = { id: string; source: string; target: string; priority: number; recordedSupport: number };
 export type GraphWorkspace = {
   sourceKey: string;
   positions: Map<string, Point>;
@@ -16,11 +17,19 @@ export type GraphWorkspace = {
   filters?: GraphFilters;
   focus?: GraphHighlight;
   axis?: 'outcome' | 'evidence' | 'semantic';
+  runResults?: RunResultConfig;
 };
 
 export type WorkflowLane = { id: string; label: string; kind: 'agent' | 'role'; participantIds: string[] };
 export type WorkflowNodeContext = { laneId: string; roundStart: number; roundEnd: number; phase?: string; eventOrder?: number };
 export type WorkflowLayout = { lanes: WorkflowLane[]; roundRange: [number, number]; roundLabel: string };
+
+/** Frame the result path with the actors active in its destination round. */
+export function workflowFrameIds(contexts: Map<string, WorkflowNodeContext>, ids: string[]) {
+  const round = contexts.get(ids[0])?.roundStart;
+  return [...new Set([...ids, ...[...contexts].filter(([, context]) => round !== undefined && context.roundStart === round)
+    .map(([id]) => id)])];
+}
 
 export function workflowGeometry(boxes: Box[], workflow: WorkflowLayout, contexts: Map<string, WorkflowNodeContext>) {
   const roundStarts = [...new Set(boxes.map((box) => contexts.get(box.id)?.roundStart).filter((round): round is number => round !== undefined))].sort((a, b) => a - b);
@@ -49,17 +58,27 @@ export function workflowGeometry(boxes: Box[], workflow: WorkflowLayout, context
     roundWidths.set(round, width);
     totalWidth += width + 32;
   }
-  const laneHeight = Math.max(190, ...boxes.map((box) => box.height + 48));
-  return { roundStarts, roundWidths, roundOffsets, totalWidth, laneHeight };
+  const heights = new Map(workflow.lanes.map((lane) => [lane.id, 208]));
+  boxes.forEach((box) => {
+    const lane = contexts.get(box.id)!.laneId;
+    heights.set(lane, Math.max(heights.get(lane)!, box.height + 64));
+  });
+  let totalHeight = 0;
+  const laneRows = workflow.lanes.map((lane) => {
+    const row = { ...lane, top: totalHeight, height: heights.get(lane.id)! };
+    totalHeight += row.height;
+    return row;
+  });
+  return { roundStarts, roundWidths, roundOffsets, totalWidth, laneRows, totalHeight };
 }
 
 export function workflowSizeSignature(box: Box) {
-  return `workflow:${box.width}:${box.height}:events-v4-focused`;
+  return `workflow:${box.width}:${box.height}:events-v6-variable-lanes`;
 }
 
 /** Slot workflow events horizontally within each actor/round cell. */
 export function layoutWorkflowLanes(boxes: Box[], workflow: WorkflowLayout, contexts: Map<string, WorkflowNodeContext>, workspace: GraphWorkspace, reset = false) {
-  const { roundStarts, roundOffsets, laneHeight } = workflowGeometry(boxes, workflow, contexts);
+  const { roundStarts, roundOffsets, laneRows } = workflowGeometry(boxes, workflow, contexts);
   const geometryChanged = !reset && (boxes.length !== workspace.sizes.size || boxes.some((box) => !workspace.sizes.has(box.id)
     || workspace.sizes.get(box.id) !== workflowSizeSignature(box)));
   const roundRank = new Map(roundStarts.map((round, index) => [round, index]));
@@ -73,11 +92,13 @@ export function layoutWorkflowLanes(boxes: Box[], workflow: WorkflowLayout, cont
   for (const box of ordered) {
     const context = contexts.get(box.id);
     const lane = laneIndex.get(context?.laneId ?? '') ?? workflow.lanes.length;
+    const row = laneRows[lane];
     const round = context?.roundStart ?? workflow.roundRange[0];
     const cell = `${round}:${lane}`;
     const offset = cellWidths.get(cell) ?? 0;
     cellWidths.set(cell, offset + box.width + 24);
-    const automatic = { x: 48 + (roundOffsets.get(round) ?? (roundRank.get(round) ?? 0) * 352) + offset, y: 56 + lane * laneHeight };
+    const automatic = { x: 48 + (roundOffsets.get(round) ?? (roundRank.get(round) ?? 0) * 352) + offset,
+      y: 56 + row.top + (row.height - 64 - box.height) / 2 };
     const saved = !reset && workspace.positions.has(box.id) && (!geometryChanged || workspace.pinned.has(box.id)) ? workspace.positions.get(box.id) : undefined;
     const candidate = { ...box, ...(saved ?? automatic) };
     // Slot geometry guarantees separation for automatic positions. Manual positions stay exact.
@@ -103,6 +124,7 @@ export function workflowLayoutLinks(graph: JoinedProvenanceGraph): LayoutLink[] 
   const links: LayoutLink[] = valid.filter((edge) => edge.witnesses.some((w) => !w.inferred)).map((edge) => ({
     id: edge.id, source: edge.source, target: edge.target,
     priority: edge.witnesses.some((w) => w.highlighted && !w.inferred) ? 20 : 10,
+    recordedSupport: new Set(edge.witnesses.filter((w) => !w.inferred).map((w) => w.run)).size,
   }));
   const incoming = new Set(links.map((edge) => edge.target));
   for (const edge of valid.filter((edge) => edge.witnesses.every((w) => w.inferred)).sort((a, b) => time(b.source) - time(a.source) || a.id.localeCompare(b.id))) {
@@ -112,7 +134,7 @@ export function workflowLayoutLinks(graph: JoinedProvenanceGraph): LayoutLink[] 
       if (!seen.has(next)) { seen.add(next); queue.push(next); }
     }
     if (seen.has(edge.source)) continue;
-    links.push({ id: edge.id, source: edge.source, target: edge.target, priority: 1 }); incoming.add(edge.target);
+    links.push({ id: edge.id, source: edge.source, target: edge.target, priority: 1, recordedSupport: 0 }); incoming.add(edge.target);
   }
   return links;
 }
@@ -126,7 +148,7 @@ function placeBox(box: Box, placed: Box[], gap: number) {
   return { ...box, y: Math.max(0, ...placed.map((other) => other.y + other.height + gap)) };
 }
 
-export async function layoutGroups(boxes: Box[], links: LayoutLink[], workspace: GraphWorkspace, reset = false) {
+export async function layoutGroups(boxes: Box[], links: LayoutLink[], workspace: GraphWorkspace, reset = false, publication = false) {
   if (!reset && boxes.every((box) => workspace.positions.has(box.id) && workspace.sizes.get(box.id) === `${box.width}:${box.height}`)) {
     return new Map(boxes.map((box) => [box.id, workspace.positions.get(box.id)!]));
   }
@@ -135,11 +157,17 @@ export async function layoutGroups(boxes: Box[], links: LayoutLink[], workspace:
     id: 'workflow',
     layoutOptions: {
       'elk.algorithm': 'layered', 'elk.direction': 'RIGHT', 'elk.edgeRouting': 'ORTHOGONAL',
-      'elk.spacing.nodeNode': '40', 'elk.spacing.componentComponent': '64',
+      'elk.spacing.nodeNode': '28', 'elk.spacing.componentComponent': '40', 'elk.aspectRatio': '2.3',
       'elk.layered.spacing.nodeNodeBetweenLayers': '104',
       'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
       'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
       'elk.padding': '[top=32,left=40,bottom=32,right=40]',
+      ...(publication ? {
+        'elk.layered.layering.strategy': 'COFFMAN_GRAHAM',
+        'elk.layered.layering.coffmanGraham.layerBound': '6',
+        'elk.layered.spacing.nodeNodeBetweenLayers': '72',
+        'elk.spacing.nodeNode': '28',
+      } : {}),
     },
     children: boxes.map(({ id, width, height }) => ({ id, width, height,
       layoutOptions: { 'elk.portConstraints': 'FIXED_SIDE' },
@@ -153,6 +181,23 @@ export async function layoutGroups(boxes: Box[], links: LayoutLink[], workspace:
     })),
   });
   const automatic = new Map(result.children!.map((node) => [node.id, { x: node.x!, y: node.y! }]));
+  // In the paper view, give the longest repeated recorded path a horizontal spine.
+  // Other branches retain their layers and remain visible around that spine.
+  const spine = new Set<string>();
+  if (publication && boxes.length) {
+    const paths = new Map(boxes.map((box) => [box.id, [box.id]]));
+    const shared = links.filter((link) => link.recordedSupport > 1 && automatic.get(link.source)!.x < automatic.get(link.target)!.x)
+      .sort((a, b) => automatic.get(a.source)!.x - automatic.get(b.source)!.x || a.id.localeCompare(b.id));
+    for (const link of shared) {
+      const path = [...paths.get(link.source)!, link.target];
+      if (path.length > paths.get(link.target)!.length) paths.set(link.target, path);
+    }
+    const longest = [...paths.values()].sort((a, b) => b.length - a.length || a.join().localeCompare(b.join()))[0];
+    if (longest.length > 2) {
+      const center = longest.map((id) => automatic.get(id)!.y).sort((a, b) => a - b)[Math.floor(longest.length / 2)];
+      longest.forEach((id) => { spine.add(id); automatic.get(id)!.y = center; });
+    }
+  }
   const shared = boxes.filter((box) => workspace.positions.has(box.id));
   const median = (values: number[]) => values.sort((a, b) => a - b)[Math.floor(values.length / 2)] ?? 0;
   const offset = reset ? { x: 0, y: 0 } : {
@@ -161,6 +206,7 @@ export async function layoutGroups(boxes: Box[], links: LayoutLink[], workspace:
   };
   const placed: Box[] = [];
   const ordered = [...boxes].sort((a, b) => Number(workspace.pinned.has(b.id)) - Number(workspace.pinned.has(a.id))
+    || Number(spine.has(b.id)) - Number(spine.has(a.id))
     || Number(workspace.positions.has(b.id)) - Number(workspace.positions.has(a.id)));
   for (const box of ordered) {
     const saved = reset ? undefined : workspace.positions.get(box.id);
@@ -207,7 +253,7 @@ class Queue {
 }
 
 /** Visibility-grid A*: rectilinear routes avoid card interiors, including after a drag. */
-export function routeOrthogonal(source: Point, target: Point, boxes: Box[], lane = 0): Point[] {
+export function routeOrthogonal(source: Point, target: Point, boxes: Box[], lane = 0, occupied:Point[][]=[]): Point[] {
   const obstacles = boxes.map((box) => ({ ...box, x: box.x - 6, y: box.y - 6, width: box.width + 12, height: box.height + 12 }));
   const start = { x: source.x + 16 + lane * 3, y: source.y };
   const end = { x: target.x - 16 - lane * 3, y: target.y };
@@ -221,6 +267,19 @@ export function routeOrthogonal(source: Point, target: Point, boxes: Box[], lane
   const costs = new Map<number, number>([[startIndex, 0]]), previous = new Map<number, number>();
   const queue = new Queue(); queue.push({ id: startIndex, cost: 0 });
   const visited = new Set<number>();
+  const congestion=new Map<string,number>();
+  const surcharge=(a:Point,b:Point)=>{
+    const key=[a.x,a.y,b.x,b.y].join(',');if(congestion.has(key))return congestion.get(key)!;
+    let cost=0;
+    for(const path of occupied)for(let i=1;i<path.length;i++){
+      const c=path[i-1],d=path[i];
+      if(a.y===b.y&&c.y===d.y&&a.y===c.y)cost+=Math.max(0,Math.min(Math.max(a.x,b.x),Math.max(c.x,d.x))-Math.max(Math.min(a.x,b.x),Math.min(c.x,d.x)))*4;
+      else if(a.x===b.x&&c.x===d.x&&a.x===c.x)cost+=Math.max(0,Math.min(Math.max(a.y,b.y),Math.max(c.y,d.y))-Math.max(Math.min(a.y,b.y),Math.min(c.y,d.y)))*4;
+      else if(a.y===b.y&&c.x===d.x&&c.x>Math.min(a.x,b.x)&&c.x<Math.max(a.x,b.x)&&a.y>Math.min(c.y,d.y)&&a.y<Math.max(c.y,d.y))cost+=32;
+      else if(a.x===b.x&&c.y===d.y&&a.x>Math.min(c.x,d.x)&&a.x<Math.max(c.x,d.x)&&c.y>Math.min(a.y,b.y)&&c.y<Math.max(a.y,b.y))cost+=32;
+    }
+    congestion.set(key,cost);return cost;
+  };
   while (queue.items.length) {
     const { id } = queue.pop();
     if (visited.has(id)) continue;
@@ -239,7 +298,7 @@ export function routeOrthogonal(source: Point, target: Point, boxes: Box[], lane
       const next = { x: xs[nx], y: ys[ny] };
       if (segmentBlocked(current, next, obstacles)) continue;
       const nextId = (ny * width + nx) * 2 + direction;
-      const cost = costs.get(id)! + Math.abs(current.x - next.x) + Math.abs(current.y - next.y) + (id % 2 !== direction ? 24 : 0);
+      const cost = costs.get(id)! + Math.abs(current.x - next.x) + Math.abs(current.y - next.y) + (id % 2 !== direction ? 24 : 0)+surcharge(current,next);
       if (cost >= (costs.get(nextId) ?? Infinity)) continue;
       costs.set(nextId, cost); previous.set(nextId, id);
       queue.push({ id: nextId, cost: cost + Math.abs(next.x - end.x) + Math.abs(next.y - end.y) });

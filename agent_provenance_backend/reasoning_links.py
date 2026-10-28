@@ -8,7 +8,8 @@ from collections import defaultdict
 import semantics
 from inference import ANNOTATION_SETTINGS, SEMANTIC_MODEL, infer_json
 from models import ModelResponseError, digest, read_cache, write_json
-from provenance import _pointer_part, _resource_values
+from provenance import _pointer_part, output_resources
+from event_order import strictly_earlier
 
 PROMPT_VERSION = 'reasoning-links-v2'
 LINK_BATCH_SIZE = 128
@@ -70,7 +71,7 @@ def _subjects(call, resources, ignored, fields):
 
 def candidates(analysis):
     calls = analysis['calls']
-    resources = {v for call in calls for _, v in _resource_values(call.get('response'))}
+    resources = {v for call in calls for _, v in output_resources(call, analysis.get('referenceSchema'))}
     ignored = {'true', 'false', 'none', 'null', 'string', 'value', 'values', 'result', 'results'}
     for call in calls:
         for field in ('args', 'response'):
@@ -91,21 +92,27 @@ def candidates(analysis):
     incoming = defaultdict(set)
     for edge in analysis['flow']:
         incoming[edge['target']].add(edge['source'])
-    result = []
-    for index, target in enumerate(calls):
-        target_group = groups[target['id']]
-        if target_group['display'] == 'omit' or target_group.get('source'):
-            continue
-        ancestors, queue = set(), list(incoming[target['id']])
+    ancestry = {}
+    for call in calls:
+        ancestors, queue = set(), list(incoming[call['id']])
         while queue:
             prior = queue.pop()
             if prior not in ancestors:
                 ancestors.add(prior)
                 queue.extend(incoming[prior])
+        ancestry[call['id']] = ancestors
+    result = []
+    for target in calls:
+        target_group = groups[target['id']]
+        if target_group['display'] == 'omit' or target_group.get('source'):
+            continue
         ranked = []
-        for source in calls[:index]:
+        for source in calls:
+            if not strictly_earlier(source, target):
+                continue
             source_group = groups[source['id']]
-            if (source['id'] in ancestors or source_group['display'] == 'omit'
+            if (source['id'] in ancestry[target['id']] or target['id'] in ancestry[source['id']]
+                    or source_group['display'] == 'omit'
                     or source_group['familyId'] == target_group['familyId']
                     or source_group.get('diagnostics')):
                 continue

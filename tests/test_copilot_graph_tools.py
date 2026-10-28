@@ -2,10 +2,9 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent_provenance_backend"))
-from copilot import CopilotStore, model_messages, parse_json_args, provenance_agent_response, request_kwargs, stream_model_round, tool_definitions, update_tool_call
+from copilot import CopilotStore, parse_json_args, provenance_agent_response, tool_definitions, user_prompt
 
 
 def catalog():
@@ -44,14 +43,45 @@ def store(global_tools=None, scope="selection-a"):
 
 
 def test_initial_model_context_is_bounded_and_does_not_include_raw_trace_data():
-    messages = model_messages(store())
-    rendered = str(messages)
+    rendered = user_prompt(store())
     assert "private-trace-id" not in rendered
     assert "private raw output" not in rendered
     assert "0.93" not in rendered
     assert "graphCatalog" in rendered
     assert "scope'" not in rendered
     assert "n0" in rendered
+
+
+def test_graph_view_accepts_input_and_local_context_without_changing_scope():
+    for context in ('parents', 'inputs', 'neighbors'):
+        current = store()
+        result = current.set_graph_view({'context': context, 'filters': {
+            'context': context, 'role': 'unknown', 'evidence': 'supported', 'view': 'isolate'}})
+        assert result.get('error') is None
+        assert result['action']['scope'] == 'selection-a'
+        assert result['action']['filters']['context'] == context
+        assert result['action']['filters']['evidence'] == 'supported'
+
+
+def test_input_patterns_expose_source_steps_and_actionable_canvas_ids_without_raw_data():
+    from skill_patterns import mine_input_patterns
+    current = store()
+    current.traces[0]['toolCalls'] = [{'id': 'a', 'name': 'read'}, {'id': 'b', 'name': 'use'}]
+    current.joined_graph['nodes'][0]['instances'] = [
+        {'run': 'private-trace-id', 'calls': [{'id': 'a'}, {'id': 'b'}]}]
+    current.joined_graph['inputPatterns'] = mine_input_patterns([{
+        'traceId': 'private-trace-id', 'calls': [{'id': 'a', 'tool': 'read', 'response': 'private raw output'},
+                                              {'id': 'b', 'tool': 'use'}],
+        'flow': [{'source': 'a', 'target': 'b'}]}])
+    result = current.call_tool('get_input_patterns', {})
+    witness = result['patterns'][0]['witnesses'][0]
+    assert witness['traceAlias'] == 'r0' and witness['steps'] == [1, 2]
+    assert witness['nodeIds'] == ['n0']
+    assert witness['consumerSteps'] == [2]
+    assert witness['inputCoverage'][0]['unknownRoleCount'] == 0
+    assert witness['links'][0]['inferred'] is False
+    assert 'private-trace-id' not in str(result) and 'private raw output' not in str(result)
+    assert current.get_input_patterns({'minSupport': 2})['patterns'] == []
 
 
 def test_agent_workflow_insights_use_source_steps_and_keep_skills_provisional():
@@ -206,7 +236,7 @@ def test_set_graph_view_accepts_typed_filters_and_rejects_bad_values():
     assert store().set_graph_view({"filters": {"minSupport": True}})["error"]
     assert store().set_graph_view({"filters": {"minSupport": 2.5}})["error"]
     assert store().set_graph_view({"filters": {"minOutcome": float("nan")}})["error"]
-    assert store().set_graph_view({"filters": {"role": "unknown"}})["error"]
+    assert store().set_graph_view({"filters": {"role": "invented-role"}})["error"]
     assert store().set_graph_view({"filters": {"extra": 1}})["error"]
 
 
@@ -227,58 +257,9 @@ def test_graph_actions_update_view_state_for_later_tools():
     assert state["highlightedNodeIds"] == [] and state["highlightedEdgeIds"] == []
 
 
-def test_gemini_request_uses_reasoning_effort_and_modest_budget():
-    request = request_kwargs("@vertexai/gemini-3.8-flash", [])
-    assert request["model"] == "@vertexai/gemini-3.8-flash"
-    assert request["reasoning_effort"] == "low"
-    assert request["max_tokens"] == 8192
-    assert "thinking" not in request
+def test_tool_definitions_include_graph_actions_and_readers():
     names = {item["function"]["name"] for item in tool_definitions()}
     assert {"get_view_state", "search_graph", "rank_score_associations", "highlight_graph", "filter_graph", "set_graph_view"} <= names
-
-
-def test_streamed_tool_chunks_assemble_by_index_and_keep_gemini_signature():
-    calls = {}
-    update_tool_call(calls, 0, {"index": 0, "function": {"arguments": '{"nodeIds":'}})
-    update_tool_call(calls, 0, {"index": 0, "id": "call-1", "extra_content": {
-        "google": {"thought_signature": "sig-1"}}, "function": {"arguments": '["n0"]}'}})
-    assert len(calls) == 1
-    call = next(iter(calls.values()))
-    assert call["id"] == "call-1"
-    assert call["function"]["arguments"] == '{"nodeIds":["n0"]}'
-    assert call["extra_content"]["google"]["thought_signature"] == "sig-1"
-
-
-def test_streamed_calls_merge_by_id_and_preserve_distinct_gemini_calls():
-    calls = {}
-    update_tool_call(calls, 0, {"id": "highlight-1", "index": 0, "function": {
-        "name": "highlight_graph", "arguments": '{"nodeIds":["n0"],'}})
-    update_tool_call(calls, 0, {"index": 0, "function": {"arguments": '"edgeIds":'}})
-    update_tool_call(calls, 1, {"id": "view-1", "function": {
-        "name": "set_graph_view", "arguments": '{"context":"workflow","frame":true}'}})
-    update_tool_call(calls, 0, {"id": "highlight-1", "index": 0, "function": {
-        "arguments": '["e4","e5"],"context":"workflow"}'}})
-    assert len(calls) == 2
-    by_name = {call["function"]["name"]: call for call in calls.values()}
-    assert by_name["highlight_graph"]["id"] == "highlight-1"
-    assert json.loads(by_name["highlight_graph"]["function"]["arguments"]) == {
-        "nodeIds": ["n0"], "context": "workflow", "edgeIds": ["e4", "e5"]}
-    assert json.loads(by_name["set_graph_view"]["function"]["arguments"]) == {
-        "context": "workflow", "frame": True}
-
-
-def test_streamed_calls_merge_idless_fragments_by_index_then_promote_id():
-    calls = {}
-    update_tool_call(calls, 0, {"index": 0, "function": {"arguments": '{"nodeIds":'}})
-    update_tool_call(calls, 1, {"index": 1, "function": {"arguments": '{"axis":'}})
-    update_tool_call(calls, 0, {"id": "highlight-1", "index": 0, "function": {
-        "name": "highlight_graph", "arguments": '["n0"]}'}})
-    update_tool_call(calls, 1, {"id": "view-1", "index": 1, "function": {
-        "name": "set_graph_view", "arguments": '"evidence"}'}})
-    assert len(calls) == 2
-    by_name = {call["function"]["name"]: call for call in calls.values()}
-    assert json.loads(by_name["highlight_graph"]["function"]["arguments"]) == {"nodeIds": ["n0"]}
-    assert json.loads(by_name["set_graph_view"]["function"]["arguments"]) == {"axis": "evidence"}
 
 
 def test_invalid_json_args_return_error_without_emitting_noop_graph_action():
@@ -289,43 +270,48 @@ def test_invalid_json_args_return_error_without_emitting_noop_graph_action():
     assert current.get_view_state({})["graphState"]["highlightedNodeIds"] == []
 
 
-def test_app_client_factory_selects_gemini_and_streams_final_telemetry(monkeypatch):
-    import inference
-
-    class Stream:
-        async def __aiter__(self):
-            yield {"choices": [{"delta": {"content": "ready"}}]}
-
-    class Client:
-        instances = []
-
-        def __init__(self, **_):
-            self.max_retries = 1
-            self.openai_client = SimpleNamespace(max_retries=1)
-            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
-            self.request = None
-            self.instances.append(self)
-
-        async def create(self, **request):
-            self.request = request
-            return Stream()
-
-        async def close(self):
-            pass
-
-    monkeypatch.setenv("PORTKEY_API_KEY", "test-key")
-    monkeypatch.setattr(inference, "AsyncPortkey", Client)
-    response = asyncio.run(provenance_agent_response({"question": "hello"}, inference.portkey_client))
+def test_planner_replays_local_tool_and_returns_final_with_telemetry(monkeypatch):
+    import copilot
+    plans = iter([
+        {"text": "I’ll inspect the graph.", "calls": [{"name": "search_graph", "arguments": '{"query":"browser"}'}]},
+        {"text": "The matching stage is browser search.", "calls": []},
+    ])
+    prompts = []
+    async def fake_infer(prompt, **kwargs):
+        prompts.append((prompt, kwargs))
+        return next(plans)
+    monkeypatch.setattr(copilot, "infer_json", fake_infer)
+    response = asyncio.run(provenance_agent_response({"question": "Where is browser used?", "joinedGraph": joined_graph([]),
+                                                       "graphCatalog": catalog(), "graphIds": {"nodes": {"family-1": "n0"}, "edges": {}}}))
 
     async def collect():
         return [json.loads(line) async for line in response.body_iterator]
 
     events = asyncio.run(collect())
-    assert Client.instances[0].request["model"] == "@vertexai/gemini-3.8-flash"
+    assert prompts[0][1]["tier"] == "semantic" and prompts[0][1]["schema"]["type"] == "object"
+    assert "Tool result for search_graph" in prompts[1][0]
+    assert any(event["type"] == "tool_call" for event in events)
+    assert any(event["type"] == "graph_action" for event in events)
+    assert events[-2]["type"] == "final" and events[-2]["output"] == "The matching stage is browser search."
     assert events[-1]["type"] == "telemetry"
-    assert events[-1]["modelRequests"] == 1
-    assert events[-1]["toolCalls"] == 0
+    assert events[-1]["modelRequests"] == 0  # Stub planner makes no hosted requests.
+    assert events[-1]["toolCalls"] == 1
     assert events[-1]["elapsedSeconds"] >= 0
+
+
+def test_planner_tool_budget_stops_before_dispatching_over_budget_call(monkeypatch):
+    import copilot
+    async def fake_infer(*_, **__):
+        return {"text": "", "calls": [{"name": "get_view_state", "arguments": "{}"},
+                                         {"name": "get_view_state", "arguments": "{}"}]}
+    monkeypatch.setattr(copilot, "infer_json", fake_infer)
+    monkeypatch.setenv("COPILOT_TOOL_CALLS", "1")
+    response = asyncio.run(provenance_agent_response({"question": "Inspect view"}))
+    async def collect():
+        return [json.loads(line) async for line in response.body_iterator]
+    events = asyncio.run(collect())
+    assert [event["type"] for event in events].count("tool_call") == 1
+    assert next(event for event in events if event["type"] == "error")["message"] == "Copilot tool budget reached."
 
 
 def test_edge_witnesses_keep_instance_continuity_without_leaking_source_ids():
@@ -343,3 +329,10 @@ def test_edge_witnesses_keep_instance_continuity_without_leaking_source_ids():
     assert result["witnesses"][0] == {"run": "r0", "sourceInstance": "i0", "targetInstance": "i1", "inferred": False, "resultPath": True, "reason": "", "relevance": None, "jointContext": False}
     assert "private-instance" not in str(result)
     assert "private-trace-id" not in str(result)
+
+
+def test_main_flow_filter_is_an_inspectable_display_action():
+    current = store()
+    result = current.set_graph_view({'filters': {'context': 'parents', 'evidence': 'main', 'view': 'isolate'}})
+    assert result['action']['filters']['evidence'] == 'main'
+    assert result['action']['filters']['context'] == 'parents'

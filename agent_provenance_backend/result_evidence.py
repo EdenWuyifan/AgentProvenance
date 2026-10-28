@@ -56,15 +56,15 @@ Do not infer score contribution, correctness of the full answer, or scientific
 causality. Do not invent missing results. Excerpts may be partial.
 '''
 _lock = asyncio.Lock()
-_word = re.compile(r'[^\W_][\w.-]{1,63}', re.UNICODE)
+_word = re.compile(r'[^\W_][\w.-]{0,63}', re.UNICODE)
 _private = re.compile(r'password|secret|token|authorization|api.?key|email', re.I)
 _location = re.compile(r'https?://\S+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}')
-_stop = set('the and for with from that this are was were have has not but into its their these those then than which what when where how also results result data analysis using used show shown table figure answer conclusion summary true false null'.split())
+_stop = set('a the and for with from that this are was were have has not but into its their these those then than which what when where how also results result data analysis using used show shown table figure answer conclusion summary null'.split())
 
 
 def _terms(text):
-    return [m.group().casefold() for m in _word.finditer(_location.sub(' ', text))
-            if m.group().casefold() not in _stop]
+    words = [m.group().casefold().strip('._-') for m in _word.finditer(_location.sub(' ', text))]
+    return [word for word in words if word and word not in _stop]
 
 
 def _units(value, path=''):
@@ -75,6 +75,9 @@ def _units(value, path=''):
                 # Quote the actual container, never a synthesized summary.
                 if len(clean) == len(value):
                     yield path, json.dumps(value, ensure_ascii=False)
+                    for key, child in value.items():
+                        if isinstance(child, bool) or isinstance(child, (int, float)):
+                            yield from _units(child, path + '/' + _pointer_part(str(key)))
                     return
         for key, child in value.items():
             if not _private.search(str(key)) and key not in RESOURCE_KEYS:
@@ -84,7 +87,9 @@ def _units(value, path=''):
             yield from _units(child, path + f'/{index}')
     elif isinstance(value, str) and value.strip():
         yield path, value
-    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+    elif isinstance(value, bool):
+        yield path, json.dumps(value)
+    elif isinstance(value, (int, float)):
         yield path, str(value)
 
 

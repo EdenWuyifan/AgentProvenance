@@ -1,8 +1,8 @@
 FROM node:20-bookworm-slim AS frontend-builder
 
 WORKDIR /app/agent_provenance_react
-COPY agent_provenance_react/package.json ./
-RUN npm install
+COPY agent_provenance_react/package.json agent_provenance_react/package-lock.json ./
+RUN npm ci
 COPY agent_provenance_react ./
 RUN npm run build
 
@@ -23,6 +23,7 @@ COPY agent_provenance_backend/requirements.txt ./agent_provenance_backend/requir
 RUN pip install --no-cache-dir -r agent_provenance_backend/requirements.txt
 
 COPY --chown=node:node agent_provenance_backend ./agent_provenance_backend
+COPY --chown=node:node agent_provenance ./agent_provenance
 COPY --chown=node:node --from=frontend-builder /app/agent_provenance_react/.next/standalone ./agent_provenance_react
 COPY --chown=node:node --from=frontend-builder /app/agent_provenance_react/.next/static ./agent_provenance_react/.next/static
 COPY --chown=node:node --from=frontend-builder /app/agent_provenance_react/public ./agent_provenance_react/public

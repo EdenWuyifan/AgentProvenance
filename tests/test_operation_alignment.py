@@ -2,8 +2,29 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent_provenance_backend"))
-from abstraction import _operation_groups
-from provenance import build_recorded_graph, call_flow, normalize_calls
+from abstraction import _entity_ports, _operation_groups
+from provenance import build_recorded_graph, call_flow, normalize_calls, project_dependencies
+
+
+def test_inferred_context_is_not_presented_as_a_recorded_entity_input():
+    calls = normalize_calls([
+        {'id': 'original', 'tool': 'load', 'args': {}, 'response': {'id': 'primary'}},
+        {'id': 'filtered', 'tool': 'transform', 'args': {'input_id': 'primary'},
+         'response': {'id': 'secondary'}},
+        {'id': 'consumer', 'tool': 'project', 'args': {'input_id': 'primary'},
+         'response': {'id': 'selected'}},
+    ], 'prov-ports')
+    graph = build_recorded_graph(calls)
+    flow = call_flow(graph) + [{'source': 'filtered', 'target': 'consumer',
+        'inferred': True, 'relation': 'semantic_context'}]
+    analysis = {'traceId': 'prov-ports', 'calls': calls, 'graph': graph, 'flow': flow}
+    inputs, outputs = _entity_ports(analysis)
+    assert set(inputs['consumer']) == set(outputs['original'])
+    assert not set(inputs['consumer']) & set(outputs['filtered'])
+    projected = project_dependencies(analysis)
+    assert any(edge.get('inferred') and edge.get('eventRelation') == 'semantic_context'
+               for edge in projected['edges'])
+    assert analysis['flow'] == flow
 
 
 def _analysis(trace, threshold, alias, columns, how):
